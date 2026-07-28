@@ -20,7 +20,7 @@
 //!   requests flow to the originally-requested model (quality-safe). A pause
 //!   can never cheapen traffic.
 //! * **Sticky.** The pause persists (`route_pauses` row) until an explicit
-//!   `POST /v1/routes/:id/resume`; a paused route stops rewriting, so it
+//!   `POST /v1/routes/:id/resume?expected_revision=N`; a paused route stops rewriting, so it
 //!   stops being judged, so its window freezes — it can never un-pause
 //!   itself.
 //! * **Resume restarts the evidence.** A resume RETAINS the `route_pauses`
@@ -258,9 +258,15 @@ impl JudgeSink for AutoPauseJudgeSink {
         if outcome.score.verdict == JudgeVerdict::Unclear {
             return;
         }
-        // (3) Per-route opt-in (OFF BY DEFAULT); an absent or already-paused
-        // route short-circuits.
-        let route = match self.routing_store.get_route(outcome.org_id, route_id).await {
+        // (3) Per-route opt-in (OFF BY DEFAULT); read the management view so
+        // the later pause can carry the exact route generation it evaluated.
+        // A typed get followed by a separate revision read would let a
+        // same-UUID replacement mix the old action with the new generation.
+        let route = match self
+            .routing_store
+            .get_management_route(outcome.org_id, route_id)
+            .await
+        {
             Ok(Some(r)) => r,
             Ok(None) => return,
             Err(e) => {
@@ -268,7 +274,21 @@ impl JudgeSink for AutoPauseJudgeSink {
                 return;
             }
         };
-        if route.paused || !route.then.auto_pause {
+        let Some(expected_revision) = route.revision.filter(|revision| *revision >= 1) else {
+            tracing::warn!(route_id = %route_id, "auto-pause: route revision unavailable (best-effort, skipping)");
+            return;
+        };
+        if route.activation.state == "invalid" {
+            return;
+        }
+        let action: tt_routing::RouteAction = match serde_json::from_value(route.target.clone()) {
+            Ok(action) => action,
+            Err(error) => {
+                tracing::warn!(error = %error, route_id = %route_id, "auto-pause: route action decode failed (best-effort, skipping)");
+                return;
+            }
+        };
+        if route.paused || !action.auto_pause {
             return;
         }
         // (4)–(5) Windowed decision.
@@ -283,12 +303,10 @@ impl JudgeSink for AutoPauseJudgeSink {
                 return;
             }
         };
-        let min_verdicts = route
-            .then
+        let min_verdicts = action
             .pause_min_verdicts
             .unwrap_or(DEFAULT_PAUSE_MIN_VERDICTS);
-        let floor = route
-            .then
+        let floor = action
             .pause_floor_pass_rate
             .unwrap_or(DEFAULT_PAUSE_FLOOR_PASS_RATE);
         let Some(pass_rate) = should_pause(acceptable, degraded, min_verdicts, floor) else {
@@ -309,7 +327,7 @@ impl JudgeSink for AutoPauseJudgeSink {
         };
         match self
             .routing_store
-            .pause_route(outcome.org_id, route_id, pause)
+            .pause_route(outcome.org_id, route_id, expected_revision, pause)
             .await
         {
             Ok(true) => {
@@ -320,7 +338,7 @@ impl JudgeSink for AutoPauseJudgeSink {
                     pass_rate = pass_rate,
                     floor = floor,
                     n = n,
-                    "route_auto_paused: paired pass-rate below floor — rewrite suppressed (requests flow to the original model) until POST /v1/routes/:id/resume"
+                    "route_auto_paused: paired pass-rate below floor — rewrite suppressed (requests flow to the original model) until POST /v1/routes/:id/resume?expected_revision=N"
                 );
                 crate::metrics::record_route_auto_paused(&route.name);
                 // CachingRoutingStore already invalidated the org's engine.
@@ -429,24 +447,37 @@ mod tests {
         ) -> Result<Option<Route>, RoutingStoreError> {
             self.inner.get_route(org_id, id).await
         }
+        async fn get_management_route(
+            &self,
+            org_id: Uuid,
+            id: Uuid,
+        ) -> Result<Option<tt_routing::RouteManagementView>, RoutingStoreError> {
+            self.inner.get_management_route(org_id, id).await
+        }
         async fn pause_route(
             &self,
             org_id: Uuid,
             route_id: Uuid,
+            expected_revision: i64,
             pause: NewRoutePause,
         ) -> Result<bool, RoutingStoreError> {
             self.pause_calls
                 .lock()
                 .unwrap()
                 .push((org_id, route_id, pause.clone()));
-            self.inner.pause_route(org_id, route_id, pause).await
+            self.inner
+                .pause_route(org_id, route_id, expected_revision, pause)
+                .await
         }
         async fn resume_route(
             &self,
             org_id: Uuid,
             route_id: Uuid,
+            expected_revision: i64,
         ) -> Result<bool, RoutingStoreError> {
-            self.inner.resume_route(org_id, route_id).await
+            self.inner
+                .resume_route(org_id, route_id, expected_revision)
+                .await
         }
     }
 

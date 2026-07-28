@@ -367,7 +367,8 @@ async fn best_of_n_streaming_replay_yields_known_plan_and_chosen_leg() {
 
     let state = AppState::new(registry);
     let ctx = test_ctx();
-    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert("mock-provider-judge".to_string(), test_creds("judge-key"));
 
     let legs = vec![
         make_ok_leg(0, "Answer from leg 0"),
@@ -426,7 +427,11 @@ async fn synthesize_streaming_yields_live_plan_and_streamed_chunks() {
 
     let state = AppState::new(registry);
     let ctx = test_ctx();
-    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert(
+        "mock-streaming-provider".to_string(),
+        test_creds("arbiter-key"),
+    );
 
     // Two ok member legs (Synthesize requires at least one).
     let legs = vec![
@@ -457,6 +462,49 @@ async fn synthesize_streaming_yields_live_plan_and_streamed_chunks() {
     assert_eq!(
         text, "Synthesized",
         "streamed text must equal the concatenation of the mock arbiter's chunks"
+    );
+}
+
+/// The live arbiter stream also requires the explicitly mapped provider
+/// credential; it must not inherit the source request's credential.
+#[tokio::test]
+async fn synthesize_streaming_requires_explicit_arbiter_credential() {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockStreamingArbiter {
+        id: "mock-streaming-provider",
+        model: "mock-synth",
+        chunks: vec!["should", "not", "dispatch"],
+    }));
+
+    let state = AppState::new(registry);
+    let ctx = test_ctx();
+    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let legs = vec![
+        make_ok_leg(0, "First candidate answer"),
+        make_ok_leg(1, "Second candidate answer"),
+    ];
+    let strategy = Synthesize {
+        arbiter_model: ModelRef {
+            model: "mock-synth".to_string(),
+            provider: None,
+        },
+    };
+
+    let error = match strategy
+        .arbitrate_streaming(&base_req(), &legs, &state, &ctx, &creds)
+        .await
+    {
+        Ok(_) => panic!("unmapped streaming arbiter must not inherit source credentials"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            &error,
+            tt_core::ApiError::MissingProviderCredential { provider }
+                if provider == "mock-streaming-provider"
+        ),
+        "expected explicit missing-arbiter credential error, got {error:?}"
     );
 }
 
@@ -569,6 +617,7 @@ fn panel_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         api_key_id: Uuid::nil(),
         trace_id: Uuid::nil(),
         provider_id: "panel".into(),
+        requested_model: "caller-panel-model".into(),
         model: "panel-arbiter".into(),
         input_tokens: 20,
         cached_tokens: 0,
@@ -576,7 +625,10 @@ fn panel_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         // Priced so the streamed cost is nonzero — the Known plan must discard it.
         pricing: Some(priced()),
         baseline_pricing: Some(priced()),
-        route_id: None,
+        // Simulate a panel triggered by a matched route: the aggregate stream
+        // must retain the exact immutable definition that selected it.
+        route_id: Some(Uuid::from_u128(0x42)),
+        route_version_id: Some(9_876_543_210),
         tag: None,
         request_started: std::time::Instant::now(),
         spend_sink: tt_core::budget::SpendSink::None,
@@ -634,7 +686,14 @@ async fn panel_aggregate_row_single_provider_panel_no_double_count() {
         row.model, "panel-arbiter",
         "aggregate row model must be the arbiter model"
     );
+    assert_eq!(row.requested_model.as_deref(), Some("caller-panel-model"));
     assert!(!row.cached, "panel aggregate row must be cached == false");
+    assert_eq!(row.route_id, Some(Uuid::from_u128(0x42)));
+    assert_eq!(
+        row.route_version_id,
+        Some(9_876_543_210),
+        "streamed panel aggregate must preserve the matched immutable route version"
+    );
     // Σ legs ($0.010) + Known arbiter ($0.002) = $0.012. The replayed leg's
     // streamed cost is NOT added (no double-count under ArbiterCostPlan::Known).
     assert!(
@@ -815,6 +874,7 @@ fn panel_log_ctx_live(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext
         api_key_id: Uuid::nil(),
         trace_id: Uuid::nil(),
         provider_id: "panel".into(),
+        requested_model: "caller-panel-model".into(),
         model: "panel-arbiter".into(),
         // 20 input tokens → nonzero input cost even when output_tokens == 0.
         input_tokens: 20,
@@ -823,6 +883,7 @@ fn panel_log_ctx_live(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext
         pricing: Some(priced()),
         baseline_pricing: Some(priced()),
         route_id: None,
+        route_version_id: None,
         tag: None,
         request_started: std::time::Instant::now(),
         spend_sink: tt_core::budget::SpendSink::None,
@@ -965,6 +1026,7 @@ async fn synthesize_streaming_panel_cost_incomplete_false() {
         .body(Body::from(
             serde_json::json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "cost_incomplete pin" }],
                 "stream": true,
                 "tt_extras": {
@@ -1485,6 +1547,7 @@ async fn streaming_e2e_synthesize_live_aggregate_row_and_event_order() {
         .body(Body::from(
             serde_json::json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": true,
                 "tt_extras": {
@@ -1609,6 +1672,7 @@ async fn streaming_e2e_best_of_n_replays_chosen_leg_verbatim_no_double_count() {
         .body(Body::from(
             serde_json::json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "which is best?" }],
                 "stream": true,
                 "tt_extras": {
@@ -1748,6 +1812,7 @@ async fn streaming_e2e_quorum_unmet_returns_502_zero_rows_no_stream() {
         .body(Body::from(
             serde_json::json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": true,
                 "tt_extras": {

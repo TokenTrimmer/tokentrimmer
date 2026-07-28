@@ -6,6 +6,24 @@
 
 use axum::response::sse;
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkflowRunStartEnvironment {
+    Development,
+    Staging,
+    Production,
+}
+
+/// Paired environment provenance for a streaming run. Keeping this nested
+/// makes an environment without its immutable release revision
+/// unrepresentable on the SSE wire.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkflowRunStartRelease {
+    pub(crate) environment: WorkflowRunStartEnvironment,
+    pub(crate) revision: i32,
+    pub(crate) variables_revision: i32,
+}
+
 /// One server-sent event from a streaming workflow run.
 ///
 /// Emitted node-by-node as the workflow executes; `NodeDone` carries the
@@ -16,11 +34,17 @@ use axum::response::sse;
 pub(crate) enum WfEvent {
     /// Emitted once at the start of a streaming run, carrying the run's id so
     /// the client can wire up the Seal-receipt affordance (which gates on
-    /// `run_id`) BEFORE the terminal `run.done`. The engine itself doesn't know
-    /// the run id (it's minted by the caller in `routes/workflows.rs`); the
-    /// caller emits this on the channel before invoking `run_workflow`. P0-8.
+    /// `run_id`) BEFORE the terminal `run.done`. It also carries the exact
+    /// accepted immutable definition and optional paired environment-release
+    /// provenance before any node event. The engine itself doesn't know these
+    /// route-owned values; the caller emits this before `run_workflow`. P0-8.
     #[serde(rename = "run.start")]
-    RunStart { run_id: uuid::Uuid },
+    RunStart {
+        run_id: uuid::Uuid,
+        workflow_version: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workflow_release: Option<WorkflowRunStartRelease>,
+    },
 
     /// A node has started executing.
     #[serde(rename = "node.start")]
@@ -128,14 +152,33 @@ mod tests {
     }
 
     #[test]
-    fn wf_event_run_start_carries_run_id() {
+    fn wf_event_run_start_carries_exact_execution_provenance() {
         let ev = WfEvent::RunStart {
             run_id: uuid::Uuid::nil(),
+            workflow_version: 7,
+            workflow_release: Some(WorkflowRunStartRelease {
+                environment: WorkflowRunStartEnvironment::Production,
+                revision: 3,
+                variables_revision: 2,
+            }),
         };
         let val = serde_json::to_value(&ev).unwrap();
         assert_eq!(val["type"], "run.start", "serde tag must be run.start");
         assert_eq!(val["run_id"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(val["workflow_version"], 7);
+        assert_eq!(val["workflow_release"]["environment"], "production");
+        assert_eq!(val["workflow_release"]["revision"], 3);
+        assert_eq!(val["workflow_release"]["variables_revision"], 2);
         let _ = ev.to_sse();
+
+        let stored = WfEvent::RunStart {
+            run_id: uuid::Uuid::nil(),
+            workflow_version: 8,
+            workflow_release: None,
+        };
+        let stored_val = serde_json::to_value(&stored).unwrap();
+        assert_eq!(stored_val["workflow_version"], 8);
+        assert!(stored_val.get("workflow_release").is_none());
     }
 
     #[test]

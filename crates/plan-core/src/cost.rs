@@ -103,6 +103,7 @@ mod tests {
             ts: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
             provider: "anthropic".into(),
             model: "claude-3-5-sonnet".into(),
+            requested_model: None,
             input_tokens: input,
             output_tokens: output,
             cached_tokens: cached,

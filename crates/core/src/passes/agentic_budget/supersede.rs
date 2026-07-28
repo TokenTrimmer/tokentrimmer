@@ -341,6 +341,43 @@ mod tests {
         assert_eq!(out.tokens_removed, 0);
     }
 
+    /// Raising the keep-recent bound preserves one additional stale tool-result
+    /// block. With four blocks, `keep=3` can supersede only the oldest repeated
+    /// call; `keep=4` makes the whole set ineligible.
+    #[test]
+    fn wider_keep_recent_window_cannot_expand_supersede_scope() {
+        let mut req = req_with(vec![
+            user("loop"),
+            assistant_call_args("c1", "ping", "{}"),
+            tool_result("c1", big_result("first")),
+            assistant_call_args("c2", "ping", "{}"),
+            tool_result("c2", big_result("second")),
+            assistant_call_args("c3", "status", "{}"),
+            tool_result("c3", big_result("third")),
+            assistant_call_args("c4", "status", "{\"verbose\":true}"),
+            tool_result("c4", big_result("fourth")),
+        ]);
+        let original = req.clone();
+
+        let out = run(SupersedePass::new(3), &mut req);
+        assert_eq!(
+            tool_text(&req, 2),
+            SUPERSEDED_STUB,
+            "oldest repeated call is eligible"
+        );
+        assert!(out.tokens_removed > 0);
+
+        let mut wider_window = original;
+        let before = serde_json::to_string(&wider_window).unwrap();
+        let out = run(SupersedePass::new(4), &mut wider_window);
+        assert_eq!(
+            serde_json::to_string(&wider_window).unwrap(),
+            before,
+            "keeping all four tool-result blocks must make supersede inert"
+        );
+        assert_eq!(out.tokens_removed, 0);
+    }
+
     /// A single occurrence of a call is never superseded (no later identical
     /// call exists).
     #[test]

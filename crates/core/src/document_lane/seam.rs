@@ -1,12 +1,13 @@
-//! D4c — the pre-routing document-lane distillation seam.
+//! D4c — the post-route-match document-lane distillation seam.
 //!
-//! Invoked in `prepare()` AFTER routing (so the matched route's
-//! `RouteAction::document_lane` opt-in is known) but BEFORE `SplitRequest::compute`
-//! (so the cache-stable prefix + L1/L2 keys are derived from the DISTILLED
-//! request). When the route opted in + the request carries document/image
-//! content parts, the sidecar distills each to text; the parts are swapped for
-//! `ContentPart::Text` so routing can downgrade to a text model + the request
-//! is billed at text-model rates. The isolated `doc_vision_saved_est_usd`
+//! Invoked in `prepare()` after route/canary selection (so the matched route's
+//! `RouteAction::document_lane` opt-in and candidate target are known), but
+//! before target-provider rebind, pinning, panel admission, failover, and
+//! `SplitRequest::compute` (so cache keys derive from the converted request).
+//! When the route opted in + the request carries document/image content parts,
+//! the sidecar distills each to text; the parts are swapped for `ContentPart::Text`
+//! only after every conversion succeeds, so a route can safely retain its
+//! text-model downgrade. The isolated `doc_vision_saved_est_usd`
 //! saving (D4c-v2) is booked from the [`DistillBookkeeping`] the seam returns —
 //! the raw image tokens the request WOULD have sent vs the distilled text tokens
 //! it now sends, priced at the served model's input rate via D0's
@@ -15,23 +16,26 @@
 //! # Fail-open (the production posture)
 //! Mirrors the sidecar client's fail-open: sidecar disabled (`TT_DOC_SIDECAR_URL`
 //! unset) / connection error / timeout / malformed response → the request stays
-//! VERBATIM (no distillation, no downgrade, no saving booked) + routes to the
-//! vision model as before. The seam is a pure optimization — it must never be
-//! able to break a request. Error blobs are never distilled (`should_distill`
-//! stays false). The default-CLOSED [`DocDistillGate`] means lossy substitution
-//! never happens unless an operator opts in. A part whose extraction fails is
-//! left verbatim AND contributes nothing to the bookkeeping — the saving is
-//! never over-booked for a part we did not actually replace.
+//! VERBATIM (no distillation and no saving booked). The seam is a pure
+//! optimization — it must never be able to break a request. Error blobs are
+//! never distilled (`should_distill` stays false). The default-CLOSED
+//! [`DocDistillGate`] means lossy substitution never happens unless an operator
+//! opts in. A failure to distill *any* lane-targeted document/image part aborts
+//! the whole transaction: all earlier candidate substitutions are discarded and
+//! booking is zero, so the request can never contain a misleading mixture of
+//! raw and distilled media.
 //!
 //! # The v1 scope (honest)
 //! v1 distills INLINE base64 document/image bytes (URL parts are NOT fetched —
 //! a future slice that resolves URLs to bytes, with the SSRF posture the `http`
-//! workflow node already enforces). Lossless extractions (PDF text layers)
-//! substitute without the judge; LOSSY extractions (OCR images) require the
-//! [`DocDistillGate`] + the 0.90 floor. **Gemini direction guard:** the booked
-//! saving is $0 for Gemini-targeted downgrades (Gemini prices page-images flat
-//! and cheaper than distilled text; never claim a saving the provider's invoice
-//! would contradict — the guard lives in `document_projection::project`).
+//! workflow node already enforces). A remote or malformed URL therefore aborts
+//! the transaction rather than allowing a partial conversion. Lossless
+//! extractions (PDF text layers) substitute without the judge; LOSSY
+//! extractions (OCR images) require the [`DocDistillGate`] + the 0.90 floor.
+//! **Gemini direction guard:** the booked saving is $0 for Gemini-targeted
+//! downgrades (Gemini prices page-images flat and cheaper than distilled text;
+//! never claim a saving the provider's invoice would contradict — the guard
+//! lives in `document_projection::project`).
 
 use base64::Engine as _;
 
@@ -47,8 +51,9 @@ use super::{sidecar_client, DocDistillGate, SpanFidelity};
 
 /// The sidecar client + gate the seam uses. Resolved ONCE in `prepare()` (the
 /// sidecar URL off env, the gate default-CLOSED) + reused per distilled part.
-/// Cheap to construct (an `Arc<dyn>` + a bool); the seam early-returns when the
-/// sidecar URL is unset (the common case — zero added latency for text traffic).
+/// Cheap to construct (an `Arc<dyn>` + a bool). With no sidecar URL, the seam
+/// performs only a small content scan so callers can distinguish text-only
+/// traffic from an incomplete media conversion; it never makes a network call.
 pub(crate) struct DistillHarness {
     pub client: reqwest::Client,
     pub sidecar_url: Option<String>,
@@ -91,10 +96,10 @@ pub(crate) enum DistillOutcome {
     Distilled { text: String, lossless: bool },
 }
 
-/// The bookkeeping a [`distill_request_parts`] call accrues so the handler can
-/// book the isolated `doc_vision_saved_est_usd` (D4c-v2). Only parts that were
-/// ACTUALLY substituted contribute — a part that failed extraction / the sidecar
-/// is disabled contributes nothing (the saving is never over-booked).
+/// The bookkeeping a completed [`distill_request_parts`] call accrues so the
+/// handler can book the isolated `doc_vision_saved_est_usd` (D4c-v2). Only a
+/// fully completed request transaction exposes nonzero bookkeeping; an
+/// incomplete conversion contributes nothing (the saving is never over-booked).
 ///
 /// - `raw_image_tokens` — the input tokens the distilled-away IMAGE parts WOULD
 ///   have spent at the served model (`estimate_image_tokens` on each image's
@@ -114,6 +119,37 @@ pub(crate) struct DistillBookkeeping {
     pub raw_image_tokens: u32,
     /// Distilled-text input tokens the substituted parts now spend.
     pub distilled_text_tokens: u32,
+}
+
+/// The request-level outcome for a document-lane transaction. This makes a
+/// zero [`DistillBookkeeping`] unambiguous to callers that need to decide
+/// whether raw media is still present for routing/capability purposes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestDistillOutcome {
+    /// The request has no lane-targeted [`ContentPart::Document`] or
+    /// [`ContentPart::ImageUrl`] part.
+    NoEligibleParts,
+    /// Every lane-targeted part was converted and the candidate request was
+    /// committed atomically.
+    Complete { booking: DistillBookkeeping },
+    /// At least one lane-targeted part could not be converted (disabled
+    /// sidecar, remote/malformed input, sidecar response, or gate rejection).
+    /// The original request is unchanged and booking is zero.
+    Incomplete,
+}
+
+impl RequestDistillOutcome {
+    /// Return booking only for a complete transaction in focused seam tests.
+    /// Production routing inspects the enum so it can distinguish
+    /// `NoEligibleParts` from `Incomplete`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn booking(&self) -> DistillBookkeeping {
+        match self {
+            Self::Complete { booking } => booking.clone(),
+            Self::NoEligibleParts | Self::Incomplete => DistillBookkeeping::default(),
+        }
+    }
 }
 
 /// Distill ONE content part's document/image payload to text via the sidecar,
@@ -175,30 +211,40 @@ pub(crate) async fn distill_part(
     }
 }
 
-/// Walk the request's messages + swap each inline-base64 Document / data-URL
-/// Image part for a `ContentPart::Text` carrying the sidecar's distilled text.
-/// Returns a [`DistillBookkeeping`] accrues the raw-image-tokens vs
-/// distilled-text-tokens so the handler can book the isolated `doc_vision_saved_est_usd`
-/// (D4c-v2) — all-zero when none distilled / the seam early-returned.
+/// Walk the request's messages + atomically swap every lane-targeted inline
+/// base64 Document / data-URL Image part for a `ContentPart::Text` carrying the
+/// sidecar's distilled text. A remote Document/Image URL, malformed data URL,
+/// sidecar failure, empty response, or gate rejection returns
+/// [`RequestDistillOutcome::Incomplete`]: the original request remains intact
+/// and booking is zero. Text and audio parts are ignored, not blockers.
 ///
 /// `model` is the SERVED model (the post-routing `target_model` rewrite) — used
 /// to (a) pick the per-provider image-token formula for the raw image tokens +
 /// (b) BPE-encode the distilled text. v1 distills INLINE base64 document bytes +
-/// data-URL image bytes ONLY (remote URLs are not fetched — a future slice).
-/// After substitution, the caller recomputes `request_has_images`/
-/// `request_has_documents` (now false → the route can downgrade to a text model).
-pub(crate) async fn distill_request_parts(
+/// data-URL image bytes ONLY. A [`RequestDistillOutcome::Complete`] commits a
+/// candidate containing only text in the converted positions, so the caller can
+/// safely recompute media capability after inspecting the outcome.
+pub(crate) async fn distill_request_parts_with_outcome(
     harness: &DistillHarness,
     model: &str,
     req: &mut ChatCompletionRequest,
-) -> DistillBookkeeping {
-    // Early-return: when the sidecar is disabled (the common case), skip the
-    // message walk entirely — zero added latency for text traffic.
-    if harness.sidecar_url.is_none() {
-        return DistillBookkeeping::default();
+) -> RequestDistillOutcome {
+    if !request_has_lane_targeted_parts(req) {
+        return RequestDistillOutcome::NoEligibleParts;
     }
+
+    // With a disabled sidecar, media is present but no request conversion is
+    // possible. Do not mutate or contact the network.
+    if harness.sidecar_url.is_none() {
+        return RequestDistillOutcome::Incomplete;
+    }
+
+    // Work on a candidate and assign it only after every Document/Image part
+    // succeeds. This is the transaction boundary that prevents a later failure
+    // from leaving the request partly raw and partly distilled.
+    let mut candidate = req.clone();
     let mut booking = DistillBookkeeping::default();
-    for message in &mut req.messages {
+    for message in &mut candidate.messages {
         // Only User / System / Tool messages carry a `Parts` content the seam
         // mutates (Assistant content is optional + treated as verbatim).
         let parts: &mut Vec<ContentPart> = match message {
@@ -228,26 +274,24 @@ pub(crate) async fn distill_request_parts(
                     DocumentSource::Base64 { media_type, data } => {
                         (media_type.clone(), data.clone(), false)
                     }
-                    // v1: URLs are not fetched — leave verbatim.
-                    DocumentSource::Url { .. } => continue,
+                    // v1 does not fetch remote/file-id document sources. A raw
+                    // lane target must block the whole transaction.
+                    DocumentSource::Url { .. } => return RequestDistillOutcome::Incomplete,
                 },
-                // v1: data-URL images (base64-inline). Remote image URLs are
-                // left verbatim (a future fetch slice).
                 ContentPart::ImageUrl { image_url } => {
-                    if let Some((media, b64)) = parse_data_url(&image_url.url) {
-                        (media, b64, true)
-                    } else {
-                        continue;
-                    }
+                    // Remote, non-base64, or malformed data URLs are all
+                    // unsupported in v1 and therefore block the transaction.
+                    let Some((media, b64)) = parse_data_url(&image_url.url) else {
+                        return RequestDistillOutcome::Incomplete;
+                    };
+                    (media, b64, true)
                 }
-                _ => continue, // Text, audio — not distilled.
+                _ => continue, // Text, audio — not lane targets or blockers.
             };
             let DistillOutcome::Distilled { text, .. } =
                 distill_part(harness, &media_type, &data_b64).await
             else {
-                // NotADocument / Disabled / ExtractFailed → leave verbatim, accrue
-                // nothing (never book a saving for a part we did not replace).
-                continue;
+                return RequestDistillOutcome::Incomplete;
             };
             // Accrue the raw image tokens the substituted image WOULD have spent.
             // Only image parts contribute (a PDF document's pixels are not billed
@@ -275,7 +319,38 @@ pub(crate) async fn distill_request_parts(
             booking.distilled_parts += 1;
         }
     }
-    booking
+
+    *req = candidate;
+    RequestDistillOutcome::Complete { booking }
+}
+
+/// True when a request contains a content part that this lane must either
+/// convert or preserve verbatim as part of an incomplete transaction. Text and
+/// audio intentionally do not count.
+pub(crate) fn request_has_lane_targeted_parts(req: &ChatCompletionRequest) -> bool {
+    req.messages.iter().any(|message| match message {
+        Message::User {
+            content: MessageContent::Parts(parts),
+            ..
+        }
+        | Message::System {
+            content: MessageContent::Parts(parts),
+        }
+        | Message::Tool {
+            content: MessageContent::Parts(parts),
+            ..
+        }
+        | Message::Assistant {
+            content: Some(MessageContent::Parts(parts)),
+            ..
+        } => parts.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::Document { .. } | ContentPart::ImageUrl { .. }
+            )
+        }),
+        _ => false,
+    })
 }
 
 /// Parse a `data:<media>;base64,<payload>` URL into `(media_type, base64_payload)`.
@@ -331,6 +406,36 @@ mod tests {
     // stdlib `serial_test` would do this too; a local Mutex avoids the dep.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    fn test_harness(sidecar_url: Option<String>) -> DistillHarness {
+        DistillHarness {
+            client: reqwest::Client::new(),
+            sidecar_url,
+            gate: DocDistillGate::default(),
+        }
+    }
+
+    fn request_with_parts(parts: Vec<ContentPart>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            messages: vec![Message::User {
+                content: MessageContent::Parts(parts),
+                name: None,
+            }],
+            ..default_request()
+        }
+    }
+
+    fn inline_pdf(data: &str) -> ContentPart {
+        ContentPart::Document {
+            document: tt_shared::messages::DocumentPart {
+                source: DocumentSource::Base64 {
+                    media_type: "application/pdf".into(),
+                    data: data.into(),
+                },
+                filename: None,
+            },
+        }
+    }
+
     #[test]
     fn parse_data_url_extracts_media_and_payload() {
         let (media, data) = parse_data_url("data:application/pdf;base64,JVBERi0=").unwrap();
@@ -380,29 +485,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distill_request_parts_disabled_sidecar_is_zero_bookkeeping() {
-        // No sidecar URL → the seam early-returns with all-zero bookkeeping — no
-        // mutation, no network, no saving booked (the common no-sidecar case).
-        let _guard = ENV_LOCK.lock().await;
-        std::env::remove_var("TT_DOC_SIDECAR_URL");
-        let h = DistillHarness::from_env();
-        let mut req = ChatCompletionRequest {
-            messages: vec![Message::User {
-                content: MessageContent::Parts(vec![ContentPart::Document {
-                    document: tt_shared::messages::DocumentPart {
-                        source: DocumentSource::Base64 {
-                            media_type: "application/pdf".into(),
-                            data: "JVBERi0=".into(),
-                        },
-                        filename: None,
-                    },
-                }]),
-                name: None,
-            }],
-            ..default_request()
-        };
-        let booking = distill_request_parts(&h, "gpt-4o", &mut req).await;
-        assert_eq!(booking, DistillBookkeeping::default());
+    async fn disabled_sidecar_with_media_is_incomplete_and_verbatim() {
+        // No sidecar URL with media present is distinct from a text-only
+        // request: routing must retain the raw capability requirements.
+        let h = test_harness(None);
+        let mut req = request_with_parts(vec![inline_pdf("JVBERi0=")]);
+        let before = serde_json::to_value(&req).expect("request serializes");
+
+        let outcome = distill_request_parts_with_outcome(&h, "gpt-4o", &mut req).await;
+
+        assert_eq!(outcome, RequestDistillOutcome::Incomplete);
+        assert_eq!(outcome.booking(), DistillBookkeeping::default());
+        assert_eq!(
+            serde_json::to_value(&req).expect("request serializes"),
+            before,
+            "disabled conversion must not mutate media"
+        );
         // The document part is left verbatim (fail-open).
         let Message::User {
             content: MessageContent::Parts(p),
@@ -420,11 +518,7 @@ mod tests {
         // seam substitutes the image part for text + accrues BOTH the raw image
         // tokens the image would have spent AND the distilled text tokens.
         use httpmock::prelude::*;
-        let _guard = ENV_LOCK.lock().await;
-        std::env::set_var("TT_DOC_SIDECAR_URL", "http://unused-set-per-mock");
         let server = MockServer::start();
-        // Point the harness's client at the mock by overriding the env URL.
-        std::env::set_var("TT_DOC_SIDECAR_URL", server.base_url());
         let mock = server.mock(|when, then| {
             when.method(POST).path("/extract");
             then.status(200)
@@ -441,7 +535,7 @@ mod tests {
         // A real 1×1 PNG header (decodes to dims (1,1)).
         const PNG_1X1_B64: &str =
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
-        let h = DistillHarness::from_env();
+        let h = test_harness(Some(server.base_url()));
         let mut req = ChatCompletionRequest {
             messages: vec![Message::User {
                 content: MessageContent::Parts(vec![ContentPart::ImageUrl {
@@ -454,8 +548,11 @@ mod tests {
             }],
             ..default_request()
         };
-        let booking = distill_request_parts(&h, "gpt-4o", &mut req).await;
+        let outcome = distill_request_parts_with_outcome(&h, "gpt-4o", &mut req).await;
         mock.assert();
+        let RequestDistillOutcome::Complete { booking } = outcome else {
+            panic!("a successful one-part conversion must complete atomically");
+        };
         assert_eq!(
             booking.distilled_parts, 1,
             "the one image part was distilled"
@@ -477,24 +574,21 @@ mod tests {
             panic!("user message parts preserved");
         };
         assert!(matches!(p[0], ContentPart::Text { .. }));
-        std::env::remove_var("TT_DOC_SIDECAR_URL");
     }
 
     #[tokio::test]
-    async fn distill_request_parts_does_not_book_a_failed_extraction() {
+    async fn failed_extraction_is_incomplete_and_verbatim() {
         // A sidecar 500 → fail-open: the part stays verbatim AND the bookkeeping
         // stays all-zero (never book a saving for a part we did not replace).
         use httpmock::prelude::*;
-        let _guard = ENV_LOCK.lock().await;
         let server = MockServer::start();
-        std::env::set_var("TT_DOC_SIDECAR_URL", server.base_url());
-        let _mock = server.mock(|when, then| {
+        let mock = server.mock(|when, then| {
             when.method(POST).path("/extract");
             then.status(500);
         });
         const PNG_1X1_B64: &str =
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
-        let h = DistillHarness::from_env();
+        let h = test_harness(Some(server.base_url()));
         let mut req = ChatCompletionRequest {
             messages: vec![Message::User {
                 content: MessageContent::Parts(vec![ContentPart::ImageUrl {
@@ -507,9 +601,178 @@ mod tests {
             }],
             ..default_request()
         };
-        let booking = distill_request_parts(&h, "gpt-4o", &mut req).await;
-        assert_eq!(booking, DistillBookkeeping::default());
-        std::env::remove_var("TT_DOC_SIDECAR_URL");
+        let before = serde_json::to_value(&req).expect("request serializes");
+
+        let outcome = distill_request_parts_with_outcome(&h, "gpt-4o", &mut req).await;
+
+        mock.assert();
+        assert_eq!(outcome, RequestDistillOutcome::Incomplete);
+        assert_eq!(outcome.booking(), DistillBookkeeping::default());
+        assert_eq!(
+            serde_json::to_value(&req).expect("request serializes"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn text_and_audio_are_no_eligible_parts() {
+        let h = test_harness(None);
+        let mut req = request_with_parts(vec![
+            ContentPart::Text {
+                text: "keep this text".into(),
+            },
+            ContentPart::InputAudio {
+                input_audio: tt_shared::messages::InputAudio {
+                    data: "AAAA".into(),
+                    format: "wav".into(),
+                },
+            },
+        ]);
+        let before = serde_json::to_value(&req).expect("request serializes");
+
+        assert!(!request_has_lane_targeted_parts(&req));
+        let outcome = distill_request_parts_with_outcome(&h, "gpt-4o", &mut req).await;
+
+        assert_eq!(outcome, RequestDistillOutcome::NoEligibleParts);
+        assert_eq!(outcome.booking(), DistillBookkeeping::default());
+        assert_eq!(
+            serde_json::to_value(&req).expect("request serializes"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_multi_part_failure_rolls_back_all_conversions() {
+        use httpmock::prelude::*;
+
+        const FIRST_PDF_B64: &str = "RklSU1Q=";
+        const SECOND_PDF_B64: &str = "U0VDT05E";
+        let server = MockServer::start();
+        let successful_first = server.mock(|when, then| {
+            when.method(POST)
+                .path("/extract")
+                .body_includes(FIRST_PDF_B64);
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "text": "first document text",
+                        "pages": 1,
+                        "spans": [{ "kind": "lossless", "page": 0, "chars": 19 }]
+                    })
+                    .to_string(),
+                );
+        });
+        let failed_second = server.mock(|when, then| {
+            when.method(POST)
+                .path("/extract")
+                .body_includes(SECOND_PDF_B64);
+            then.status(500);
+        });
+        let h = test_harness(Some(server.base_url()));
+        let mut req =
+            request_with_parts(vec![inline_pdf(FIRST_PDF_B64), inline_pdf(SECOND_PDF_B64)]);
+        let before = serde_json::to_value(&req).expect("request serializes");
+
+        let outcome = distill_request_parts_with_outcome(&h, "gpt-4o", &mut req).await;
+
+        successful_first.assert_calls(1);
+        failed_second.assert_calls(1);
+        assert_eq!(outcome, RequestDistillOutcome::Incomplete);
+        assert_eq!(outcome.booking(), DistillBookkeeping::default());
+        assert_eq!(
+            serde_json::to_value(&req).expect("request serializes"),
+            before,
+            "the successful first candidate conversion must be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_200_keeps_raw_part_and_returns_incomplete() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/extract");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("{}");
+        });
+        let h = test_harness(Some(server.base_url()));
+        let mut req = request_with_parts(vec![inline_pdf("RU1QVFk=")]);
+        let before = serde_json::to_value(&req).expect("request serializes");
+
+        let outcome = distill_request_parts_with_outcome(&h, "gpt-4o", &mut req).await;
+
+        mock.assert();
+        assert_eq!(outcome, RequestDistillOutcome::Incomplete);
+        assert_eq!(outcome.booking(), DistillBookkeeping::default());
+        assert_eq!(
+            serde_json::to_value(&req).expect("request serializes"),
+            before
+        );
+        let Message::User {
+            content: MessageContent::Parts(parts),
+            ..
+        } = &req.messages[0]
+        else {
+            panic!("raw media message must remain present");
+        };
+        assert!(matches!(parts[0], ContentPart::Document { .. }));
+    }
+
+    #[tokio::test]
+    async fn remote_or_malformed_url_blocks_the_transaction() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let no_sidecar_request = server.mock(|when, then| {
+            when.method(POST).path("/extract");
+            then.status(500);
+        });
+        let h = test_harness(Some(server.base_url()));
+        let unsupported_parts = vec![
+            ContentPart::Document {
+                document: tt_shared::messages::DocumentPart {
+                    source: DocumentSource::Url {
+                        url: "https://example.test/document.pdf".into(),
+                    },
+                    filename: None,
+                },
+            },
+            ContentPart::ImageUrl {
+                image_url: tt_shared::messages::ImageUrl {
+                    url: "https://example.test/image.png".into(),
+                    detail: None,
+                },
+            },
+            ContentPart::ImageUrl {
+                image_url: tt_shared::messages::ImageUrl {
+                    url: "data:image/png,not-base64".into(),
+                    detail: None,
+                },
+            },
+        ];
+
+        for unsupported_part in unsupported_parts {
+            let mut req = request_with_parts(vec![
+                ContentPart::Text {
+                    text: "do not mutate surrounding text".into(),
+                },
+                unsupported_part,
+            ]);
+            let before = serde_json::to_value(&req).expect("request serializes");
+
+            let outcome = distill_request_parts_with_outcome(&h, "gpt-4o", &mut req).await;
+
+            assert_eq!(outcome, RequestDistillOutcome::Incomplete);
+            assert_eq!(outcome.booking(), DistillBookkeeping::default());
+            assert_eq!(
+                serde_json::to_value(&req).expect("request serializes"),
+                before
+            );
+        }
+        no_sidecar_request.assert_calls(0);
     }
 
     /// The handler's D4c-v2 override prices the seam's bookkeeping via D0's

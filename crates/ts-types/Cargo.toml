@@ -5,15 +5,25 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Reserved placeholder for future TypeScript bindings from shared wire types."
+description = "Generated JSON Schema, TypeScript, and vectors for public wire contracts."
 # Internal tooling for the cloud-repo dashboard — never publish to crates.io.
 publish = false
 
 [dependencies]
 tt-shared.workspace = true
+tt-telemetry = { workspace = true, features = ["contract-schema"] }
+tt-plan-core = { workspace = true, features = ["contract-schema"] }
+tt-routing = { workspace = true, features = ["contract-schema"] }
+tt-core = { workspace = true, features = ["contract-schema"] }
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
+ed25519-dalek.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

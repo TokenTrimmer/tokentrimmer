@@ -26,6 +26,7 @@ Gateway implements the following OpenAI API endpoints, with the OpenAI request/r
 | `/v1/messages` (Anthropic Messages wire) | POST | ✓ v1 |
 | `/v1/embeddings` | POST | ✓ v1 |
 | `/v1/models` | GET | ✓ v1 |
+| `/v1/capabilities` | GET | ✓ gateway-runtime evidence v1 |
 | `/v1/completions` (legacy) | POST | ✗ not supported |
 | `/v1/responses` (OpenAI Responses API) | POST | ✗ not yet supported — use `/v1/chat/completions` |
 | `/v1/images/generations` | POST | ✗ not supported (v2 candidate) |
@@ -506,6 +507,91 @@ Returns all models accessible to the authenticated key, across all configured pr
 
 The `tokentrimmer` object is the TokenTrimmer extension.
 
+### 5.2 Gateway runtime capabilities
+
+```
+GET /v1/capabilities
+Authorization: Bearer tt_live_...
+```
+
+Returns a versioned, `Cache-Control: private, no-store` snapshot of facts known
+by the **responding gateway process** for a verified live key. Anonymous,
+sandbox (`tt_test_*`), dogfood, and other non-live identities receive the
+normal `401` response. The document never includes an organization ID, key ID,
+provider credential, provider configuration, or secret.
+
+The first version describes only Fusion facts that the gateway itself enforces:
+its kill switch, the effective caller tier, its configured minimum tier, and
+the maximum number of member models. This selected-fields excerpt omits the
+repeated `reason.message`, applicable `source`, and `schema_versions` metadata;
+the cap value is only an example, since the response carries the process's
+configured value:
+
+```json
+{
+  "schema_version": 1,
+  "scope": "gateway_runtime",
+  "snapshot_scope": "responding_process",
+  "generated_at": "2026-07-16T12:00:00.000Z",
+  "features": {
+    "fusion": {
+      "enabled": {
+        "state": "enabled",
+        "source": "gateway_runtime",
+        "reason": { "code": "fusion_kill_switch_enabled" }
+      },
+      "access": {
+        "state": "available",
+        "reason": { "code": "fusion_gateway_gate_passed" }
+      },
+      "current_tier": { "state": "known", "value": "pro" },
+      "minimum_tier": { "state": "known", "value": "pro" },
+      "limits": {
+        "member_models_max": {
+          "value": 8,
+          "enforcement": "gateway_runtime",
+          "reason": { "code": "fusion_member_cap" }
+        }
+      }
+    }
+  },
+  "provider_credentials": { "state": "unknown", "source": "not_negotiated" },
+  "provider_health": { "state": "unknown", "source": "not_negotiated" },
+  "model_support": { "state": "unknown", "source": "not_negotiated" },
+  "modality_support": { "state": "unknown", "source": "not_negotiated" }
+}
+```
+
+`features.fusion.access: "available"` means only that the responding process
+has passed its Fusion kill-switch and tier gate for this key. It is neither a
+reservation nor an execution guarantee: request-time credential, model,
+budget, policy, and upstream-provider checks remain authoritative. Conversely,
+`"unavailable"` includes a machine-readable reason such as
+`fusion_disabled` or `fusion_tier_below_minimum`.
+
+The provider, model, and modality fields are intentionally `unknown`; this
+endpoint does not decrypt or count credentials, probe providers, or negotiate a
+request. In particular, catalog data from `/v1/models` is metadata, not proof
+that a credentialed request will be accepted. `snapshot_scope` also means a
+load-balanced fleet may return different snapshots while configuration or a
+binary rollout is in progress. Clients must execute the real request and handle
+its result rather than using this endpoint as a fleet-wide readiness signal.
+
+For these intentionally unknown facts, version 1 emits the following stable
+`reason.code` values:
+
+| Field | `reason.code` | Meaning |
+| --- | --- | --- |
+| `provider_credentials` | `provider_credentials_not_inspected` | The endpoint did not decrypt, count, or probe credentials. It says nothing about whether a credential is absent, present, valid, or usable. |
+| `provider_health` | `provider_health_not_probed` | The endpoint did not make a provider health probe or spend-producing test request. It says nothing about provider health. |
+| `model_support` | `model_support_not_negotiated` | The endpoint did not negotiate this request's model. Catalog metadata is not request acceptance evidence. |
+| `modality_support` | `modality_support_not_negotiated` | The endpoint did not negotiate this request's modality. It is not modality-support or request-acceptance evidence. |
+
+For every row, `state: "unknown"` and `source: "not_negotiated"` are
+normative: the code describes an omitted observation, never a positive or
+negative readiness result. Clients MUST use the actual request result for any
+credential, provider, model, modality, limit, or execution decision.
+
 ---
 
 ## 6. TokenTrimmer extension headers
@@ -542,8 +628,8 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Batch-Forgone-Usd` | on dispatched/cached responses — the **forgone** Batch-API discount for batch-eligible requests (advisory `then.batch` route action), priced from the served model's real catalog batch rate. An advisory projection for the future async Batch Lane: the request was dispatched synchronously and billed in full, so this figure is **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for all unmarked traffic. | `0.0125` |
 | `X-TokenTrimmer-Minify-Saved-Est-Usd` | on dispatched/cached responses — the **ESTIMATED** saving from minified-JSON output steering (`then.minify_json` route action): the emitted JSON re-rendered pretty and re-tokenized with the served model's tokenizer, minus the tokens actually emitted, priced at the billed output rate. An estimate of an unmeasurable counterfactual: **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for un-minified traffic, non-JSON responses, and streaming (v1 meters but does not estimate). | `0.000312` |
 | `X-TokenTrimmer-Diff-Saved-Usd` | on dispatched/cached responses — the **measured** saving of an applied `then.diff` patch: tokens of the reconstructed artifact minus the billed patch tokens, priced at the served model's output rate. Both sides are real tokenizer counts on real strings, so this figure **is** included in `X-TokenTrimmer-Saved-Usd` (via the baseline fold) and is itemized here for the methodology breakdown. `0.000000` for all undiffed traffic. | `0.0297` |
-| `X-TokenTrimmer-Format-Switch-Saved-Est-Usd` | on dispatched/cached responses — the **estimated** saving of a validated `then.format_switch` emission: a JSON-equivalent reconstruction minus the emitted body, output-rate-priced. The `Est` in the name is the label: an estimate, **never** included in `X-TokenTrimmer-Saved-Usd` / `Baseline-Cost-Usd` (those reconcile against the provider invoice). `0.000000` for unswitched traffic, whenever the reconstruction is not computable (booked $0), and on cache **hits** of a switched response (the hit still advertises `format_switch:<label>`, but its saving is attributed to the cache — the estimate belongs to the original miss's row, mirroring the diff/compression figures). | `0.0041` |
-| `X-TokenTrimmer-Diff-Failed-Cost-Usd` | on dispatched/cached responses — the realized cost of a FAILED `then.diff` patch attempt on a fail-closed double dispatch. Already **folded into** `X-TokenTrimmer-Cost-Usd` (the retry is real invoice spend for this trace); duplicated here so the retry tax can be unpicked. `0.000000` unless a patch failed on this trace. | `0.0106` |
+| `X-TokenTrimmer-Format-Switch-Saved-Est-Usd` | on dispatched/cached responses — the **estimated** saving of a validated `then.format_switch` emission: a JSON-equivalent reconstruction minus the emitted body, output-rate-priced. The `Est` in the name is the label: an estimate, **never** included in `X-TokenTrimmer-Saved-Usd` / `Baseline-Cost-Usd` (which are catalog-priced gateway figures, not provider-invoice reconciliation). `0.000000` for unswitched traffic, whenever the reconstruction is not computable (booked $0), and on cache **hits** of a switched response (the hit still advertises `format_switch:<label>`, but its saving is attributed to the cache — the estimate belongs to the original miss's row, mirroring the diff/compression figures). | `0.0041` |
+| `X-TokenTrimmer-Diff-Failed-Cost-Usd` | on dispatched/cached responses — the realized cost of a FAILED `then.diff` patch attempt on a fail-closed double dispatch. Already **folded into** `X-TokenTrimmer-Cost-Usd` (the retry is real served usage for this trace; the header remains a catalog-priced gateway figure rather than provider-invoice reconciliation); duplicated here so the retry tax can be unpicked. `0.000000` unless a patch failed on this trace. | `0.0106` |
 | `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
 | `X-TokenTrimmer-Warnings` | on dispatched responses when the gateway altered the request, and on cache-hit responses carrying pre-dispatch tokens | `param_dropped:frequency_penalty,param_dropped:n` |
 | `X-TokenTrimmer-Captured` | present **only** when this trace's body was persisted to the per-org **opt-in encrypted body-capture** sink — i.e. the hosted feature is armed AND your org enabled capture in its settings (the gateway checks the per-org opt-in before stamping the header, so it never appears for orgs that have not opted in). Always `true` when present; **absent** on every default-path response (capture off by default) and on cache-hit replays (no live body to capture). Non-streaming traces persist request **and** response; streaming traces persist the **request** body only. See [§19 — does Gateway log my prompts?](#19-faq) and the [hosted privacy spec](tokentrimmer-architecture-spec-v1.md#161-customer-data). | `true` |
@@ -559,9 +645,9 @@ failover choices). Discounts the provider applies automatically to its own bill
 — prompt-cache read discounts (e.g. OpenAI cached input tokens, Anthropic
 `cache_read_input_tokens`), net of any cache-write premium — are reported
 separately on `X-TokenTrimmer-Provider-Cache-Saved-Usd` and never inflate the
-TokenTrimmer figure, so `Saved-Usd` reconciles against the provider invoice.
-`X-TokenTrimmer-Cost-Usd` always reflects what the provider actually bills
-(cache discounts included).
+TokenTrimmer figure. `Saved-Usd` and `Cost-Usd` are observed gateway usage
+priced from the active catalog; they are not provider-invoice reconciliation,
+which requires a separate period-level import and comparison.
 
 `X-TokenTrimmer-Warnings` is a comma-separated list of tokens, emitted only when
 the gateway altered the request before dispatch. Currently the gateway emits one
@@ -912,11 +998,82 @@ The open-source gateway binary serves a routes API at `/v1/routes` (note: **no `
 GET    /v1/routes              → list all routes
 POST   /v1/routes              → create a route (body identical to §10.2)
 GET    /v1/routes/:id          → fetch one route
-DELETE /v1/routes/:id          → delete a route
-POST   /v1/routes/:id/pause    → sticky-pause the route's rewrite
-POST   /v1/routes/:id/resume   → the ONLY thing that clears a pause
+DELETE /v1/routes/:id?expected_revision=N
+                               → delete only the management-read revision N
+POST   /v1/routes/:id/pause?expected_revision=N
+                               → sticky-pause only management-read revision N
+POST   /v1/routes/:id/resume?expected_revision=N
+                               → clear a pause only on management-read revision N
 GET    /v1/routes/:id/savings  → windowed netted savings (see below)
 ```
+
+#### Route-triggered workflow releases
+
+A route can opt into automatic execution of a current workflow release by
+setting the closed `then.workflow.environment` selector. Omit `environment` to
+preserve the legacy behavior of executing the latest saved definition.
+
+```json
+{
+  "name": "production-support-flow",
+  "when": { "models": ["gpt-4o"] },
+  "then": {
+    "target_model": null,
+    "workflow": {
+      "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+      "environment": "production",
+      "mode": "detour",
+      "max_cost_usd": 0.05
+    }
+  }
+}
+```
+
+`environment` accepts only `development`, `staging`, or `production`. For each
+matched request, the gateway resolves the selected environment before provider
+work, executes its exact immutable workflow version with its exact current
+non-secret variable snapshot, and records workflow version, release revision,
+and variables revision on the durable workflow run. A missing release, missing
+required variable, inconsistent retained release, or unavailable run-provenance
+store fails the detour before spend. Shadow mode skips the workflow and surfaces
+a warning while the direct request continues. Advancing the environment affects
+only later matched requests; an already accepted run keeps its recorded tuple.
+
+#### Activation evidence and legacy-row recovery
+
+`GET /v1/routes` and `GET /v1/routes/:id` are **management reads**. They
+include disabled routes and expose a persisted legacy/manual row even when the
+runtime refuses to execute it. This makes a bad row repairable or deletable
+instead of silently disappearing from the route list.
+
+Each returned route keeps the familiar flattened route fields (`id`, `name`,
+`priority`, `enabled`, `when`, `then`, and optional `paused`) and adds:
+
+```json
+{
+  "revision": 42,
+  "schema_version": 1,
+  "canonical_hash": "sha256:…",
+  "activation": { "state": "active" }
+}
+```
+
+`revision` is an opaque positive generation token. Every stateful single-route
+operation (`DELETE`, `POST …/pause`, and `POST …/resume`) requires the exact
+value from a recent management read as `expected_revision`; a missing,
+malformed, or stale value makes no change (`400` for an invalid/missing token,
+`409` for a newer current row). The CLI re-reads this value before `tt route rm`;
+API clients must do the same rather than retrying a revision-less delete, pause,
+or resume.
+
+`activation.state` is `active` for a canonical enabled definition,
+`disabled` for a canonical disabled definition, or `invalid` for a stored
+definition the gateway will not execute. An invalid row has
+`"canonical_hash": null` and field-addressed `activation.issues`; its raw
+`when`/`then` JSON is returned unchanged for diagnosis. `active` describes
+canonical enabled eligibility, not a bypass of a sticky pause: when
+`"paused": true`, the route still matches for attribution but its cost action
+is suppressed as described below.
 
 #### Pause / resume
 
@@ -929,10 +1086,10 @@ model: the **expensive, quality-safe** direction. **Safety** levers (`redact`,
 `disable_cache`) stay live — pausing a quality gate never disables a privacy
 guardrail. A forced `X-TokenTrimmer-Route` header does **not** bypass a pause.
 
-Pauses are **sticky**: created manually (`POST /v1/routes/:id/pause`) or by the
+Pauses are **sticky**: created manually (`POST /v1/routes/:id/pause?expected_revision=N`) or by the
 opt-in quality auto-pause (`then.auto_pause` — see the
 [routing rules guide](routing-rules-guide.md)), they persist until an explicit
-`POST /v1/routes/:id/resume`. A resume retains the pause record with a
+`POST /v1/routes/:id/resume?expected_revision=N`. A resume retains the pause record with a
 `resumed_at` watermark: the auto-pause evaluator only counts verdicts recorded
 **after** the most recent resume, so a just-resumed route is re-evaluated on
 fresh evidence, never instantly re-paused by its frozen pre-pause window.
@@ -965,10 +1122,15 @@ never silently subtracted:
   "window_end": "2026-06-11T00:00:00Z",
   "paused": false,
   "requests": 1842,
-  "gross_saved_usd": 12.41,      // Σ per-request Saved-Usd over the route's rows
+  "gross_saved_usd": 12.41,      // legacy positive-only compatibility figure
   "judge_tax_usd": 0.83,         // paired-judge calls + baseline reference dispatches
   "shadow_tax_usd": 0.22,        // discarded shadow-arm spend
-  "net_saved_usd": 11.36,        // gross − judge_tax − shadow_tax; MAY BE NEGATIVE
+  "cache_bust_usd": 0.07,        // itemized; already included in legacy/signed rows
+  "net_saved_usd": 11.36,        // legacy gross − judge_tax − shadow_tax; MAY BE NEGATIVE
+  "positive_estimated_savings_usd": 12.06,
+  "estimated_regressions_usd": 0.16,
+  "summarizer_tax_usd": 0.04,    // itemized; already included in signed row values
+  "net_estimated_savings_usd": 10.85, // positive − regressions − judge_tax − shadow_tax
   "unmetered_tax_rows": 3,       // rows whose tax is unmetered (NULL cost) —
                                  // when > 0 the taxes are lower bounds and the
                                  // net is an upper bound
@@ -977,26 +1139,41 @@ never silently subtracted:
 }
 ```
 
-`net_saved_usd` is deliberately **not clamped at zero**: a regressing route
-whose verification spend exceeds its swap saving must show a negative net.
-Per-request figures (`X-TokenTrimmer-Saved-Usd`, `request_logs`) stay gross — a
-single request doesn't carry the amortized measurement tax; netting exists only
-at this aggregate surface. The shipped gateway binary wires the Postgres
-savings source automatically at boot when `DATABASE_URL` is set; without a
-database the endpoint answers `503` (aggregation not configured). An existing
-route with no in-window traffic answers an honest all-zero body, not `404`.
+Both net fields are deliberately **not clamped at zero**. The additive
+`net_estimated_savings_usd` is the recommended route-level estimate: it keeps a
+request that cost more than its counterfactual visible as a regression instead
+of losing it to a per-row positive floor. Per-request figures
+(`X-TokenTrimmer-Saved-Usd`, `request_logs`) do not carry the amortized
+judge/shadow measurement taxes; that netting exists only at this aggregate
+surface. The shipped gateway binary wires the Postgres savings source
+automatically at boot when `DATABASE_URL` is set; without a database the
+endpoint answers `503` (aggregation not configured). An existing route with no
+in-window traffic answers an honest all-zero body, not `404`.
 
 Two semantics to read the numbers with:
 
-- `gross_saved_usd` is the route's **full per-request savings headline**
-  (`X-TokenTrimmer-Saved-Usd`) summed over its rows — model-swap savings plus
-  any L1/L2 cache-hit, Flex, and compression savings on route-attributed
-  requests. It is **not** the model-swap delta alone; notably, a paused route
-  still serves L1/L2 hits (caching is a safety-neutral lever), so a paused
-  route's gross can keep growing from cache hits while its rewrite is
-  suppressed. The `verdicts` block and `net_saved_usd` are the
-  quality-regression signal; the gross line is invoice-reconcilable savings
-  attribution.
+- `gross_saved_usd` and `net_saved_usd` are retained legacy compatibility
+  fields. Their row contribution is `max(baseline_cost_usd - cost_usd -
+  provider_cache_saved_usd - cache_bust_penalty_usd, 0)`, so a costly request
+  is hidden before the route aggregate is formed. They also predate the
+  durable `summarizer_tax_usd` field. They remain useful for existing clients,
+  but are not the complete row-level estimate. A paused route can still accrue
+  cache-hit savings while its rewrite is suppressed; provider-invoice
+  reconciliation remains a separate, period-level process.
+- The signed fields use each route-attributed request's complete delta:
+  `baseline_cost_usd - cost_usd - provider_cache_saved_usd -
+  cache_bust_penalty_usd - summarizer_tax_usd`. The API reports the sum of
+  its positive half as `positive_estimated_savings_usd`, the absolute
+  magnitude of its negative half as `estimated_regressions_usd`, and
+  `net_estimated_savings_usd = positive_estimated_savings_usd -
+  estimated_regressions_usd - judge_tax_usd - shadow_tax_usd`. Cache-bust and
+  summarizer taxes are already inside the signed row values and are itemized
+  only for auditability—do **not** subtract either again. This is a
+  catalog-priced gateway estimate, not provider-invoice reconciliation.
+- `unmetered_tax_rows` identifies only NULL judge/shadow measurement costs.
+  `summarizer_tax_usd` is the sum of durably recorded row values; the gateway
+  does not yet persist a separate marker for an auxiliary summarizer cost that
+  failed to meter, so that unknown amount cannot be inferred from this response.
 - The window buckets `request_logs` rows and `quality_verdicts` rows
   independently by their own timestamps, and a verdict is written by the
   detached judge task seconds-to-minutes after its request — so a request near
@@ -1319,7 +1496,7 @@ Just the base URL and API key. Existing OpenAI SDK code works as-is. TokenTrimme
 If your route has a fallback chain configured, Gateway tries each fallback in order. If no fallback or all fallbacks fail, Gateway returns a 502 with the upstream error preserved.
 
 **Q: How is cost calculated?**
-Tokens used × per-model pricing from our curated pricing table (a snapshot embedded at build time and refreshed on each release, not auto-refreshed). Reported in `X-TokenTrimmer-Cost-Usd` and reconciled against actual provider invoices monthly.
+Tokens used × per-model pricing from our curated pricing table (a snapshot embedded at build time and refreshed on each release, not auto-refreshed). `X-TokenTrimmer-Cost-Usd` and `X-TokenTrimmer-Saved-Usd` are catalog-priced gateway estimates based on observed usage, not provider-invoice reconciliation.
 
 **Q: Does Gateway log my prompts?**
 No, not by default. By default the gateway records only request **metadata** (token counts, model, route, latency) — never prompt or response bodies. There is one opt-in exception: hosted orgs can enable **encrypted body capture** (per org, off unless you turn it on) so the `/logs` replay tooling can show real request/response bodies. When enabled, the gateway:
@@ -1356,9 +1533,9 @@ Change `base_url` and `api_key`. Both OpenRouter and Helicone use OpenAI-compati
 
 ---
 
-## 21. Deep Research Panel
+## 21. Fusion (multi-model panel)
 
-The Deep Research Panel is an opt-in feature that fans out a single request to N member models concurrently, then passes all responses to an arbiter model that synthesizes or selects the best answer. The panel is **off by default** — a request without the trigger header is handled identically to any other request, with zero overhead.
+Fusion is TokenTrimmer's opt-in multi-model panel: it fans one request out to N member models concurrently, then passes their responses to an arbiter model that synthesizes or selects an answer. It is not a web-search, source-capture, or citation-backed Deep Research workflow. The panel is **off by default** — a request without the trigger header is handled identically to any other request, with zero overhead.
 
 ### 21.1 Enabling and trigger
 
@@ -1412,7 +1589,7 @@ On `/v1/chat/completions` and `/v1/responses`, you can fine-tune the panel by in
 | `members` | string[] | gateway default (`TT_PANEL_DEFAULT_MEMBERS`) | Model ids to fan out to. Overrides the gateway default entirely when non-empty. |
 | `arbiter_model` | string | gateway default (`TT_PANEL_DEFAULT_ARBITER`) | Model used for arbitration (Synthesize/BestOfN). |
 | `quorum` | integer | see §21.3 | Minimum legs that must succeed before arbitration. |
-| `max_cost_usd` | float | none | Per-request hard cost ceiling (USD); see §21.5. |
+| `max_cost_usd` | float | none | Per-request preflight budget estimate (USD); see §21.5. |
 
 `/v1/messages` (Anthropic wire) accepts the `X-TokenTrimmer-Panel` header but does **not** accept `tt_extras.panel` — header-only trigger on that ingress.
 
@@ -1540,13 +1717,14 @@ data: [DONE]
 
 The `tokentrimmer.panel` shape is **identical across all three ingresses** — `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` all carry or emit the same object.
 
-### 21.5 Budget gate (required)
+### 21.5 Preflight budget gate (required)
 
-A panel request **requires an explicit cost ceiling**. Provide one via:
+A Fusion panel request **requires an explicit preflight budget**. Provide one via:
+
 - `X-TokenTrimmer-Cost-Limit-Usd` request header (e.g. `0.10`), OR
 - `tt_extras.panel.max_cost_usd` in the body.
 
-The gateway estimates the total cost (Σ all members + arbiter, including fee multipliers) **before any dispatch**. If no ceiling is provided, or if any member model is unpriced, or if the estimate exceeds the ceiling, the request is rejected with `402` before any leg is dispatched. This is fail-closed — a panel can never exceed its declared budget and a budget-less panel is always rejected.
+The request must also provide an explicit member output cap: `max_completion_tokens` takes precedence when supplied, otherwise use `max_tokens`. The gateway estimates the known total cost (all member calls, requested `n` choices, arbiter candidate fan-in, and the fixed Synthesize/Best-of-N arbiter allowance, including fee multipliers) **before any dispatch**. If the budget or output cap is absent, any required model is unpriced, the strategy has unpriced work, or the estimate exceeds the budget, the request is rejected with `402` before any leg is dispatched. In particular, `majority` is currently rejected by the budget gate because its embedding pass has no pricing contract. This is an admission check, not a runtime spend ceiling; treat the configured value as a maximum planned estimate until runtime reservations, settlement, and cancellation are implemented. A budget-less panel is always rejected.
 
 ### 21.6 Billing
 
@@ -1589,7 +1767,7 @@ From the billing and overage meter perspective a panel counts as **one request**
 
 | Metric | Labels | Description |
 |---|---|---|
-| `panel_requests_total` | `strategy`, `outcome` (`success`/`quorum_unmet`/`strategy_unsupported`/`error`) | One increment per panel request attempt |
+| `panel_requests_total` | `strategy`, `outcome` (`success`/`quorum_unmet`/`credential_preflight`/`strategy_unsupported`/`error`) | One increment per panel request attempt |
 | `panel_legs_total` | `role` (`leg`/`arbiter`), `status` (`ok`/`error`/`timeout`/`skipped_no_cred`) | One increment per dispatched leg |
 
 ---
@@ -1637,7 +1815,7 @@ Authenticate the same way as chat completions (§2): a TokenTrimmer key in `Auth
 | `messages` | array | yes | Initial transcript — system/user messages in OpenAI format. |
 | `tools` | array | no | Tool definitions advertised to the model. Defaults to `[]`. |
 | `max_turns` | integer | no | Turn cap; clamped to `[1, 32]`. Default: 10. |
-| `max_cost_usd` | number | no | Hard ceiling on the run's total accumulated served cost (USD). The run stops as `incomplete` with `stop_reason: "budget_exhausted"` before starting a turn that would breach it. A best-effort next-turn estimate is used to tighten the check before each turn when the model is in the pricing catalog. |
+| `max_cost_usd` | number | no | Admission guard on accumulated served cost (USD). Before a new turn, the run stops as `incomplete` with `stop_reason: "budget_exhausted"` when accrued cost—plus a best-effort estimate when the model is priced—reaches the cap. A turn already started can settle beyond the cap; this is not a reservation/settlement or provider-invoice guarantee. |
 | `stream` | boolean | no | When `true`, the response is a stream of SSE run events (see §23.4). Default `false`. |
 
 ### 23.3 Response (non-streaming)
@@ -1769,7 +1947,7 @@ let outcome = client
     .message(system("You are a helpful assistant."))
     .message(user("Summarize the TokenTrimmer README"))
     .max_turns(5)
-    .max_cost_usd(0.05)   // hard cost ceiling
+    .max_cost_usd(0.05)   // preflight cost-admission cap, not a runtime spend ceiling
     .run(&NoTools)
     .await?;
 
@@ -1857,7 +2035,7 @@ The run's total **served cost** (sum of `x-tokentrimmer-cost-usd` across all tur
 
 ## 24. Workflow Engine
 
-The workflow engine lets you define and execute multi-step, multi-node AI pipelines as a DAG of typed nodes. Each node is an LLM call, an agentic loop, a conditional branch, a deterministic transform, or an output collector. Workflows are versioned: every `POST /v1/workflows` stores a new immutable version; reads always return the latest.
+The workflow engine lets you define and execute multi-step, multi-node AI pipelines as a DAG of typed nodes. Each node is an LLM call, an agentic loop, a conditional branch, a deterministic transform, or an output collector. Workflows are versioned: every `POST /v1/workflows` stores a new immutable version. The ordinary definition read returns latest, while the bounded version-history endpoints expose exact retained versions read-only.
 
 **Authentication:** a real `tt_live_*` key in `Authorization: Bearer …`. Dogfood keys and anonymous callers receive `401`. Requires Postgres; returns `503` when the pool is absent.
 
@@ -1877,6 +2055,43 @@ A workflow definition is a JSON object with the following top-level fields:
 | `inputs` | object | no | Freeform input schema / defaults passed to the trigger node. |
 | `budget` | object | no | Run-level cost cap (see §24.6). |
 | `allowed_hosts` | array of strings | no | Per-workflow egress allowlist for Http nodes (default-deny: `[]`). Each entry is a bare hostname (e.g. `"api.example.com"`). Http nodes whose URL host is not an exact member of this list are rejected at definition-save time and again at run time. |
+| `metadata` | JSON value | no | Editor metadata. The engine does not execute it, but clients must preserve it when updating a definition. |
+| `triggers` | array | no | Out-of-band invokers. A `schedule` runs on a bounded interval; a `webhook` enables a signed invocation URL. Omit or send `[]` for human-run-only workflows. |
+
+`POST /v1/workflows` is a strict top-level contract: unknown top-level fields
+are rejected rather than silently discarded. Read-modify-write clients must
+preserve every returned top-level field, including `metadata` and `triggers`.
+
+#### Out-of-band triggers
+
+```json
+"triggers": [
+  { "type": "schedule", "interval": "6h", "environment": "staging" },
+  { "type": "webhook", "token_id": "ops_sync_1", "environment": "production" }
+]
+```
+
+`schedule.interval` accepts bounded duration components such as `"1h"`,
+`"6h"`, `"1d"`, or `"1d6h"`; new or updated definitions must be between one
+hour and 30 days. At most one schedule trigger is allowed per workflow. The
+hosted dispatcher normally picks due work up on an approximate hourly sweep,
+not at an exact wall-clock time; startup, leader acquisition, and the configured
+sweep profile can add pickup jitter. A webhook `token_id` must be a non-empty
+URL-safe identifier (`A-Z`, `a-z`, `0-9`, `_`, `-`). The signing key and final
+URL are managed server-side; do not place a webhook secret in the definition.
+
+Each trigger may optionally select `development`, `staging`, or `production`.
+The hosted control plane resolves that environment once when it durably queues
+an occurrence, persists the exact workflow version, release revision, and
+non-secret variable revision, and replays that tuple unchanged after pointer
+movement. Omit `environment` to preserve the legacy latest-saved-definition
+behavior. A missing release or positive variable snapshot fails before gateway
+provider work; it never falls back to latest or to the current variable set.
+
+Definitions persisted before the one-hour validation floor are not rewritten or
+disabled by this change. Operators must inventory and explicitly migrate any
+stored sub-hour schedule to one hour or longer; those legacy definitions remain
+compatibility-only and do not gain a sub-hour delivery guarantee.
 
 Each edge:
 
@@ -1915,7 +2130,8 @@ Single LLM call.
 |---|---|---|---|
 | `selection` | object | yes | Which model to use (see §24.3). |
 | `prompt` | string | yes | Prompt template; `{{input}}` is replaced with the node's input value. |
-| `max_cost_usd` | number | no | Per-node USD ceiling. |
+| `max_output_tokens` | integer | no | Positive completion-token limit sent to the provider. Omit to retain legacy provider-default output behavior. Required on every model/agent node only when this workflow is admitted under a run-level `max_cost_usd`. |
+| `max_cost_usd` | number | no | Per-node preflight USD admission cap; a started node can settle above it. |
 
 #### `agent`
 
@@ -1937,7 +2153,8 @@ Multi-turn agentic loop with tool access.
 | `selection` | object | yes | Which model to use (see §24.3). |
 | `prompt` | string | yes | Prompt template. |
 | `max_turns` | integer | no | Turn cap for the agent loop. Defaults to 8. |
-| `max_cost_usd` | number | no | Per-node USD ceiling. |
+| `max_output_tokens` | integer | no | Positive per-turn completion-token limit. Omit to retain legacy provider-default output behavior. Required on every model/agent node only when this workflow is admitted under a run-level `max_cost_usd`. |
+| `max_cost_usd` | number | no | Per-node preflight USD admission cap; a started node can settle above it. |
 | `tools` | array | no | Tool definitions advertised to the model. Defaults to `[]`. |
 
 #### `transform`
@@ -2021,7 +2238,10 @@ and again at run time if the host is not allowlisted.
 `headers` value or `body` string. At run time the gateway substitutes the
 decrypted value before the request is made. The secret value never appears in
 logs, the node journal, or any API response. Store secrets with
-`POST /v1/workflows/secrets` (see §24.7).
+`POST /v1/workflows/secrets` (see §24.7). Before executing any node in the
+current workflow definition, the engine verifies that every referenced secret
+is available and decryptable; otherwise the run fails with zero cost and no
+HTTP dispatch.
 
 **Allowlist enforcement** is applied at definition-save time (`POST /v1/workflows`)
 and again at run time. A workflow with an `http` node whose host is absent from
@@ -2067,15 +2287,18 @@ any recursive call is made.  The guard maintains an ancestors list; if the child
 sub-workflow cycle detected
 ```
 
-**Budget rollup.** The parent passes its remaining run budget down to the child.
-On child success the child's `cost_usd` and `baseline_cost_usd` are folded into
-the parent's running totals.  The child's `saved_usd` is **not** added directly
+**Budget rollup.** For an uncapped legacy execution, a child's `cost_usd` and
+`baseline_cost_usd` are folded into the parent's running totals. The child's
+`saved_usd` is **not** added directly
 — savings are always re-derived as `(accrued_baseline − accrued_cost)` at the
 end of the parent run to prevent double-counting.
 
 **Child failure propagates.** If the child run ends with `Failed` or
 `BudgetExhausted`, the parent run also ends with the same status.  Any cost
 already incurred by the child is included in the parent's reported `cost_usd`.
+A run requesting `max_cost_usd` is instead rejected at static admission before
+dispatch when it contains any `sub_workflow`; this rollup is not a reservation
+or a cost-ceiling guarantee.
 
 **Output mapping.** The SubWorkflow node's output `content` is the child
 workflow's `node_outputs` array serialized as JSON.  Downstream nodes can
@@ -2107,7 +2330,11 @@ Execute a stored body workflow repeatedly while a condition holds (while-semanti
 
 **`max_iters` hard cap (1–100).** Passing `max_iters: 0` or `max_iters > 100` is a validation error.  The cap is the definitive termination guarantee: even an always-true condition cannot cause an infinite loop.
 
-**Budget stop.** At the start of each iteration, if `accrued_cost + loop_cost_so_far >= run_max_cost_usd`, the loop exits early (the condition is not re-evaluated).  The loop node itself still returns `Succeeded`; the budget is tracked at the parent run level.
+**Capped admission.** A public workflow run requesting `max_cost_usd` is
+rejected before dispatch when it contains a `loop`, because the future number
+of body executions cannot be projected as one bounded direct graph. Existing
+uncapped workflows retain loop behavior; this is not a spend reservation or a
+runtime cost-ceiling claim.
 
 **Per-iteration output threading.** After each iteration the body's `node_outputs` array is serialized as JSON and stored under the loop node's id in the output map.  The next iteration's condition evaluation and the body's trigger input both receive this value, so downstream cond expressions (e.g. `{{retry}} != "STOP"`) can react to what the body last produced.
 
@@ -2133,6 +2360,13 @@ The `selection` field on `model` and `agent` nodes determines how the model is r
 
 Validates and stores a workflow definition. If the `id` is new, version 1 is created. If the `id` already exists (for the same org), the next version is computed atomically.
 
+`expected_latest_version` is an optional write-only optimistic precondition. `0`
+means the org/workflow must have no retained version; a positive value must
+match its current latest version. A mismatch or a concurrent writer returns
+`409` and appends no row. Omitting the field retains the legacy unconditional
+append behavior. The ordinary `version` definition field remains ignored for
+write concurrency and is not a substitute for this precondition.
+
 **Request body:** a workflow definition object (§24.1).
 
 **Response (`201 Created`):**
@@ -2145,7 +2379,7 @@ Validates and stores a workflow definition. If the `id` is new, version 1 is cre
 }
 ```
 
-**Error codes:** `400` with a list of validation errors (e.g. cycle detected, unknown model, Auto selection); `409` on a concurrent-insert version conflict (retry); `500` on a DB write error; `503` when Postgres is unavailable.
+**Error codes:** `400` with a list of validation errors (including an unrepresentable precondition); `409` when `expected_latest_version` is stale or a concurrent insert wins (reload before retrying); `500` on a DB write error; `503` when Postgres is unavailable.
 
 ---
 
@@ -2177,20 +2411,245 @@ Returns the full workflow definition for the latest version of the given id, sco
 
 ---
 
+#### `GET /v1/workflows/:id/versions` — list immutable definition versions
+
+Returns newest-first metadata for at most 100 retained versions of exactly one
+org-owned workflow. The handler fetches one extra row to set `truncated` and
+never returns another org's existence or metadata. The response is
+`Cache-Control: private, no-store`.
+
+```json
+{
+  "object": "list",
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "data": [
+    {
+      "version": 3,
+      "content_hash": "a1b2c3d4...",
+      "created_at": "2026-06-28T12:00:00Z"
+    }
+  ],
+  "truncated": false
+}
+```
+
+Returns `404` for an absent or differently owned workflow, `500` on a storage
+read/decode failure, and `503` when Postgres is unavailable.
+
+#### `GET /v1/workflows/:id/versions/:version` — get one immutable version
+
+Returns the exact retained definition and its authoritative version,
+`content_hash`, and `created_at` metadata. `version` must be a positive integer.
+The definition's embedded `version` is patched from the database row, and the
+response is `Cache-Control: private, no-store`. An absent, unowned, or
+non-retained version returns `404`.
+
+#### `GET /v1/workflows/:id/versions/:from/compare/:to` — compare two immutable versions
+
+Returns a deterministic, value-free structural comparison of two positive
+org-owned versions. `from` and `to` metadata include each authoritative
+version, content hash, and creation timestamp. `data` contains only RFC 6901
+JSON Pointer paths and one of `added`, `removed`, or `modified`; neither
+definition's values are echoed. The server-owned embedded `version` field is
+excluded from authored changes.
+
+At most 256 entries are returned. The walker stops at 64 nested levels, reports
+that subtree as one modified path, and fetches one further detected change only
+to set `truncated`. The response is `Cache-Control: private, no-store`.
+
+```json
+{
+  "object": "workflow_definition_version_diff",
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "from": {
+    "version": 2,
+    "content_hash": "0a1b2c3d...",
+    "created_at": "2026-06-27T12:00:00Z"
+  },
+  "to": {
+    "version": 3,
+    "content_hash": "a1b2c3d4...",
+    "created_at": "2026-06-28T12:00:00Z"
+  },
+  "changed": true,
+  "data": [
+    { "path": "/name", "kind": "modified" },
+    { "path": "/metadata/canvas_positions/new-node", "kind": "added" }
+  ],
+  "truncated": false
+}
+```
+
+The immutable history/read/compare endpoints do not mutate release state.
+
+#### Workflow release state — explicit publish, promotion, and rollback pointers
+
+Every immutable version starts as a draft. Release state is separate metadata:
+one compare-and-swap current pointer per `development`, `staging`, and
+`production` environment, backed by an append-only release ledger. Release
+responses include versions, hashes, revisions, transition provenance, and
+timestamps only—never definitions or secret values—and are
+`Cache-Control: private, no-store`.
+
+`GET /v1/workflows/:id/release-state` returns the newest saved version plus the
+current pointer for each environment that has a release. `data` is always in
+development → staging → production order and contains at most three entries.
+
+```json
+{
+  "object": "workflow_release_state",
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "latest": {
+    "version": 4,
+    "content_hash": "draft-hash...",
+    "created_at": "2026-07-20T18:00:00Z"
+  },
+  "data": [
+    {
+      "environment": "development",
+      "revision": 2,
+      "workflow_version": 3,
+      "content_hash": "released-hash...",
+      "action": "publish",
+      "source_environment": null,
+      "source_revision": null,
+      "created_at": "2026-07-20T17:00:00Z"
+    }
+  ]
+}
+```
+
+`GET /v1/workflows/:id/environments/:environment/releases` returns at most 100
+newest-first immutable release records for one environment and an explicit
+`truncated` flag. This history supplies the exact `release_revision` accepted
+by rollback without exposing a retained definition.
+
+`POST /v1/workflows/:id/environments/development/publish` points development
+at one exact retained version. `expected_release_revision` is `0` only when no
+development release exists; otherwise it must match the current revision and
+the target workflow version must be newer than development's current version.
+Restoring an older version uses the rollback endpoint and same-environment
+release history.
+
+```json
+{ "workflow_version": 4, "expected_release_revision": 2 }
+```
+
+`POST /v1/workflows/:id/environments/:environment/promote` accepts only
+`staging` or `production`. Staging copies the exact current development
+version; production copies the exact current staging version. Both source and
+target revisions are required optimistic preconditions, and the caller cannot
+substitute a different version.
+
+```json
+{ "expected_source_revision": 2, "expected_release_revision": 0 }
+```
+
+`POST /v1/workflows/:id/environments/:environment/rollback` appends a new
+current release that restores the workflow version recorded by an earlier
+release revision in that same environment. It cannot target an arbitrary saved
+draft or another environment's history.
+
+```json
+{ "release_revision": 1, "expected_release_revision": 2 }
+```
+
+All three mutations return `409` for a stale revision, concurrent winner,
+missing source transition, same-version no-op, or otherwise invalid current
+state, with no partial pointer/ledger update. A missing publish target returns
+`404`; malformed/nonpositive/out-of-range inputs return `400`. Because a
+successful transition increments the target revision, its expected revision
+must be at most 2,147,483,646.
+
+This contract does not constitute human approval, and it does not silently
+change legacy latest-version Estimate/Run or durable-trigger behavior. Direct
+Estimate/Run callers may opt into the explicit environment selector below;
+automatic trigger activation and attributable approval remain separate gates.
+
+---
+
+#### Workflow environment variables — versioned non-secret configuration
+
+`GET` and `PUT /v1/workflows/:id/environments/:environment/variables` manage
+one independently versioned configuration map for `development`, `staging`,
+or `production`. This is explicitly a **non-secret** surface: management reads
+return the values. Credentials belong in the encrypted workflow-secrets API.
+Responses use `Cache-Control: private, no-store`.
+
+An environment without a stored snapshot returns the implicit empty revision:
+
+```json
+{
+  "object": "workflow_environment_variables",
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "environment": "production",
+  "revision": 0,
+  "variables": {},
+  "updated_at": null
+}
+```
+
+`PUT` replaces the complete map under an optimistic `expected_revision`:
+
+```json
+{
+  "expected_revision": 0,
+  "variables": {
+    "API_BASE": "https://api.example.com/v2",
+    "REGION": "us-east"
+  }
+}
+```
+
+Names must match `^[A-Z0-9_]{1,64}$`. A set contains at most 100 entries,
+each value at most 4,096 UTF-8 bytes, and at most 65,536 encoded bytes in
+total. Unknown request fields and unknown environments are rejected. A stale
+revision returns `409`; an exact retry of the current value is idempotent.
+Each successful change appends an immutable snapshot and advances only the
+selected environment's current pointer.
+
+Executable template fields may bind `{{variables.NAME}}`. An environment-bound
+Estimate/Run accepts the current immutable variable snapshot independently of
+the release pointer and reports its exact revision. Before an execution starts,
+the gateway validates every variable reference in the bounded, frozen nested
+workflow tree and fails at zero cost if a required name is absent. A latest- or
+exact-version run has no environment snapshot, so definitions containing these
+references fail closed on those execution paths. The accepted map applies to
+the root and every nested workflow in that run.
+
+---
+
 #### `POST /v1/workflows/:id/estimate` — pre-run cost projection
 
-Returns a static cost projection for the workflow's latest definition. No model calls are made.
+Returns a static cost projection without making model calls. By default it
+uses the workflow's latest definition.
+
+Set optional positive `workflow_version` (legacy alias: `version`) to estimate
+that exact retained org-owned definition instead of latest. Alternatively set
+`workflow_environment` to `development`, `staging`, or `production` to resolve
+that environment's exact current immutable release. The two selectors are
+mutually exclusive. A missing requested version or environment release returns
+`404`; zero/negative versions and unknown environments return `400` before
+execution.
 
 **Request body:**
 
 ```json
-{ "inputs": {} }
+{ "inputs": {}, "workflow_version": 3 }
+```
+
+```json
+{ "inputs": {}, "workflow_environment": "production" }
 ```
 
 **Response:**
 
 ```json
 {
+  "workflow_version": 3,
+  "workflow_environment": "production",
+  "release_revision": 2,
+  "variables_revision": 4,
   "projected_cost_usd": 0.0012,
   "per_node": [
     { "node_id": "summarise", "model": "claude-3-5-haiku-20241022", "cost_usd": 0.0008 },
@@ -2208,11 +2667,25 @@ Returns a static cost projection for the workflow's latest definition. No model 
 
 Executes the workflow synchronously and returns the result. Bounded by the 60-second gateway timeout.
 
+For durable callers, send a stable Idempotency-Key header. The gateway hashes
+that value before storage and creates or reuses one run per (org, workflow,
+key). The first accepted request binds the key to its immutable workflow
+version, canonical JSON inputs, max_cost_usd request option, and explicit
+environment or frozen release selector when supplied. A retry with changed
+inputs, cost, version, environment, release revision, or variable revision
+receives 409. Repeating the same current-environment selector
+reuses the release and variables revisions accepted first even if either current
+pointer has since advanced.
+Legacy retries without `workflow_environment` preserve their pre-existing
+fingerprint and behavior. Clients without Idempotency-Key retain the historical
+behavior: every request creates a fresh run.
+
 **Request body:**
 
 ```json
 {
   "inputs": { "text": "Summarise this document…" },
+  "workflow_environment": "production",
   "max_cost_usd": 0.05
 }
 ```
@@ -2220,13 +2693,45 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `inputs` | object | no | Input values passed to the trigger node. |
+| `workflow_version` | integer | no | Exact immutable definition version to execute. Omit for the latest version on a new invocation. `version` is accepted as a compatibility alias. |
+| `workflow_environment` | string | no | Current `development`, `staging`, or `production` release to resolve before execution. Normally mutually exclusive with `workflow_version`; durable automatic delivery uses the complete four-field frozen tuple described below. Route detours have a separate optional `then.workflow.environment` selector (§10.7). |
+| `release_revision` | integer | no | Positive immutable release-ledger revision. Valid only with all of `workflow_version`, `workflow_environment`, and `variables_revision`. |
+| `variables_revision` | integer | no | Nonnegative immutable non-secret variable revision; `0` is the implicit empty set. Valid only as part of the complete frozen tuple. |
 | `max_cost_usd` | number | no | Run-level USD cap. Superseded by `def.budget.max_cost_usd` when that is set. |
+
+Idempotency-Key is optional, must be 1–256 visible bytes, and is never
+returned or stored in raw form. stream is deliberately not part of the logical
+invocation binding: a retry may request status JSON after a lost SSE connection
+without starting a second run.
+
+Schedule/webhook bridges use a complete frozen selector:
+
+```json
+{
+  "inputs": {},
+  "workflow_version": 3,
+  "workflow_environment": "production",
+  "release_revision": 2,
+  "variables_revision": 4,
+  "stream": false
+}
+```
+
+That four-field shape requires `Idempotency-Key`. Any partial tuple, unknown
+environment, nonpositive workflow/release revision, negative variable revision,
+missing immutable ledger row, or release/version mismatch fails closed. The
+gateway reads the exact release and variable ledgers and does not consult either
+current pointer for this request shape.
 
 **Response:**
 
 ```json
 {
   "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "workflow_version": 3,
+  "workflow_environment": "production",
+  "release_revision": 2,
+  "variables_revision": 4,
   "status": "completed",
   "cost_usd": 0.00312,
   "baseline_cost_usd": 0.00480,
@@ -2244,11 +2749,99 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
 | Field | Type | Description |
 |---|---|---|
 | `run_id` | string (UUID) | The run's unique identifier. |
+| `workflow_version` | integer | Exact immutable definition version that executed. |
+| `workflow_environment` | string | Present only when the caller selected an environment; the closed development/staging/production value resolved before execution. |
+| `release_revision` | integer | Present with `workflow_environment`; exact immutable release-ledger revision bound to the run. |
+| `variables_revision` | integer | Present with `workflow_environment`; exact immutable non-secret configuration snapshot accepted by the run. `0` is the implicit empty set. |
 | `status` | string | Terminal status of the run (see values below). |
 | `cost_usd` | number | Total served cost (USD) across all nodes in this run. |
 | `baseline_cost_usd` | number | What the run would have cost without routing — sum of per-node baseline costs (the default/first-ranked model's price). Zero when no model nodes executed. |
-| `saved_usd` | number | `baseline_cost_usd − cost_usd`, floored at 0. Positive values indicate routing saved money; 0 when cost ≥ baseline (e.g. the route was unchanged). Note: this is the run-level indicative figure; a signed/netted authoritative receipt will be minted per-run in a forthcoming release. |
+| `saved_usd` | number | `baseline_cost_usd − cost_usd`, floored at 0. Positive values indicate routing saved money; 0 when cost ≥ baseline (e.g. the route was unchanged). This is a catalog-priced run-level estimate, not provider-invoice reconciliation. An eligible retained terminal run may be minted on demand as a signed estimate; it is not automatic per-run proof. |
 | `node_outputs` | array | Per-node output and cost (see below). |
+
+With `"stream": true`, the response is a named SSE stream. Before any node
+event or provider work, `run.start` carries the run id and exact accepted
+immutable definition version. An environment-bound run additionally carries a
+single nested `workflow_release` object, so environment plus release and
+variables revisions cannot be separated on the wire:
+
+```text
+event: run.start
+data: {"type":"run.start","run_id":"550e8400-e29b-41d4-a716-446655440000","workflow_version":3,"workflow_release":{"environment":"production","revision":2,"variables_revision":4}}
+```
+
+Selector-free and exact-version streams omit `workflow_release`. Clients should
+validate this first event against their request before presenting release
+provenance; a malformed or mismatched event does not mean the already accepted
+run was cancelled, so reconcile it through the retained run endpoint.
+
+An exact Idempotency-Key replay returns the existing run_id and current totals
+with 200 for a terminal run or 202 while it is running, plus the
+Idempotent-Replay: true header and a replayed: true response field. It is a
+status/reconciliation response, so node_outputs is empty; use
+GET /v1/workflows/runs/:run_id for the durable run status. It never executes
+the graph again. Recent-run and single-run reads likewise expose
+`workflow_environment`, `release_revision`, and `variables_revision` only for
+environment-bound runs;
+legacy latest/exact-version rows retain null provenance.
+
+#### `GET /v1/workflows/runs/:run_id/nodes` — inspect the retained node journal
+
+Returns at most 500 persisted node-journal rows for one org-owned run. The
+gateway first resolves the run under the authenticated org, then joins the
+node rows through that owned run; a foreign run id returns 404. Labels,
+`node_type`, and `definition_position` are derived from the exact immutable
+workflow version recorded on the run, not from the latest editor definition.
+Successful responses include `Cache-Control: private, no-store`.
+
+The response also includes `workflow_version`, `workflow_name`, and the
+definition's freeform `workflow_inputs_schema` so an inspector can compare the
+accepted run inputs with the contract/defaults that executed.
+
+```json
+{
+  "object": "list",
+  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "workflow_id": "8aa43e0d-f318-4d3c-bb52-7ed725a4fb51",
+  "workflow_version": 3,
+  "workflow_name": "Summarise and score",
+  "workflow_inputs_schema": { "text": { "type": "string" } },
+  "truncated": false,
+  "data": [
+    {
+      "id": "ab21f7aa-c0e7-44aa-8601-03a44fedf860",
+      "journal_index": 1,
+      "node_id": "summarise",
+      "definition_position": 2,
+      "node_type": "model",
+      "label": "02. model · summarise",
+      "attempt": 1,
+      "status": "completed",
+      "output": { "content": "The document discusses…" },
+      "cost_usd": 0.00312,
+      "model_used": "gpt-4o-mini",
+      "error": null,
+      "timing_source": "gateway_node_envelope",
+      "started_at": "2026-07-20T10:00:00.000Z",
+      "finished_at": "2026-07-20T10:00:00.125Z",
+      "duration_ms": 125,
+      "legacy_recorded_at": null
+    }
+  ]
+}
+```
+
+Node journaling is best-effort, so an empty list does not prove that no node
+executed. For new rows, `started_at`, `finished_at`, and `duration_ms` describe
+the gateway workflow-node envelope; for Model/Agent nodes that spans the
+executor call, not individual provider attempts. Internal retries, fallback
+attempts, and provider timing are not reconstructed. Legacy rows instead use
+`timing_source: "legacy_post_run_persistence"`, set only
+`legacy_recorded_at`, and leave the three execution fields null.
+`journal_index` is stable for repeated reads, but is not a duration or a
+provider-attempt sequence. Trigger/Output nodes and some early guard failures
+do not produce rows, and subworkflow child identity is not reconstructed. This
+endpoint is read-only inspection, not a breakpoint or replay API.
 
 **`status` values:**
 
@@ -2269,13 +2862,15 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
       "id": "summarise",
       "type": "model",
       "selection": { "type": "model", "model": "claude-3-5-haiku-20241022" },
-      "prompt": "Summarise this in one sentence: {{input}}"
+      "prompt": "Summarise this in one sentence: {{input}}",
+      "max_output_tokens": 128
     },
     {
       "id": "score",
       "type": "model",
       "selection": { "type": "model", "model": "claude-3-5-haiku-20241022" },
-      "prompt": "Rate the quality of this summary 0–1: {{input}}"
+      "prompt": "Rate the quality of this summary 0–1: {{input}}",
+      "max_output_tokens": 128
     },
     { "id": "done", "type": "output" }
   ],
@@ -2290,7 +2885,18 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
 
 ### 24.6 Budget policy
 
-The `budget` field on a workflow definition sets a hard run-level USD ceiling:
+The `budget` field asks the gateway to perform bounded static budget admission
+before it creates a run record or dispatches a provider request. An admitted
+capped wave then runs priceable single-turn nodes sequentially: each directional
+preview is reserved against the remaining value and settled to actual node cost
+before the next sibling can launch. Immediately before dispatch, the final
+routed/shaped request is priced again against that node's effective remaining
+value. A capped workflow node allows one provider attempt: route fallbacks,
+retries, shadow/panel/workflow fan-out, quality-judge work, and diff re-emission
+are suppressed because those extra legs are not included in the reservation.
+This in-memory reservation is not a hard runtime cost ceiling or
+provider-invoice guarantee: a started provider turn can still settle
+differently from its directional estimate.
 
 ```json
 { "max_cost_usd": 0.10, "on_exceed": "stop" }
@@ -2298,8 +2904,8 @@ The `budget` field on a workflow definition sets a hard run-level USD ceiling:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `max_cost_usd` | number | none | Maximum USD cost for the entire run. |
-| `on_exceed` | string | `"stop"` | Action when the cap is reached. Only `"stop"` is supported. The run stops before the node that would breach the budget, with status `"budget_exhausted"`. |
+| `max_cost_usd` | number | none | Requested USD value for static admission and runtime reservation checks. Capped admission requires each model/agent node to set a positive `max_output_tokens`, only `{{input}}` prompt references, pinned priceable selections, single-turn agents without tools, and no loops/sub-workflows. |
+| `on_exceed` | string | `"stop"` | Action for the runtime guard when it detects a budget condition. Only `"stop"` is supported; it does not make a started call or provider invoice hard-capped. |
 
 A `max_cost_usd` can also be supplied per-run in the `POST /v1/workflows/:id/runs` request body. The definition-level budget (`def.budget.max_cost_usd`) takes precedence when both are set.
 
@@ -2321,14 +2927,14 @@ returned in any response or log.**
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | yes | Secret name. Must match `^[A-Z0-9_]{1,64}$` (uppercase letters, digits, and underscore). |
-| `value` | string | yes | Plaintext secret value. Encrypted before storage; never echoed. |
+| `value` | string | yes | Plaintext secret value, 1–65,536 UTF-8 bytes. Encrypted before storage; never echoed. |
 
 **Status codes:**
 
 | Code | Meaning |
 |---|---|
 | `204 No Content` | Secret stored (or rotated) successfully. |
-| `400 Bad Request` | `name` does not match `^[A-Z0-9_]{1,64}$`. |
+| `400 Bad Request` | `name` is invalid, or `value` is empty or larger than 65,536 UTF-8 bytes. |
 | `401 Unauthorized` | Missing or invalid bearer token, or dogfood key. |
 | `503 Service Unavailable` | `TT_MASTER_KEY` not configured on this gateway instance. |
 
@@ -2345,6 +2951,51 @@ curl -X POST https://gateway.tokentrimmer.com/v1/workflows/secrets \
 Secrets are scoped to the authenticated org. Each org's secrets are isolated:
 a secret named `MY_KEY` for org A cannot be read or decrypted by org B.
 
+#### `GET /v1/workflows/secrets` — list safe secret metadata
+
+Returns at most 500 names in ascending order for the authenticated org. The
+response contains no secret value, ciphertext, hash, length, or key material,
+and carries `Cache-Control: private, no-store`.
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "name": "EXAMPLE_API_KEY",
+      "state": "ready",
+      "created_at": "2026-07-19T12:00:00Z",
+      "rotated_at": null
+    }
+  ],
+  "truncated": false
+}
+```
+
+`ready` means only that the ciphertext decrypts under this gateway's current
+master key; it does not validate the credential with a downstream provider.
+`unusable` means a master key is configured but the row does not decrypt.
+`unavailable` means this gateway has no configured master key. Names are still
+security-sensitive metadata and should not be cached or copied into prompts.
+
+#### `DELETE /v1/workflows/secrets/:name` — delete a per-org secret
+
+Idempotently removes the named ciphertext for the authenticated org and
+returns `204 No Content`, including when the name is already absent. `name`
+must match `^[A-Z0-9_]{1,64}$`; an invalid name returns `400`. Deletion does
+not require `TT_MASTER_KEY`, does not rewrite stored workflow versions, and
+does not disclose whether another org has the same name.
+
+Deleting a referenced name takes effect immediately. Every retained workflow
+version and durable trigger that starts a run loads and checks the complete
+executable nested-definition tree before the root Trigger or any parent node.
+The run fails at zero cost if any checked definition has a malformed, missing,
+or unusable secret or environment-variable reference. The preparation is bounded to 256 nested definitions
+through the five supported depth levels, uses org-scoped depth-batch reads, and
+reuses those exact loaded definitions during execution so a newer saved child
+cannot bypass the check. Recreate the same name with `POST` to restore future
+runs; the previous value is not recoverable through this API.
+
 #### Using secrets in Http nodes
 
 Reference a stored secret in any `headers` value or `body` string using
@@ -2358,9 +3009,10 @@ Reference a stored secret in any `headers` value or `body` string using
 ```
 
 At run time the gateway resolves `{{secrets.NAME}}` to the decrypted value
-before making the HTTP request. If a referenced secret has not been stored,
-the token resolves to an empty string (the request is still made; the
-downstream service will likely reject it).
+before making the HTTP request. Missing, undecryptable, or unavailable
+references anywhere in the bounded nested tree fail closed before the root
+workflow executes its Trigger or any provider/HTTP node. The exact definitions
+checked during preparation are the definitions reused by recursive execution.
 
 #### Security model
 
@@ -2380,6 +3032,9 @@ downstream service will likely reject it).
 - **AAD-bound ciphertext.** Each secret's ciphertext is bound to `(org_id, name)`
   via AEAD additional-data; copying a ciphertext row to a different org or
   renaming the secret causes a decryption failure rather than a silent decrypt.
+- **Deletion is fail-closed, not a definition rewrite.** Removing a name leaves
+  historical definitions intact and makes their next execution fail secret
+  preflight. The endpoint is idempotent so transport retries are safe.
 
 ---
 

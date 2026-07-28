@@ -2,9 +2,15 @@
 
 ## Reporting a vulnerability
 
-Email **security@tokentrimmer.com** with details. We acknowledge within one business day.
+Email **security@tokentrimmer.com** with a description and reproduction. We aim
+to acknowledge reports within 24 hours and triage within 72 hours. These are
+operational targets, not a response or remediation SLA.
 
-For sensitive reports, encrypt with our PGP key (published at `https://tokentrimmer.com/.well-known/security.txt` once production launches).
+The marketing-site source builds the public reporting file at
+<https://tokentrimmer.com/.well-known/security.txt>; verify a live deployment
+before relying on that URL. Its policy link is <https://tokentrimmer.com/trust>.
+No PGP key or encrypted-reporting channel is currently published. Do not send
+live credentials, customer data, or other secrets in an email report.
 
 Please do **not** open public GitHub issues for security vulnerabilities.
 
@@ -31,17 +37,32 @@ The OSS Gateway, Inspect CLI, Plan engine, and SDKs in this repository are in sc
 
 ## Coordinated disclosure
 
-We aim to release a fix within 30 days of confirmation. We will credit reporters in the changelog unless anonymity is requested.
+We do not publish a remediation timeline or reporter-credit commitment in this
+repository. Use the private reporting channel above rather than a public issue.
 
-## Our security commitments
+## Source-evidenced controls and proof boundaries
 
-- All commits to `main` are signed.
-- All releases are signed.
-- Dependencies are vetted via `cargo deny` and `cargo audit` in CI.
-- Provider credentials are encrypted at rest with XChaCha20-Poly1305 using per-org data encryption keys.
-- API keys are stored as argon2 hashes; only the prefix is recoverable.
-- Audit log entries are hash-chained (BLAKE3) and signed (Ed25519).
-- All hosted-service infrastructure runs behind Cloudflare with DDoS protection.
+This repository can show implementation and CI policy. It cannot by itself
+prove a deployed environment, GitHub configuration/history, a release-signing
+ceremony, a Cloudflare configuration, or an operational security outcome.
+
+- CI source contains dependency-policy checks including `cargo deny`; current
+  advisory-feed results are an operational CI record, not a static-repository
+  guarantee.
+- Provider-credential code uses XChaCha20-Poly1305 with per-org derived keys.
+  Deployment key custody, backups, and rotation execution require operator
+  evidence.
+- API-key code stores Argon2 hashes and only retains a prefix for lookup.
+- Audit-entry code uses a BLAKE3 hash chain and Ed25519 signatures. Signature
+  integrity is not a claim of independent issuer trust or economic truth.
+- Branch-protection, commit-signature enforcement, signed release artifacts,
+  CDN/DDoS configuration, TLS/HSTS headers, monitoring, and incident response
+  must be independently verified for a live deployment; they are not asserted
+  as completed facts here.
+
+No current external penetration-test report, compliance certification,
+recovery exercise, RTO/RPO result, or access-review record is published in
+this repository. See the Trust Center for the current public evidence status.
 
 ## Bug bounty
 

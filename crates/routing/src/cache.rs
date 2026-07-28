@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::store::{RoutingStore, RoutingStoreError};
-use crate::{Route, RoutingEngine};
+use crate::store::{RouteManagementView, RoutingStore, RoutingStoreError};
+use crate::{Route, RoutingEngine, RuntimeRoute};
 
 /// Default per-org TTL.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -69,8 +69,12 @@ impl CachingRoutingStore {
         }
 
         // Refresh.
-        let routes = self.inner.list_for_org(org_id).await?;
-        let engine = Arc::new(RoutingEngine::with_routes(routes));
+        // The production store captures a route definition and its immutable
+        // `route_versions.id` in one database snapshot. Preserve that pairing
+        // inside the cached engine; do not re-read a mutable route revision on
+        // individual requests.
+        let routes = self.inner.list_runtime_for_org(org_id).await?;
+        let engine = Arc::new(RoutingEngine::with_runtime_routes(routes));
         let mut g = self.cache.write().await;
         g.insert(
             org_id,
@@ -97,8 +101,26 @@ impl RoutingStore for CachingRoutingStore {
         Ok(engine.routes().to_vec())
     }
 
+    async fn list_runtime_for_org(
+        &self,
+        org_id: Uuid,
+    ) -> Result<Vec<RuntimeRoute>, RoutingStoreError> {
+        let engine = self.engine_for(org_id).await?;
+        Ok(engine.runtime_routes())
+    }
+
     async fn list_all_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
         self.inner.list_all_for_org(org_id).await
+    }
+
+    async fn list_management_for_org(
+        &self,
+        org_id: Uuid,
+    ) -> Result<Vec<RouteManagementView>, RoutingStoreError> {
+        // Never synthesize a management view from the cached runtime engine:
+        // the engine intentionally omits invalid rows. Delegate to the raw
+        // store so a legacy/manual row stays visible for repair.
+        self.inner.list_management_for_org(org_id).await
     }
 
     async fn create_route(
@@ -115,8 +137,24 @@ impl RoutingStore for CachingRoutingStore {
         self.inner.get_route(org_id, id).await
     }
 
-    async fn delete_route(&self, org_id: Uuid, id: Uuid) -> Result<bool, RoutingStoreError> {
-        let removed = self.inner.delete_route(org_id, id).await?;
+    async fn get_management_route(
+        &self,
+        org_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<RouteManagementView>, RoutingStoreError> {
+        self.inner.get_management_route(org_id, id).await
+    }
+
+    async fn delete_route(
+        &self,
+        org_id: Uuid,
+        id: Uuid,
+        expected_revision: i64,
+    ) -> Result<bool, RoutingStoreError> {
+        let removed = self
+            .inner
+            .delete_route(org_id, id, expected_revision)
+            .await?;
         if removed {
             self.invalidate(org_id).await;
         }
@@ -127,9 +165,13 @@ impl RoutingStore for CachingRoutingStore {
         &self,
         org_id: Uuid,
         route_id: Uuid,
+        expected_revision: i64,
         pause: crate::store::NewRoutePause,
     ) -> Result<bool, RoutingStoreError> {
-        let paused = self.inner.pause_route(org_id, route_id, pause).await?;
+        let paused = self
+            .inner
+            .pause_route(org_id, route_id, expected_revision, pause)
+            .await?;
         if paused {
             // Invalidate so the pause takes effect immediately on THIS replica;
             // other replicas converge within the TTL (≤ 60s by default) — same
@@ -139,8 +181,16 @@ impl RoutingStore for CachingRoutingStore {
         Ok(paused)
     }
 
-    async fn resume_route(&self, org_id: Uuid, route_id: Uuid) -> Result<bool, RoutingStoreError> {
-        let resumed = self.inner.resume_route(org_id, route_id).await?;
+    async fn resume_route(
+        &self,
+        org_id: Uuid,
+        route_id: Uuid,
+        expected_revision: i64,
+    ) -> Result<bool, RoutingStoreError> {
+        let resumed = self
+            .inner
+            .resume_route(org_id, route_id, expected_revision)
+            .await?;
         if resumed {
             // Same immediate-on-this-replica / ≤TTL-elsewhere convergence as
             // pause_route.
@@ -155,6 +205,29 @@ mod tests {
     use super::*;
     use crate::store::InMemoryRoutingStore;
     use crate::{RouteAction, RouteConditions};
+
+    #[derive(Debug)]
+    struct VersionedStore {
+        routes: Vec<RuntimeRoute>,
+    }
+
+    #[async_trait::async_trait]
+    impl RoutingStore for VersionedStore {
+        async fn list_for_org(&self, _org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
+            Ok(self
+                .routes
+                .iter()
+                .map(|runtime| runtime.route.clone())
+                .collect())
+        }
+
+        async fn list_runtime_for_org(
+            &self,
+            _org_id: Uuid,
+        ) -> Result<Vec<RuntimeRoute>, RoutingStoreError> {
+            Ok(self.routes.clone())
+        }
+    }
 
     fn route(name: &str, target: &str) -> Route {
         Route {
@@ -191,6 +264,32 @@ mod tests {
             },
             paused: false,
         }
+    }
+
+    /// The cache must retain a ledger identity supplied by its backing store;
+    /// dropping it here would make a correctly captured Postgres snapshot turn
+    /// into a NULL request trace before the route engine evaluates it.
+    #[tokio::test]
+    async fn cache_preserves_immutable_runtime_route_version() {
+        let org = Uuid::now_v7();
+        let runtime_route = route("versioned", "m1");
+        let route_id = runtime_route.id;
+        let cache = CachingRoutingStore::with_ttl(
+            Arc::new(VersionedStore {
+                routes: vec![RuntimeRoute {
+                    route: runtime_route,
+                    route_version_id: Some(9_876_543_210),
+                }],
+            }) as Arc<dyn RoutingStore>,
+            Duration::from_secs(60),
+        );
+
+        let engine = cache.engine_for(org).await.unwrap();
+        assert_eq!(engine.route_version_id(route_id), Some(9_876_543_210));
+        let copied = cache.list_runtime_for_org(org).await.unwrap();
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].route.id, route_id);
+        assert_eq!(copied[0].route_version_id, Some(9_876_543_210));
     }
 
     #[tokio::test]
@@ -292,12 +391,19 @@ mod tests {
             .unwrap();
         // Warm the cache with the rewrite-active engine.
         assert!(!cache.engine_for(org).await.unwrap().routes()[0].paused);
+        let revision = cache
+            .get_management_route(org, created.id)
+            .await
+            .unwrap()
+            .and_then(|route| route.revision)
+            .expect("in-memory management reads carry a revision");
 
         // Pause via the caching store → immediately reflected (no TTL wait).
         assert!(cache
             .pause_route(
                 org,
                 created.id,
+                revision,
                 crate::store::NewRoutePause {
                     paused_by: crate::store::PausedBy::Auto,
                     reason: "auto: test".into(),
@@ -313,7 +419,7 @@ mod tests {
         );
 
         // Resume → immediately reflected again.
-        assert!(cache.resume_route(org, created.id).await.unwrap());
+        assert!(cache.resume_route(org, created.id, revision).await.unwrap());
         assert!(
             !cache.engine_for(org).await.unwrap().routes()[0].paused,
             "resume must invalidate the cached engine"

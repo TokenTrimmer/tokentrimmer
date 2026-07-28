@@ -1,0 +1,243 @@
+{
+  "corpus": {
+    "id": "tokentrimmer.gateway-capabilities-contract-corpus",
+    "version": 1
+  },
+  "contract": {
+    "id": "tokentrimmer.gateway-capabilities.v1",
+    "version": 1
+  },
+  "cases": [
+    {
+      "id": "enabled_authenticated_tier_gate_passes",
+      "document": {
+        "schema_version": 1,
+        "scope": "gateway_runtime",
+        "snapshot_scope": "responding_process",
+        "generated_at": "2026-07-17T12:00:00.000Z",
+        "features": {
+          "fusion": {
+            "enabled": { "state": "enabled", "source": "gateway_runtime", "reason": { "code": "fusion_kill_switch_enabled", "message": "Fusion is enabled." } },
+            "access": { "state": "available", "reason": { "code": "fusion_gateway_gate_passed", "message": "The gate passed." } },
+            "current_tier": { "state": "known", "value": "pro", "source": "authenticated_api_key", "reason": { "code": "effective_tier_from_authenticated_key", "message": "The key tier is known." } },
+            "minimum_tier": { "state": "known", "value": "pro", "source": "gateway_runtime", "reason": { "code": "fusion_minimum_tier_configured", "message": "The minimum tier is known." } },
+            "limits": { "member_models_max": { "value": 8, "enforcement": "gateway_runtime", "reason": { "code": "fusion_member_cap", "message": "The cap is enforced." } } }
+          }
+        },
+        "provider_credentials": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_credentials_not_inspected", "message": "Credentials are unknown." } },
+        "provider_health": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_health_not_probed", "message": "Health is unknown." } },
+        "model_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "model_support_not_negotiated", "message": "Models are unknown." } },
+        "modality_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "modality_support_not_negotiated", "message": "Modalities are unknown." } },
+        "schema_versions": {
+          "capabilities_document": { "state": "known", "version": 1, "source": "gateway_runtime", "reason": { "code": "capabilities_document_version", "message": "This is version one." } },
+          "fusion_request": { "state": "unversioned", "version": null, "source": "gateway_runtime", "reason": { "code": "fusion_request_schema_not_versioned", "message": "The request is unversioned." } }
+        }
+      },
+      "expected": {
+        "cli": { "outcome": "accepted", "fusion": { "kill_switch": "enabled", "kill_switch_reason_code": "fusion_kill_switch_enabled", "access": "available", "access_reason_code": "fusion_gateway_gate_passed", "current_tier": { "value": "pro", "source": "authenticated_api_key", "reason_code": "effective_tier_from_authenticated_key" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 8, "member_models_max_reason_code": "fusion_member_cap" } },
+        "dashboard": { "outcome": "accepted", "fusion": { "kill_switch": "enabled", "kill_switch_reason_code": "fusion_kill_switch_enabled", "access": "available", "access_reason_code": "fusion_gateway_gate_passed", "current_tier": { "value": "pro", "source": "authenticated_api_key", "reason_code": "effective_tier_from_authenticated_key" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 8, "member_models_max_reason_code": "fusion_member_cap" } }
+      }
+    },
+    {
+      "id": "disabled_switch_is_unavailable",
+      "document": {
+        "schema_version": 1,
+        "scope": "gateway_runtime",
+        "snapshot_scope": "responding_process",
+        "generated_at": "2026-07-17T12:00:00.000Z",
+        "features": {
+          "fusion": {
+            "enabled": { "state": "disabled", "source": "gateway_runtime", "reason": { "code": "fusion_kill_switch_disabled", "message": "Fusion is disabled." } },
+            "access": { "state": "unavailable", "reason": { "code": "fusion_disabled", "message": "The switch blocks the gate." } },
+            "current_tier": { "state": "known", "value": "pro", "source": "authenticated_api_key", "reason": { "code": "effective_tier_from_authenticated_key", "message": "The key tier is known." } },
+            "minimum_tier": { "state": "known", "value": "pro", "source": "gateway_runtime", "reason": { "code": "fusion_minimum_tier_configured", "message": "The minimum tier is known." } },
+            "limits": { "member_models_max": { "value": 8, "enforcement": "gateway_runtime", "reason": { "code": "fusion_member_cap", "message": "The cap is enforced." } } }
+          }
+        },
+        "provider_credentials": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_credentials_not_inspected", "message": "Credentials are unknown." } },
+        "provider_health": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_health_not_probed", "message": "Health is unknown." } },
+        "model_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "model_support_not_negotiated", "message": "Models are unknown." } },
+        "modality_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "modality_support_not_negotiated", "message": "Modalities are unknown." } },
+        "schema_versions": {
+          "capabilities_document": { "state": "known", "version": 1, "source": "gateway_runtime", "reason": { "code": "capabilities_document_version", "message": "This is version one." } },
+          "fusion_request": { "state": "unversioned", "version": null, "source": "gateway_runtime", "reason": { "code": "fusion_request_schema_not_versioned", "message": "The request is unversioned." } }
+        }
+      },
+      "expected": {
+        "cli": { "outcome": "accepted", "fusion": { "kill_switch": "disabled", "kill_switch_reason_code": "fusion_kill_switch_disabled", "access": "unavailable", "access_reason_code": "fusion_disabled", "current_tier": { "value": "pro", "source": "authenticated_api_key", "reason_code": "effective_tier_from_authenticated_key" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 8, "member_models_max_reason_code": "fusion_member_cap" } },
+        "dashboard": { "outcome": "accepted", "fusion": { "kill_switch": "disabled", "kill_switch_reason_code": "fusion_kill_switch_disabled", "access": "unavailable", "access_reason_code": "fusion_disabled", "current_tier": { "value": "pro", "source": "authenticated_api_key", "reason_code": "effective_tier_from_authenticated_key" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 8, "member_models_max_reason_code": "fusion_member_cap" } }
+      }
+    },
+    {
+      "id": "tier_below_minimum_is_unavailable",
+      "document": {
+        "schema_version": 1,
+        "scope": "gateway_runtime",
+        "snapshot_scope": "responding_process",
+        "generated_at": "2026-07-17T12:00:00.000Z",
+        "features": {
+          "fusion": {
+            "enabled": { "state": "enabled", "source": "gateway_runtime", "reason": { "code": "fusion_kill_switch_enabled", "message": "Fusion is enabled." } },
+            "access": { "state": "unavailable", "reason": { "code": "fusion_tier_below_minimum", "message": "The tier is too low." } },
+            "current_tier": { "state": "known", "value": "free", "source": "gateway_free_default", "reason": { "code": "effective_tier_defaulted_to_free", "message": "The default tier is free." } },
+            "minimum_tier": { "state": "known", "value": "pro", "source": "gateway_runtime", "reason": { "code": "fusion_minimum_tier_configured", "message": "The minimum tier is known." } },
+            "limits": { "member_models_max": { "value": 8, "enforcement": "gateway_runtime", "reason": { "code": "fusion_member_cap", "message": "The cap is enforced." } } }
+          }
+        },
+        "provider_credentials": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_credentials_not_inspected", "message": "Credentials are unknown." } },
+        "provider_health": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_health_not_probed", "message": "Health is unknown." } },
+        "model_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "model_support_not_negotiated", "message": "Models are unknown." } },
+        "modality_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "modality_support_not_negotiated", "message": "Modalities are unknown." } },
+        "schema_versions": {
+          "capabilities_document": { "state": "known", "version": 1, "source": "gateway_runtime", "reason": { "code": "capabilities_document_version", "message": "This is version one." } },
+          "fusion_request": { "state": "unversioned", "version": null, "source": "gateway_runtime", "reason": { "code": "fusion_request_schema_not_versioned", "message": "The request is unversioned." } }
+        }
+      },
+      "expected": {
+        "cli": { "outcome": "accepted", "fusion": { "kill_switch": "enabled", "kill_switch_reason_code": "fusion_kill_switch_enabled", "access": "unavailable", "access_reason_code": "fusion_tier_below_minimum", "current_tier": { "value": "free", "source": "gateway_free_default", "reason_code": "effective_tier_defaulted_to_free" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 8, "member_models_max_reason_code": "fusion_member_cap" } },
+        "dashboard": { "outcome": "accepted", "fusion": { "kill_switch": "enabled", "kill_switch_reason_code": "fusion_kill_switch_enabled", "access": "unavailable", "access_reason_code": "fusion_tier_below_minimum", "current_tier": { "value": "free", "source": "gateway_free_default", "reason_code": "effective_tier_defaulted_to_free" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 8, "member_models_max_reason_code": "fusion_member_cap" } }
+      }
+    },
+    {
+      "id": "higher_safe_member_cap_is_process_evidence",
+      "document": {
+        "schema_version": 1,
+        "scope": "gateway_runtime",
+        "snapshot_scope": "responding_process",
+        "generated_at": "2026-07-17T12:00:00.000Z",
+        "features": {
+          "fusion": {
+            "enabled": { "state": "enabled", "source": "gateway_runtime", "reason": { "code": "fusion_kill_switch_enabled", "message": "Fusion is enabled." } },
+            "access": { "state": "available", "reason": { "code": "fusion_gateway_gate_passed", "message": "The gate passed." } },
+            "current_tier": { "state": "known", "value": "pro", "source": "authenticated_api_key", "reason": { "code": "effective_tier_from_authenticated_key", "message": "The key tier is known." } },
+            "minimum_tier": { "state": "known", "value": "pro", "source": "gateway_runtime", "reason": { "code": "fusion_minimum_tier_configured", "message": "The minimum tier is known." } },
+            "limits": { "member_models_max": { "value": 65, "enforcement": "gateway_runtime", "reason": { "code": "fusion_member_cap", "message": "The cap is enforced." } } }
+          }
+        },
+        "provider_credentials": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_credentials_not_inspected", "message": "Credentials are unknown." } },
+        "provider_health": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_health_not_probed", "message": "Health is unknown." } },
+        "model_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "model_support_not_negotiated", "message": "Models are unknown." } },
+        "modality_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "modality_support_not_negotiated", "message": "Modalities are unknown." } },
+        "schema_versions": {
+          "capabilities_document": { "state": "known", "version": 1, "source": "gateway_runtime", "reason": { "code": "capabilities_document_version", "message": "This is version one." } },
+          "fusion_request": { "state": "unversioned", "version": null, "source": "gateway_runtime", "reason": { "code": "fusion_request_schema_not_versioned", "message": "The request is unversioned." } }
+        }
+      },
+      "expected": {
+        "cli": { "outcome": "accepted", "fusion": { "kill_switch": "enabled", "kill_switch_reason_code": "fusion_kill_switch_enabled", "access": "available", "access_reason_code": "fusion_gateway_gate_passed", "current_tier": { "value": "pro", "source": "authenticated_api_key", "reason_code": "effective_tier_from_authenticated_key" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 65, "member_models_max_reason_code": "fusion_member_cap" } },
+        "dashboard": { "outcome": "accepted", "fusion": { "kill_switch": "enabled", "kill_switch_reason_code": "fusion_kill_switch_enabled", "access": "available", "access_reason_code": "fusion_gateway_gate_passed", "current_tier": { "value": "pro", "source": "authenticated_api_key", "reason_code": "effective_tier_from_authenticated_key" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 65, "member_models_max_reason_code": "fusion_member_cap" } }
+      }
+    },
+    {
+      "id": "future_document_version_is_rejected",
+      "document": {
+        "schema_version": 2,
+        "scope": "gateway_runtime",
+        "snapshot_scope": "responding_process",
+        "generated_at": "2026-07-17T12:00:00.000Z",
+        "features": {
+          "fusion": {
+            "enabled": { "state": "enabled", "source": "gateway_runtime", "reason": { "code": "fusion_kill_switch_enabled", "message": "Fusion is enabled." } },
+            "access": { "state": "available", "reason": { "code": "fusion_gateway_gate_passed", "message": "The gate passed." } },
+            "current_tier": { "state": "known", "value": "pro", "source": "authenticated_api_key", "reason": { "code": "effective_tier_from_authenticated_key", "message": "The key tier is known." } },
+            "minimum_tier": { "state": "known", "value": "pro", "source": "gateway_runtime", "reason": { "code": "fusion_minimum_tier_configured", "message": "The minimum tier is known." } },
+            "limits": { "member_models_max": { "value": 8, "enforcement": "gateway_runtime", "reason": { "code": "fusion_member_cap", "message": "The cap is enforced." } } }
+          }
+        },
+        "provider_credentials": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_credentials_not_inspected", "message": "Credentials are unknown." } },
+        "provider_health": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_health_not_probed", "message": "Health is unknown." } },
+        "model_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "model_support_not_negotiated", "message": "Models are unknown." } },
+        "modality_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "modality_support_not_negotiated", "message": "Modalities are unknown." } },
+        "schema_versions": {
+          "capabilities_document": { "state": "known", "version": 1, "source": "gateway_runtime", "reason": { "code": "capabilities_document_version", "message": "This is version one." } },
+          "fusion_request": { "state": "unversioned", "version": null, "source": "gateway_runtime", "reason": { "code": "fusion_request_schema_not_versioned", "message": "The request is unversioned." } }
+        }
+      },
+      "expected": { "cli": { "outcome": "rejected" }, "dashboard": { "outcome": "rejected" } }
+    },
+    {
+      "id": "provider_readiness_claim_is_rejected",
+      "document": {
+        "schema_version": 1,
+        "scope": "gateway_runtime",
+        "snapshot_scope": "responding_process",
+        "generated_at": "2026-07-17T12:00:00.000Z",
+        "features": {
+          "fusion": {
+            "enabled": { "state": "enabled", "source": "gateway_runtime", "reason": { "code": "fusion_kill_switch_enabled", "message": "Fusion is enabled." } },
+            "access": { "state": "available", "reason": { "code": "fusion_gateway_gate_passed", "message": "The gate passed." } },
+            "current_tier": { "state": "known", "value": "pro", "source": "authenticated_api_key", "reason": { "code": "effective_tier_from_authenticated_key", "message": "The key tier is known." } },
+            "minimum_tier": { "state": "known", "value": "pro", "source": "gateway_runtime", "reason": { "code": "fusion_minimum_tier_configured", "message": "The minimum tier is known." } },
+            "limits": { "member_models_max": { "value": 8, "enforcement": "gateway_runtime", "reason": { "code": "fusion_member_cap", "message": "The cap is enforced." } } }
+          }
+        },
+        "provider_credentials": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_credentials_not_inspected", "message": "Credentials are unknown." } },
+        "provider_health": { "state": "available", "source": "not_negotiated", "reason": { "code": "health_claimed", "message": "Health was claimed." } },
+        "model_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "model_support_not_negotiated", "message": "Models are unknown." } },
+        "modality_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "modality_support_not_negotiated", "message": "Modalities are unknown." } },
+        "schema_versions": {
+          "capabilities_document": { "state": "known", "version": 1, "source": "gateway_runtime", "reason": { "code": "capabilities_document_version", "message": "This is version one." } },
+          "fusion_request": { "state": "unversioned", "version": null, "source": "gateway_runtime", "reason": { "code": "fusion_request_schema_not_versioned", "message": "The request is unversioned." } }
+        }
+      },
+      "expected": { "cli": { "outcome": "rejected" }, "dashboard": { "outcome": "rejected" } }
+    },
+    {
+      "id": "javascript_unsafe_member_cap_is_dashboard_unverified",
+      "document": {
+        "schema_version": 1,
+        "scope": "gateway_runtime",
+        "snapshot_scope": "responding_process",
+        "generated_at": "2026-07-17T12:00:00.000Z",
+        "features": {
+          "fusion": {
+            "enabled": { "state": "enabled", "source": "gateway_runtime", "reason": { "code": "fusion_kill_switch_enabled", "message": "Fusion is enabled." } },
+            "access": { "state": "available", "reason": { "code": "fusion_gateway_gate_passed", "message": "The gate passed." } },
+            "current_tier": { "state": "known", "value": "pro", "source": "authenticated_api_key", "reason": { "code": "effective_tier_from_authenticated_key", "message": "The key tier is known." } },
+            "minimum_tier": { "state": "known", "value": "pro", "source": "gateway_runtime", "reason": { "code": "fusion_minimum_tier_configured", "message": "The minimum tier is known." } },
+            "limits": { "member_models_max": { "value": 9007199254740992, "enforcement": "gateway_runtime", "reason": { "code": "fusion_member_cap", "message": "The cap is enforced." } } }
+          }
+        },
+        "provider_credentials": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_credentials_not_inspected", "message": "Credentials are unknown." } },
+        "provider_health": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_health_not_probed", "message": "Health is unknown." } },
+        "model_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "model_support_not_negotiated", "message": "Models are unknown." } },
+        "modality_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "modality_support_not_negotiated", "message": "Modalities are unknown." } },
+        "schema_versions": {
+          "capabilities_document": { "state": "known", "version": 1, "source": "gateway_runtime", "reason": { "code": "capabilities_document_version", "message": "This is version one." } },
+          "fusion_request": { "state": "unversioned", "version": null, "source": "gateway_runtime", "reason": { "code": "fusion_request_schema_not_versioned", "message": "The request is unversioned." } }
+        }
+      },
+      "expected": {
+        "cli": { "outcome": "accepted", "fusion": { "kill_switch": "enabled", "kill_switch_reason_code": "fusion_kill_switch_enabled", "access": "available", "access_reason_code": "fusion_gateway_gate_passed", "current_tier": { "value": "pro", "source": "authenticated_api_key", "reason_code": "effective_tier_from_authenticated_key" }, "minimum_tier": { "value": "pro", "source": "gateway_runtime", "reason_code": "fusion_minimum_tier_configured" }, "member_models_max": 9007199254740992, "member_models_max_reason_code": "fusion_member_cap" } },
+        "dashboard": { "outcome": "rejected" }
+      }
+    },
+    {
+      "id": "unsafe_reason_code_is_rejected",
+      "document": {
+        "schema_version": 1,
+        "scope": "gateway_runtime",
+        "snapshot_scope": "responding_process",
+        "generated_at": "2026-07-17T12:00:00.000Z",
+        "features": {
+          "fusion": {
+            "enabled": { "state": "enabled", "source": "gateway_runtime", "reason": { "code": "fusion_kill_switch_enabled", "message": "Fusion is enabled." } },
+            "access": { "state": "available", "reason": { "code": "Fusion Gate", "message": "The gate passed." } },
+            "current_tier": { "state": "known", "value": "pro", "source": "authenticated_api_key", "reason": { "code": "effective_tier_from_authenticated_key", "message": "The key tier is known." } },
+            "minimum_tier": { "state": "known", "value": "pro", "source": "gateway_runtime", "reason": { "code": "fusion_minimum_tier_configured", "message": "The minimum tier is known." } },
+            "limits": { "member_models_max": { "value": 8, "enforcement": "gateway_runtime", "reason": { "code": "fusion_member_cap", "message": "The cap is enforced." } } }
+          }
+        },
+        "provider_credentials": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_credentials_not_inspected", "message": "Credentials are unknown." } },
+        "provider_health": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "provider_health_not_probed", "message": "Health is unknown." } },
+        "model_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "model_support_not_negotiated", "message": "Models are unknown." } },
+        "modality_support": { "state": "unknown", "source": "not_negotiated", "reason": { "code": "modality_support_not_negotiated", "message": "Modalities are unknown." } },
+        "schema_versions": {
+          "capabilities_document": { "state": "known", "version": 1, "source": "gateway_runtime", "reason": { "code": "capabilities_document_version", "message": "This is version one." } },
+          "fusion_request": { "state": "unversioned", "version": null, "source": "gateway_runtime", "reason": { "code": "fusion_request_schema_not_versioned", "message": "The request is unversioned." } }
+        }
+      },
+      "expected": { "cli": { "outcome": "rejected" }, "dashboard": { "outcome": "rejected" } }
+    }
+  ]
+}

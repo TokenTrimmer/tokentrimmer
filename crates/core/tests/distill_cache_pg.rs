@@ -22,34 +22,55 @@ use tt_core::workflow::distill_cache::{
 };
 use uuid::Uuid;
 
-/// Mirrors cloud migration 0044's `CREATE TABLE flow_doc_distill_cache`.
-const CREATE_CACHE_TABLE: &str = "CREATE TABLE IF NOT EXISTS flow_doc_distill_cache (
+/// Mirrors cloud migration 0044's table and index contracts.  Keep the
+/// conflict arbiter separate from the table: PostgreSQL does not allow an
+/// expression such as `COALESCE(caller_key, '')` in a primary-key constraint.
+const CREATE_CACHE_TABLE: &str = "CREATE TABLE IF NOT EXISTS public.flow_doc_distill_cache (
     org_id         UUID        NOT NULL,
     content_hash   TEXT        NOT NULL,
     caller_key     TEXT,
     distilled_text TEXT        NOT NULL,
     pages          INTEGER     NOT NULL DEFAULT 0,
     engine         TEXT        NOT NULL,
-    distilled_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT flow_doc_distill_cache_pk PRIMARY KEY
-        (org_id, content_hash, COALESCE(caller_key, ''))
+    distilled_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 )";
+const CREATE_CACHE_KEY_IDX: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS flow_doc_distill_cache_key_uq \
+     ON public.flow_doc_distill_cache (org_id, content_hash, COALESCE(caller_key, ''))";
 const CREATE_EXPIRY_IDX: &str = "CREATE INDEX IF NOT EXISTS flow_doc_distill_cache_expiry_idx \
-     ON flow_doc_distill_cache (org_id, distilled_at) \
-     WHERE distilled_at < now() - INTERVAL '30 days'";
+     ON public.flow_doc_distill_cache (distilled_at)";
+
+/// The ignored tests below run in parallel when explicitly enabled. PostgreSQL's
+/// `CREATE TABLE IF NOT EXISTS` is not sufficient to serialize concurrent first
+/// creation, so hold a transaction-scoped lock while installing this fixture.
+const CACHE_FIXTURE_SCHEMA_LOCK: i64 = 0x7474_6469_7374_6368; // "ttdistch"
 
 async fn pool() -> sqlx::PgPool {
     let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
     let pool = tt_core::connect(&url, 2).await.expect("connect");
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(CACHE_FIXTURE_SCHEMA_LOCK)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query(CREATE_CACHE_TABLE)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query(CREATE_EXPIRY_IDX).execute(&pool).await.unwrap();
-    sqlx::query("TRUNCATE flow_doc_distill_cache")
-        .execute(&pool)
+    sqlx::query(CREATE_CACHE_KEY_IDX)
+        .execute(&mut *tx)
         .await
         .unwrap();
+    sqlx::query(CREATE_EXPIRY_IDX)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Each test generates an org UUID, so no shared-table truncation is needed
+    // (or safe) while the ignored database tests run concurrently.
     pool
 }
 
@@ -66,6 +87,21 @@ fn doc(text: &str) -> CachedDistill {
         pages: 1,
         engine: "pdf-extract".to_string(),
     }
+}
+
+#[test]
+fn cache_fixture_uses_postgres_executable_0044_index_shapes() {
+    assert!(
+        !CREATE_CACHE_TABLE.contains("PRIMARY KEY"),
+        "the NULL-aware cache key must be an expression index, not a primary key"
+    );
+    assert!(CREATE_CACHE_KEY_IDX.contains("CREATE UNIQUE INDEX"));
+    assert!(CREATE_CACHE_KEY_IDX.contains("COALESCE(caller_key, '')"));
+    assert!(
+        !CREATE_EXPIRY_IDX.contains("WHERE"),
+        "time-relative partial-index predicates use now(), which PostgreSQL rejects"
+    );
+    assert!(CREATE_EXPIRY_IDX.contains("(distilled_at)"));
 }
 
 #[tokio::test]
@@ -151,4 +187,43 @@ async fn upsert_overwrites_on_same_key() {
     cache.upsert(&k, &doc("first")).await;
     cache.upsert(&k, &doc("second")).await;
     assert_eq!(cache.get(&k).await.unwrap().text, "second");
+}
+
+/// The public store's `COALESCE` conflict target deliberately treats an absent
+/// caller key and an explicitly empty caller key as the same logical cache
+/// address. This is the behavior provided by cloud migration 0044's expression
+/// unique index; a raw nullable-column unique/primary key would not provide it.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn null_and_empty_caller_key_share_the_same_cache_slot() {
+    let pool = pool().await;
+    let org = Uuid::new_v4();
+    let cache = FlowDocDistillCache {
+        org_id: org,
+        pool: &pool,
+    };
+    let no_key = DistillCacheKey {
+        content_hash: "null-empty-conflict".into(),
+        caller_key: None,
+    };
+    let empty_key = DistillCacheKey {
+        content_hash: "null-empty-conflict".into(),
+        caller_key: Some(String::new()),
+    };
+
+    cache.upsert(&no_key, &doc("first")).await;
+    cache.upsert(&empty_key, &doc("second")).await;
+
+    assert_eq!(cache.get(&no_key).await.unwrap().text, "second");
+    assert_eq!(cache.get(&empty_key).await.unwrap().text, "second");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.flow_doc_distill_cache \
+         WHERE org_id = $1 AND content_hash = $2",
+    )
+    .bind(org)
+    .bind("null-empty-conflict")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "NULL and empty caller keys share one cache row");
 }

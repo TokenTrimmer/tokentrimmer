@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "cli_source_repository": "https://github.com/tokentrimmer/tokentrimmer",
+  "cli_source_revision": "117b8d69c01e5a56a6c548355ef9453f6cdfaeac",
+  "distribution_model": "locked_source_build",
+  "signed_release_artifact": false
+}

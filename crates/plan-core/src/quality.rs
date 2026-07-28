@@ -41,6 +41,7 @@ use crate::types::RequestLog;
 
 /// Aggregate risk classification per `docs/03-plan-replay-design.md` §7.4
 /// (task-spec thresholds: `≤5%` / `(5%, 15%]` / `>15%`).
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RiskBand {
@@ -68,6 +69,7 @@ impl RiskBand {
 }
 
 /// Per-sample judge verdict.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JudgeVerdict {
@@ -121,6 +123,7 @@ pub fn quality_score_for_verdict(verdict: JudgeVerdict) -> f64 {
 }
 
 /// One sampled request's score.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SampleScore {
     /// Stable identifier of the source [`RequestLog`].
@@ -132,6 +135,7 @@ pub struct SampleScore {
 }
 
 /// Aggregated quality result attached to a `PlanResult`.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityResult {
     /// Number of requests the judge actually scored.
@@ -166,6 +170,7 @@ pub struct QualityResult {
 /// `band` is the same red/yellow/green [`RiskBand`] the per-request hook uses,
 /// derived from the degraded share so a single `Degraded` in a large acceptable
 /// set stays `Low`.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct QualityPreservedSummary {
     /// Percentage (0–100) of classified samples judged `Acceptable`. When no
@@ -215,6 +220,7 @@ pub fn quality_preserved_summary(scores: &[SampleScore]) -> QualityPreservedSumm
 }
 
 /// Configuration for one Tier 3 quality scoring run.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityConfig {
     /// Required gate: caller must surface body-logging opt-in to the org.

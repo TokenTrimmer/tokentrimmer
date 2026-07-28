@@ -10,7 +10,8 @@
 //! attached to the [`Sse`] response body; when the body is dropped (clean
 //! completion **or** client-abort), the guard fires a closure that writes a
 //! `request_logs` row with the partial usage.  The row carries
-//! `truncated = true` when no `finish_reason` chunk was observed before drop.
+//! `truncated = true` until an allowed terminal `finish_reason` is followed by
+//! a clean upstream EOF (or when an upstream error/late frame occurs).
 //!
 //! ## Span attributes
 //!
@@ -51,6 +52,154 @@ use crate::budget::SpendSink;
 use crate::passes::PassEffects;
 use crate::state::{L1Config, L2Config};
 
+// ─── Stream terminal integrity ───────────────────────────────────────────────
+
+/// The canonical OpenAI-compatible terminal reasons the gateway can verify.
+///
+/// Providers translate their native terminal markers into this vocabulary
+/// before reaching this module.  An arbitrary non-empty string is not enough
+/// evidence that an upstream response completed: accepting one would let a
+/// malformed or partially decoded stream reach a clean `[DONE]`, terminal cost
+/// receipt, cache insert, and non-truncated request-log row.
+///
+/// `function_call` remains for legacy OpenAI-compatible providers. New tool
+/// streams use `tool_calls`.
+const ALLOWED_STREAM_FINISH_REASONS: &[&str] = &[
+    "stop",
+    "length",
+    "tool_calls",
+    "content_filter",
+    "function_call",
+];
+
+fn is_allowed_stream_finish_reason(reason: &str) -> bool {
+    ALLOWED_STREAM_FINISH_REASONS.contains(&reason)
+}
+
+fn chunk_has_allowed_finish_reason(chunk: &ChatCompletionChunk) -> bool {
+    chunk.choices.iter().any(|choice| {
+        choice
+            .finish_reason
+            .as_deref()
+            .is_some_and(is_allowed_stream_finish_reason)
+    })
+}
+
+/// OpenAI may send one final, choices-empty usage frame after the terminal
+/// choice frame when `stream_options.include_usage` is enabled. That narrow
+/// shape is the only upstream frame permitted after an accepted finish reason.
+fn is_standalone_usage_chunk(chunk: &ChatCompletionChunk) -> bool {
+    chunk.choices.is_empty() && chunk.usage.is_some()
+}
+
+/// A provider EOF is not a protocol completion by itself. Send a structured
+/// error frame and deliberately omit `[DONE]` so clients cannot persist a
+/// partial response as a verified terminal answer.
+fn incomplete_stream_event() -> Event {
+    let json = serde_json::json!({
+        "error": {
+            "message": "The upstream stream ended without an allowed terminal finish_reason.",
+            "type": "upstream_incomplete",
+            "code": "unverified_terminal_finish_reason",
+        }
+    })
+    .to_string();
+    // Keep errors on the default data channel for OpenAI-compatible SDKs;
+    // consumers that only parse data frames still receive the structured
+    // failure rather than an unexplained EOF.
+    Event::default().data(json)
+}
+
+/// A terminal choice frame means no more provider content is valid. A later
+/// content/chunk/error is a protocol violation, not a successful stream with
+/// harmless trailing noise. Omit all completion receipts so clients preserve
+/// the partial answer as failed rather than durable.
+fn terminal_sequence_violation_event() -> Event {
+    let json = serde_json::json!({
+        "error": {
+            "message": "The upstream stream sent data after an allowed terminal finish_reason.",
+            "type": "upstream_incomplete",
+            "code": "terminal_sequence_violation",
+        }
+    })
+    .to_string();
+    Event::default().data(json)
+}
+
+fn upstream_error_event(error: &ProviderError) -> Event {
+    let json = serde_json::json!({
+        "error": {
+            "message": error.to_string(),
+            "type": "upstream_error",
+        }
+    })
+    .to_string();
+    Event::default().data(json)
+}
+
+/// Gateway-authored terminal accounting for an L1 cache-hit fake stream.
+///
+/// A cached response is not a new provider dispatch: its served cost is
+/// exactly zero, while the cache envelope's insertion-time baseline is the
+/// only safe source for the savings claim.  Keep the fields private so callers
+/// must use [`CacheStreamAttribution::l1`] rather than constructing a receipt
+/// from an estimate at the streaming boundary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheStreamAttribution {
+    baseline_cost_usd: f64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+}
+
+impl CacheStreamAttribution {
+    /// Build a receipt only from a priced L1 envelope. A legacy/raw cache
+    /// record has no insertion-time baseline and must not receive an invented
+    /// cost or savings receipt merely because its response carries token usage.
+    pub fn l1(
+        baseline_cost_usd: f64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    ) -> Option<Self> {
+        baseline_cost_usd
+            .is_finite()
+            .then_some(baseline_cost_usd)
+            .filter(|baseline| *baseline >= 0.0)
+            .map(|baseline_cost_usd| Self {
+                baseline_cost_usd,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            })
+    }
+
+    /// The envelope's priced counterfactual, retained without re-pricing the
+    /// cached response token counts.
+    pub fn baseline_cost_usd(self) -> f64 {
+        self.baseline_cost_usd
+    }
+
+    fn usage_event(self) -> Event {
+        // The usage counts are the cached response's original provider counts,
+        // matching the response body and the existing L1-hit telemetry row.
+        // `cache: hit-l1` makes that provenance explicit: they are not a new
+        // provider bill on this served request.
+        let json = serde_json::json!({
+            "cost_usd": 0.0_f64,
+            "baseline_cost_usd": self.baseline_cost_usd,
+            "saved_usd": self.baseline_cost_usd,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cached_tokens": self.cached_tokens,
+            "cache": "hit-l1",
+            "usage_source": "l1_cached_response",
+        })
+        .to_string();
+        Event::default().event("tokentrimmer.usage").data(json)
+    }
+}
+
 // ─── PartialUsage ─────────────────────────────────────────────────────────────
 
 /// Token counts accumulated while the SSE stream is in flight.
@@ -89,7 +238,8 @@ struct AuthoritativeUsage {
 ///   raw byte length (bytes ≈ 4× tokens → ~4× cost overcount).
 /// - When a terminal chunk carries a `usage` block the authoritative counts
 ///   overwrite the tokenizer estimate.
-/// - Sets `finished` when any choice carries a `finish_reason`.
+/// - Sets `finished` only when a choice carries an allowed terminal
+///   `finish_reason`. An arbitrary string or upstream EOF remains incomplete.
 pub(crate) struct UsageTrackingStream {
     inner: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
     /// Accumulated output text for fallback token estimation and cache reconstruction.
@@ -100,11 +250,28 @@ pub(crate) struct UsageTrackingStream {
     provider_id: String,
     /// Authoritative usage from the provider's terminal chunk.
     authoritative: Option<AuthoritativeUsage>,
-    /// True once any `finish_reason` chunk has been observed.
+    /// True once an allowed terminal `finish_reason` chunk has been observed.
     pub(crate) finished: bool,
+    /// True only after the wrapped provider stream has actually returned EOF.
+    /// A client can disconnect immediately after a terminal-looking chunk;
+    /// until EOF is observed we cannot prove that no late provider frame/error
+    /// remains, so the response is not cacheable or fully completed yet.
+    upstream_eof_observed: bool,
     /// The `finish_reason` string from the terminal chunk (e.g. `"stop"`).
     /// Used to reconstruct a `ChatCompletionResponse` for cache insertion.
     pub(crate) finish_reason: Option<String>,
+    /// A provider error after a terminal-looking chunk means the stream did not
+    /// complete cleanly after all. Keep this distinct from `finished` so the
+    /// DropGuard cannot cache or report it as a verified completion.
+    stream_error: bool,
+    /// An accepted finish reason permits at most one OpenAI-native standalone
+    /// usage frame (only when the finish chunk carried no usage). Any other
+    /// later provider frame/error is a terminal-sequence violation.
+    terminal_usage_tail_allowed: bool,
+    /// Set when a provider sends a frame/error after its accepted terminal
+    /// marker. This is stricter than `stream_error`: a late `Ok` chunk is also
+    /// unsafe and must suppress `[DONE]`, terminal receipts, and cache writes.
+    terminal_sequence_violation: bool,
     /// True once a standalone OpenAI-native usage chunk (empty `choices`,
     /// populated `usage`) has flowed through. Lets the egress avoid emitting a
     /// duplicate synthesized usage chunk when `include_usage` is honored.
@@ -129,7 +296,11 @@ impl UsageTrackingStream {
             provider_id: provider_id.into(),
             authoritative: None,
             finished: false,
+            upstream_eof_observed: false,
             finish_reason: None,
+            stream_error: false,
+            terminal_usage_tail_allowed: false,
+            terminal_sequence_violation: false,
             saw_standalone_usage_chunk: false,
             last_chunk_meta: None,
         }
@@ -147,6 +318,9 @@ impl UsageTrackingStream {
     /// stream's id/model/created. Returns `None` when no authoritative usage
     /// arrived (a truncated stream — nothing trustworthy to report).
     fn synthesized_usage_chunk(&self) -> Option<ChatCompletionChunk> {
+        if !self.cleanly_completed() {
+            return None;
+        }
         let auth = self.authoritative?;
         let cache_creation = auth.cache_creation.unwrap_or(0);
         let (id, model, created) = self
@@ -174,13 +348,16 @@ impl UsageTrackingStream {
     }
 
     /// Returns the accumulated data needed to reconstruct a `ChatCompletionResponse`
-    /// for cache insertion. Returns `None` when no authoritative usage block arrived
-    /// (i.e. stream was truncated / no terminal usage chunk), ensuring only cleanly
+    /// for cache insertion. Returns `None` unless an allowed terminal reason
+    /// and an authoritative usage block arrived, ensuring only cleanly
     /// completed streams with known token counts are cached.
     pub(crate) fn cache_completion_data(&self) -> Option<(String, String, Usage)> {
+        if !self.cleanly_completed() {
+            return None;
+        }
         let auth = self.authoritative?;
         let cache_creation = auth.cache_creation.unwrap_or(0);
-        let finish_reason = self.finish_reason.clone().unwrap_or_else(|| "stop".into());
+        let finish_reason = self.finish_reason.clone()?;
         let text = self.output_text.clone();
         let usage = Usage {
             prompt_tokens: auth.prompt as u64,
@@ -197,6 +374,17 @@ impl UsageTrackingStream {
     /// provider-authoritative rather than tokenizer estimates).
     pub(crate) fn has_authoritative_usage(&self) -> bool {
         self.authoritative.is_some()
+    }
+
+    /// A terminal reason is only a verified completion after the provider has
+    /// also reached EOF without a late frame or error. This deliberately
+    /// distinguishes a cleanly drained upstream from a client-aborted stream
+    /// that merely happened to have seen a terminal-looking chunk.
+    fn cleanly_completed(&self) -> bool {
+        self.finished
+            && self.upstream_eof_observed
+            && !self.stream_error
+            && !self.terminal_sequence_violation
     }
 
     pub(crate) fn snapshot(&self) -> PartialUsage {
@@ -231,19 +419,44 @@ impl Stream for UsageTrackingStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(&poll, Poll::Ready(None)) {
+            self.upstream_eof_observed = true;
+        }
+        if matches!(&poll, Poll::Ready(Some(Err(_)))) {
+            if self.finished {
+                self.terminal_sequence_violation = true;
+            }
+            self.stream_error = true;
+        }
         if let Poll::Ready(Some(Ok(ref chunk))) = poll {
+            // Once the provider has emitted an accepted terminal choice, the
+            // only valid follow-up is its optional choices-empty usage tail.
+            // Do not let trailing content, a duplicate finish frame, or any
+            // other provider chunk become part of a response we later mark
+            // complete/cacheable.
+            if self.finished {
+                if self.terminal_usage_tail_allowed && is_standalone_usage_chunk(chunk) {
+                    self.terminal_usage_tail_allowed = false;
+                } else {
+                    self.terminal_sequence_violation = true;
+                    return poll;
+                }
+            } else if let Some(finish_reason) = chunk.choices.iter().find_map(|choice| {
+                choice
+                    .finish_reason
+                    .as_deref()
+                    .filter(|reason| is_allowed_stream_finish_reason(reason))
+            }) {
+                self.finished = true;
+                self.finish_reason = Some(finish_reason.to_owned());
+                // OpenAI's `include_usage` tail is legal only when usage was
+                // not already folded into the terminal choice frame.
+                self.terminal_usage_tail_allowed = chunk.usage.is_none();
+            }
+
             // Remember the latest chunk's identity so a synthesized usage chunk
             // (when `include_usage` is honored) matches the stream.
             self.last_chunk_meta = Some((chunk.id.clone(), chunk.model.clone(), chunk.created));
-            // Track finish_reason (first observed value wins).
-            for choice in &chunk.choices {
-                if let Some(ref fr) = choice.finish_reason {
-                    self.finished = true;
-                    if self.finish_reason.is_none() {
-                        self.finish_reason = Some(fr.clone());
-                    }
-                }
-            }
             // Accumulate output text from content deltas for fallback
             // token estimation (§2.12).
             for choice in &chunk.choices {
@@ -377,7 +590,7 @@ pub struct StreamSpanContext {
 
 // ─── PanelStreamLog ─────────────────────────────────────────────────────────
 
-/// Panel-specific billing context attached to a streaming deep-research panel.
+/// Panel-specific billing context attached to a streaming Fusion panel.
 ///
 /// When present on a [`StreamLogContext`], the terminal [`DropGuard`] writes ONE
 /// aggregate `request_logs` row (`provider = "panel"`, `cost = Σ legs + arbiter`,
@@ -435,6 +648,10 @@ pub struct StreamLogContext {
     pub api_key_id: Uuid,
     pub trace_id: Uuid,
     pub provider_id: String,
+    /// Exact caller model captured before routing; persisted separately from
+    /// the final served `model` so stream rows can support snapshot-scoped
+    /// historical `model_in` evidence.
+    pub requested_model: String,
     pub model: String,
     pub input_tokens: i32,
     pub cached_tokens: i32,
@@ -444,6 +661,9 @@ pub struct StreamLogContext {
     /// to `pricing` when `None`.
     pub baseline_pricing: Option<ModelPricing>,
     pub route_id: Option<Uuid>,
+    /// Immutable `route_versions.id` captured with the matched runtime route.
+    /// Nullable for unrouted / legacy-ledger traffic; never a mutable revision.
+    pub route_version_id: Option<i64>,
     pub tag: Option<String>,
     pub request_started: Instant,
     /// Spend sink — realized streamed spend is recorded through this into the
@@ -524,9 +744,9 @@ enum Phase {
 }
 
 /// Drives the `Arc<Mutex<UsageTrackingStream>>` as a stream of SSE events.
-/// On clean completion it emits a terminal `tokentrimmer.usage` event carrying
-/// cost/baseline/saved (so streaming clients can surface per-request savings,
-/// which response headers can't), then the `[DONE]` sentinel.
+/// Only a verified terminal reason permits the terminal sequence: a provider
+/// EOF without one emits a structured incomplete-stream error instead of a
+/// `tokentrimmer.usage` receipt or `[DONE]` sentinel.
 struct TrackedEventStream {
     inner: Arc<std::sync::Mutex<UsageTrackingStream>>,
     /// Served-model pricing for the terminal usage event (`None` ⇒ skip it).
@@ -734,14 +954,32 @@ impl Stream for TrackedEventStream {
             }
             Phase::Streaming => {}
         }
-        let poll = {
+        let (poll, terminal_sequence_violation) = {
             let mut guard = self.inner.lock().expect("tracking stream mutex poisoned");
-            Pin::new(&mut *guard).poll_next(cx)
+            let poll = Pin::new(&mut *guard).poll_next(cx);
+            (poll, guard.terminal_sequence_violation)
         };
+        if terminal_sequence_violation {
+            self.phase = Phase::Finished;
+            return Poll::Ready(Some(Ok(terminal_sequence_violation_event())));
+        }
         match poll {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                // Clean completion: queue the terminal events in order —
+                // EOF is only clean after an allowed provider terminal reason.
+                // Do not synthesize usage, panel attribution, or `[DONE]` for
+                // an unverified EOF: those frames are a completion receipt to
+                // clients and would make a partial answer look durable.
+                let completed = {
+                    let guard = self.inner.lock().expect("tracking stream mutex poisoned");
+                    guard.cleanly_completed()
+                };
+                if !completed {
+                    self.phase = Phase::Finished;
+                    return Poll::Ready(Some(Ok(incomplete_stream_event())));
+                }
+
+                // Verified completion: queue terminal events in order —
                 //   1. OpenAI-native usage chunk (only when include_usage honored),
                 //   2. `tokentrimmer.panel` attribution (only for panel streams),
                 //   3. the `tokentrimmer.usage` cost frame (always, when priceable),
@@ -767,15 +1005,19 @@ impl Stream for TrackedEventStream {
                 Poll::Ready(first.map(Ok))
             }
             Poll::Ready(Some(result)) => {
-                let json = match result {
-                    Ok(chunk) => serde_json::to_string(&chunk)
-                        .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}")),
-                    Err(e) => format!(
-                        "{{\"error\":{{\"message\":{:?},\"type\":\"upstream_error\"}}}}",
-                        e.to_string()
-                    ),
-                };
-                Poll::Ready(Some(Ok(Event::default().data(json))))
+                match result {
+                    Ok(chunk) => {
+                        let json = serde_json::to_string(&chunk)
+                            .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}"));
+                        Poll::Ready(Some(Ok(Event::default().data(json))))
+                    }
+                    Err(e) => {
+                        // Preserve the historical error frame, but do not follow
+                        // it with a completion receipt on the next poll.
+                        self.phase = Phase::Finished;
+                        Poll::Ready(Some(Ok(upstream_error_event(&e))))
+                    }
+                }
             }
         }
     }
@@ -804,7 +1046,9 @@ impl<S: Stream + Unpin> Stream for GuardedStream<S> {
 ///
 /// Each chunk is serialized to JSON and emitted as `data: <json>`.
 /// On stream error, emits `data: {"error":{"message":"…","type":"upstream_error"}}` then ends.
-/// Terminates with `data: [DONE]` per OpenAI convention.
+/// Terminates with `data: [DONE]` only after an allowed provider
+/// `finish_reason`; an unverified EOF emits `upstream_incomplete` without a
+/// `[DONE]` completion receipt.
 ///
 /// Sets `X-TokenTrimmer-Trace-Id` and `X-TokenTrimmer-Provider` on the response.
 ///
@@ -881,8 +1125,10 @@ pub fn stream_response(
             let org_id = ctx.org_id;
             let api_key_id = ctx.api_key_id;
             let provider_id_log = ctx.provider_id.clone();
+            let requested_model = ctx.requested_model.clone();
             let model = ctx.model.clone();
             let route_id = ctx.route_id;
+            let route_version_id = ctx.route_version_id;
             let tag = ctx.tag.clone();
             let request_started = ctx.request_started;
             let log_trace_id = ctx.trace_id;
@@ -898,7 +1144,7 @@ pub fn stream_response(
                     .lock()
                     .expect("tracking stream mutex poisoned");
                 let usage = inner.snapshot();
-                let truncated = !inner.finished;
+                let truncated = !inner.cleanly_completed();
                 let authoritative = inner.has_authoritative_usage();
                 // Extract cache data before dropping the lock.
                 let cache_data = if !truncated {
@@ -1047,6 +1293,7 @@ pub fn stream_response(
                     api_key_id,
                     ts: Utc::now(),
                     provider: row_provider,
+                    requested_model: Some(requested_model),
                     model: row_model,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
@@ -1058,9 +1305,29 @@ pub fn stream_response(
                     // the row-derived TT headline equal to `tt_saved_usd()`.
                     // For a panel aggregate, zeroed to match `complete_panel`.
                     cache_bust_penalty_usd: row_cache_bust_usd,
+                    // Persist the same measured cost-breakdown pieces exposed
+                    // in the terminal usage event. A Fusion/panel row is its
+                    // own opted-in service, so it intentionally carries zeros
+                    // just like the aggregate non-streaming path.
+                    flex_saved_usd: if panel.is_some() {
+                        0.0
+                    } else {
+                        breakdown.flex_saved_usd
+                    },
+                    doc_compaction_saved_usd: if panel.is_some() {
+                        0.0
+                    } else {
+                        breakdown.doc_compaction_saved_usd
+                    },
+                    summarizer_tax_usd: if panel.is_some() {
+                        0.0
+                    } else {
+                        breakdown.summarizer_tax_usd
+                    },
                     cached: false,
                     cache_layer: None,
                     route_id,
+                    route_version_id,
                     latency_ms: request_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
                     upstream_latency_ms: None,
                     status: 200,
@@ -1361,24 +1628,128 @@ pub fn stream_response(
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+/// The no-telemetry / cache-hit branch still needs the same protocol boundary
+/// as a tracked provider stream. Otherwise an EOF from a malformed fake cache
+/// record or BYO-key passthrough could silently become a successful `[DONE]`.
+struct UntrackedEventStream {
+    inner: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+    saw_allowed_finish_reason: bool,
+    terminal_usage_tail_allowed: bool,
+    /// Cache-hit accounting is injected only after the synthetic/provider
+    /// stream itself reaches a verified EOF. It is never sent for an
+    /// incomplete or post-finish-violating stream.
+    cache_attribution: Option<CacheStreamAttribution>,
+    terminal_events: std::collections::VecDeque<Event>,
+    finished: bool,
+}
+
+impl Stream for UntrackedEventStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(event) = self.terminal_events.pop_front() {
+            if self.terminal_events.is_empty() {
+                self.finished = true;
+            }
+            return Poll::Ready(Some(Ok(event)));
+        }
+        if self.finished {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                if self.saw_allowed_finish_reason {
+                    // A terminal receipt is meaningful only after the source
+                    // stream reached EOF without a post-finish violation. The
+                    // cache attribution, when present, is intentionally queued
+                    // before `[DONE]` to match tracked stream ordering.
+                    if let Some(attribution) = self.cache_attribution {
+                        self.terminal_events.push_back(attribution.usage_event());
+                    }
+                    self.terminal_events
+                        .push_back(Event::default().data("[DONE]"));
+                    let event = self
+                        .terminal_events
+                        .pop_front()
+                        .expect("verified terminal queue is non-empty");
+                    if self.terminal_events.is_empty() {
+                        self.finished = true;
+                    }
+                    Poll::Ready(Some(Ok(event)))
+                } else {
+                    self.finished = true;
+                    Poll::Ready(Some(Ok(incomplete_stream_event())))
+                }
+            }
+            Poll::Ready(Some(Ok(chunk))) => {
+                if self.saw_allowed_finish_reason {
+                    if self.terminal_usage_tail_allowed && is_standalone_usage_chunk(&chunk) {
+                        self.terminal_usage_tail_allowed = false;
+                    } else {
+                        self.finished = true;
+                        return Poll::Ready(Some(Ok(terminal_sequence_violation_event())));
+                    }
+                } else if chunk_has_allowed_finish_reason(&chunk) {
+                    self.saw_allowed_finish_reason = true;
+                    self.terminal_usage_tail_allowed = chunk.usage.is_none();
+                }
+                let json = serde_json::to_string(&chunk)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}"));
+                Poll::Ready(Some(Ok(Event::default().data(json))))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finished = true;
+                if self.saw_allowed_finish_reason {
+                    Poll::Ready(Some(Ok(terminal_sequence_violation_event())))
+                } else {
+                    Poll::Ready(Some(Ok(upstream_error_event(&error))))
+                }
+            }
+        }
+    }
+}
+
 fn build_event_stream(
     stream: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    stream
-        .map(|result| {
-            let json = match result {
-                Ok(chunk) => serde_json::to_string(&chunk)
-                    .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}")),
-                Err(e) => format!(
-                    "{{\"error\":{{\"message\":{:?},\"type\":\"upstream_error\"}}}}",
-                    e.to_string()
-                ),
-            };
-            Ok::<_, Infallible>(Event::default().data(json))
-        })
-        .chain(futures::stream::once(async {
-            Ok::<_, Infallible>(Event::default().data("[DONE]"))
-        }))
+) -> UntrackedEventStream {
+    build_event_stream_with_cache_attribution(stream, None)
+}
+
+fn build_event_stream_with_cache_attribution(
+    stream: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+    cache_attribution: Option<CacheStreamAttribution>,
+) -> UntrackedEventStream {
+    UntrackedEventStream {
+        inner: stream,
+        saw_allowed_finish_reason: false,
+        terminal_usage_tail_allowed: false,
+        cache_attribution,
+        terminal_events: std::collections::VecDeque::new(),
+        finished: false,
+    }
+}
+
+/// Stream a synthetic L1 cache hit using the same terminal-integrity gate as
+/// an untracked provider stream. `cache_attribution` is optional so legacy L1
+/// entries without a stored baseline can still replay safely, but they never
+/// get a fabricated cost/savings receipt.
+pub fn cache_hit_stream_response(
+    stream: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+    provider: &Arc<dyn Provider>,
+    trace_id: Uuid,
+    cache_attribution: Option<CacheStreamAttribution>,
+) -> Response {
+    let provider_id = provider.id().to_string();
+    let trace_id_str = trace_id.to_string();
+    let response = Sse::new(build_event_stream_with_cache_attribution(
+        stream,
+        cache_attribution,
+    ))
+    .keep_alive(KeepAlive::default())
+    .into_response();
+    attach_sse_headers(response, &trace_id_str, &provider_id)
 }
 
 fn attach_sse_headers(mut response: Response, trace_id_str: &str, provider_id: &str) -> Response {
@@ -1488,7 +1859,8 @@ async fn stream_insert_into_l2(
 /// real upstream stream to forward, so we synthesize one matching the
 /// OpenAI SSE format the client expects.
 ///
-/// Three chunks before `[DONE]`:
+/// Three chunks before `[DONE]` when the cached response has a supported
+/// terminal reason:
 ///
 /// 1. `delta.role = "assistant"` — primes clients that switch on role.
 /// 2. `delta.content = <full assistant text>` — single content chunk
@@ -1498,6 +1870,11 @@ async fn stream_insert_into_l2(
 /// 3. `finish_reason` + the cached usage — matches OpenAI's
 ///    stream-with-usage shape so client SDKs can read counts off the
 ///    terminator.
+///
+/// A malformed/legacy cache record without an allowed terminal reason is not
+/// silently repaired to `"stop"`: it emits only role/content chunks and the
+/// common egress guard converts its EOF into `upstream_incomplete` rather than
+/// claiming a completed cached answer.
 pub fn fake_stream_from_response(
     response: ChatCompletionResponse,
 ) -> BoxStream<'static, Result<ChatCompletionChunk, ProviderError>> {
@@ -1524,8 +1901,9 @@ pub fn fake_stream_from_response(
     let finish_reason = response
         .choices
         .first()
-        .and_then(|c| c.finish_reason.clone())
-        .unwrap_or_else(|| "stop".into());
+        .and_then(|c| c.finish_reason.as_deref())
+        .filter(|reason| is_allowed_stream_finish_reason(reason))
+        .map(str::to_owned);
 
     let role_chunk = ChatCompletionChunk {
         id: id.clone(),
@@ -1567,22 +1945,26 @@ pub fn fake_stream_from_response(
         extra: Default::default(),
     };
 
-    let finish_chunk = ChatCompletionChunk {
-        id,
-        object: "chat.completion.chunk".into(),
-        created,
-        model,
-        choices: vec![ChunkChoice {
-            index: 0,
-            delta: ChunkDelta::default(),
-            finish_reason: Some(finish_reason),
+    let mut chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(role_chunk), Ok(content_chunk)];
+    if let Some(finish_reason) = finish_reason {
+        chunks.push(Ok(ChatCompletionChunk {
+            id,
+            object: "chat.completion.chunk".into(),
+            created,
+            model,
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::default(),
+                finish_reason: Some(finish_reason),
+                extra: Default::default(),
+            }],
+            usage: Some(usage),
             extra: Default::default(),
-        }],
-        usage: Some(usage),
-        extra: Default::default(),
-    };
+        }));
+    }
 
-    futures::stream::iter(vec![Ok(role_chunk), Ok(content_chunk), Ok(finish_chunk)]).boxed()
+    futures::stream::iter(chunks).boxed()
 }
 
 #[cfg(test)]
@@ -1592,6 +1974,90 @@ mod tests {
         messages::{Choice, Message, MessageContent},
         Usage,
     };
+
+    fn stream_chunk(
+        content: Option<&str>,
+        finish_reason: Option<&str>,
+        usage: Option<Usage>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "stream-test".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "test-model".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: content.map(str::to_owned),
+                    tool_calls: Vec::new(),
+                    extra: Default::default(),
+                },
+                finish_reason: finish_reason.map(str::to_owned),
+                extra: Default::default(),
+            }],
+            usage,
+            extra: Default::default(),
+        }
+    }
+
+    fn standalone_usage_chunk(usage: Usage) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "stream-test".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "test-model".into(),
+            choices: Vec::new(),
+            usage: Some(usage),
+            extra: Default::default(),
+        }
+    }
+
+    fn test_pricing() -> ModelPricing {
+        ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 1.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: chrono::DateTime::UNIX_EPOCH,
+        }
+    }
+
+    async fn sse_body<S>(stream: S) -> String
+    where
+        S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+    {
+        let response = Sse::new(stream).into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("SSE body");
+        String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE body")
+    }
+
+    fn tracked_event_stream(
+        stream: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+        pricing: Option<ModelPricing>,
+        panel: Option<Arc<PanelStreamLog>>,
+    ) -> TrackedEventStream {
+        TrackedEventStream {
+            inner: Arc::new(std::sync::Mutex::new(UsageTrackingStream::new(
+                stream, 1, 0, "openai",
+            ))),
+            pricing,
+            baseline_pricing: None,
+            fee_multiplier: 1.0,
+            flex_applied: false,
+            pass_effects: PassEffects::default(),
+            include_usage: true,
+            panel,
+            phase: Phase::Streaming,
+        }
+    }
 
     fn cached_response(text: &str) -> ChatCompletionResponse {
         ChatCompletionResponse {
@@ -1653,6 +2119,387 @@ mod tests {
         let chunks: Vec<_> = stream.filter_map(|r| async { r.ok() }).collect().await;
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn untracked_eof_without_finish_reason_is_error_not_done() {
+        let stream = futures::stream::iter(vec![Ok::<_, ProviderError>(stream_chunk(
+            Some("partial"),
+            None,
+            None,
+        ))])
+        .boxed();
+
+        let body = sse_body(build_event_stream(stream)).await;
+        assert!(body.contains("partial"));
+        assert!(body.contains("upstream_incomplete"), "body: {body}");
+        assert!(body.contains("unverified_terminal_finish_reason"));
+        assert!(
+            !body.contains("[DONE]"),
+            "an unverified EOF must not carry a completion sentinel: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_unknown_finish_reason_is_error_not_done() {
+        let stream = futures::stream::iter(vec![Ok::<_, ProviderError>(stream_chunk(
+            Some("partial"),
+            Some("provider_private_reason"),
+            None,
+        ))])
+        .boxed();
+
+        let body = sse_body(build_event_stream(stream)).await;
+        assert!(body.contains("provider_private_reason"));
+        assert!(body.contains("upstream_incomplete"));
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn untracked_allowed_finish_reason_preserves_done() {
+        let stream = futures::stream::iter(vec![Ok::<_, ProviderError>(stream_chunk(
+            Some("complete"),
+            Some("stop"),
+            None,
+        ))])
+        .boxed();
+
+        let body = sse_body(build_event_stream(stream)).await;
+        assert!(body.contains("[DONE]"), "body: {body}");
+        assert!(!body.contains("upstream_incomplete"));
+    }
+
+    #[test]
+    fn l1_cache_attribution_rejects_nonfinite_or_negative_baselines() {
+        assert!(CacheStreamAttribution::l1(0.0045, 5, 4, 0).is_some());
+        assert!(CacheStreamAttribution::l1(-0.01, 5, 4, 0).is_none());
+        assert!(CacheStreamAttribution::l1(f64::NAN, 5, 4, 0).is_none());
+        assert!(CacheStreamAttribution::l1(f64::INFINITY, 5, 4, 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn l1_cache_hit_emits_stored_terminal_receipt_before_done() {
+        let attribution =
+            CacheStreamAttribution::l1(0.0045, 5, 4, 5).expect("finite L1 envelope baseline");
+        let body = sse_body(build_event_stream_with_cache_attribution(
+            fake_stream_from_response(cached_response("cached complete")),
+            Some(attribution),
+        ))
+        .await;
+
+        let receipt = body
+            .find("event: tokentrimmer.usage")
+            .expect("cache receipt must be emitted");
+        let done = body
+            .find("[DONE]")
+            .expect("verified fake stream must finish");
+        assert!(receipt < done, "receipt must precede completion: {body}");
+        assert!(body.contains("\"cost_usd\":0.0"), "body: {body}");
+        assert!(
+            body.contains("\"baseline_cost_usd\":0.0045"),
+            "body: {body}"
+        );
+        assert!(body.contains("\"saved_usd\":0.0045"), "body: {body}");
+        assert!(body.contains("\"cache\":\"hit-l1\""), "body: {body}");
+        assert!(
+            body.contains("\"usage_source\":\"l1_cached_response\""),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_cache_fake_stream_never_emits_attribution() {
+        let mut response = cached_response("cached partial");
+        response.choices[0].finish_reason = None;
+        let attribution =
+            CacheStreamAttribution::l1(0.0045, 5, 4, 5).expect("finite L1 envelope baseline");
+        let body = sse_body(build_event_stream_with_cache_attribution(
+            fake_stream_from_response(response),
+            Some(attribution),
+        ))
+        .await;
+
+        assert!(body.contains("upstream_incomplete"), "body: {body}");
+        assert!(!body.contains("event: tokentrimmer.usage"), "body: {body}");
+        assert!(!body.contains("[DONE]"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn untracked_late_chunk_after_finish_is_protocol_error_not_done() {
+        let stream = futures::stream::iter(vec![
+            Ok::<_, ProviderError>(stream_chunk(Some("complete"), Some("stop"), None)),
+            Ok(stream_chunk(Some("must-not-forward"), None, None)),
+        ])
+        .boxed();
+
+        let body = sse_body(build_event_stream(stream)).await;
+        assert!(body.contains("terminal_sequence_violation"), "body: {body}");
+        assert!(
+            !body.contains("must-not-forward"),
+            "late provider content must not reach the client: {body}"
+        );
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn untracked_usage_tail_after_finish_remains_valid() {
+        let stream = futures::stream::iter(vec![
+            Ok::<_, ProviderError>(stream_chunk(Some("complete"), Some("stop"), None)),
+            Ok(standalone_usage_chunk(Usage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            })),
+        ])
+        .boxed();
+
+        let body = sse_body(build_event_stream(stream)).await;
+        assert!(body.contains("\"choices\":[]"), "body: {body}");
+        assert!(body.contains("[DONE]"), "body: {body}");
+        assert!(!body.contains("terminal_sequence_violation"));
+    }
+
+    #[tokio::test]
+    async fn untracked_error_after_finish_is_protocol_error_not_done() {
+        let stream = futures::stream::iter(vec![
+            Ok::<_, ProviderError>(stream_chunk(Some("complete"), Some("stop"), None)),
+            Err(ProviderError::Timeout { ms: 1 }),
+        ])
+        .boxed();
+
+        let body = sse_body(build_event_stream(stream)).await;
+        assert!(body.contains("terminal_sequence_violation"), "body: {body}");
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn tracked_eof_without_finish_reason_suppresses_usage_and_done() {
+        let stream = futures::stream::iter(vec![Ok::<_, ProviderError>(stream_chunk(
+            Some("partial"),
+            None,
+            None,
+        ))])
+        .boxed();
+        let body = sse_body(tracked_event_stream(stream, Some(test_pricing()), None)).await;
+
+        assert!(body.contains("upstream_incomplete"), "body: {body}");
+        assert!(
+            !body.contains("tokentrimmer.usage"),
+            "partial EOF must not get a terminal cost receipt: {body}"
+        );
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn tracked_late_chunk_suppresses_terminal_receipts_and_cache_data() {
+        let usage = Usage {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let stream = futures::stream::iter(vec![
+            Ok::<_, ProviderError>(stream_chunk(
+                Some("complete"),
+                Some("stop"),
+                Some(usage.clone()),
+            )),
+            Ok(stream_chunk(Some("must-not-forward"), None, None)),
+        ])
+        .boxed();
+        let body = sse_body(tracked_event_stream(stream, Some(test_pricing()), None)).await;
+
+        assert!(body.contains("terminal_sequence_violation"), "body: {body}");
+        assert!(!body.contains("must-not-forward"));
+        assert!(!body.contains("tokentrimmer.usage"));
+        assert!(!body.contains("[DONE]"));
+
+        let stream = futures::stream::iter(vec![
+            Ok::<_, ProviderError>(stream_chunk(Some("complete"), Some("stop"), Some(usage))),
+            Ok(stream_chunk(Some("must-not-cache"), None, None)),
+        ])
+        .boxed();
+        let mut tracker = UsageTrackingStream::new(stream, 2, 0, "openai");
+        let _ = tracker.next().await;
+        let _ = tracker.next().await;
+        assert!(tracker.terminal_sequence_violation);
+        assert!(
+            tracker.cache_completion_data().is_none(),
+            "a stream with a late provider frame must never populate L1/L2"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_chunk_is_not_cacheable_until_clean_eof_is_observed() {
+        let stream = futures::stream::iter(vec![Ok::<_, ProviderError>(stream_chunk(
+            Some("complete"),
+            Some("stop"),
+            Some(Usage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+        ))])
+        .boxed();
+        let mut tracker = UsageTrackingStream::new(stream, 2, 0, "openai");
+
+        assert!(tracker.next().await.is_some());
+        assert!(tracker.finished);
+        assert!(
+            tracker.cache_completion_data().is_none(),
+            "a client abort after the terminal chunk must not populate cache before upstream EOF"
+        );
+
+        assert!(tracker.next().await.is_none());
+        assert!(
+            tracker.cache_completion_data().is_some(),
+            "a terminal chunk followed by clean EOF remains cacheable"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_error_after_finish_is_protocol_error_not_done() {
+        let stream = futures::stream::iter(vec![
+            Ok::<_, ProviderError>(stream_chunk(Some("complete"), Some("stop"), None)),
+            Err(ProviderError::Timeout { ms: 1 }),
+        ])
+        .boxed();
+        let body = sse_body(tracked_event_stream(stream, Some(test_pricing()), None)).await;
+
+        assert!(body.contains("terminal_sequence_violation"), "body: {body}");
+        assert!(!body.contains("tokentrimmer.usage"));
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn unknown_finish_reason_cannot_produce_cache_data() {
+        let stream = futures::stream::iter(vec![Ok::<_, ProviderError>(stream_chunk(
+            Some("partial"),
+            Some("provider_private_reason"),
+            Some(Usage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+        ))])
+        .boxed();
+        let mut tracker = UsageTrackingStream::new(stream, 2, 0, "openai");
+        let _ = tracker.next().await;
+
+        assert!(!tracker.finished);
+        assert!(
+            tracker.cache_completion_data().is_none(),
+            "an unknown terminal marker must never create an L1/L2 cacheable response"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_panel_eof_without_finish_reason_suppresses_panel_receipt() {
+        let stream = futures::stream::empty::<Result<ChatCompletionChunk, ProviderError>>().boxed();
+        let panel = Arc::new(PanelStreamLog {
+            leg_records: Vec::new(),
+            leg_cost_total: None,
+            strategy: crate::routes::panel::ArbiterStrategyKind::Synthesize,
+            quorum_required: 1,
+            quorum_met: 1,
+            arbiter_detail: crate::routes::panel::ArbiterDetail::default(),
+            arbiter_cost_plan: crate::routes::panel::ArbiterCostPlan::Live,
+            arbiter_model: "test-arbiter".into(),
+            panel_leg_writer: None,
+        });
+        let body = sse_body(tracked_event_stream(
+            stream,
+            Some(test_pricing()),
+            Some(panel),
+        ))
+        .await;
+
+        assert!(body.contains("upstream_incomplete"), "body: {body}");
+        assert!(
+            !body.contains("tokentrimmer.panel"),
+            "partial panel EOF must not get a panel receipt: {body}"
+        );
+        assert!(!body.contains("tokentrimmer.usage"));
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn tracked_panel_late_chunk_after_finish_suppresses_panel_receipt() {
+        let stream = futures::stream::iter(vec![
+            Ok::<_, ProviderError>(stream_chunk(Some("complete"), Some("stop"), None)),
+            Ok(stream_chunk(Some("must-not-forward"), None, None)),
+        ])
+        .boxed();
+        let panel = Arc::new(PanelStreamLog {
+            leg_records: Vec::new(),
+            leg_cost_total: None,
+            strategy: crate::routes::panel::ArbiterStrategyKind::Synthesize,
+            quorum_required: 1,
+            quorum_met: 1,
+            arbiter_detail: crate::routes::panel::ArbiterDetail::default(),
+            arbiter_cost_plan: crate::routes::panel::ArbiterCostPlan::Live,
+            arbiter_model: "test-arbiter".into(),
+            panel_leg_writer: None,
+        });
+        let body = sse_body(tracked_event_stream(
+            stream,
+            Some(test_pricing()),
+            Some(panel),
+        ))
+        .await;
+
+        assert!(body.contains("terminal_sequence_violation"), "body: {body}");
+        assert!(!body.contains("must-not-forward"));
+        assert!(!body.contains("tokentrimmer.panel"));
+        assert!(!body.contains("tokentrimmer.usage"));
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn malformed_cached_response_is_not_repaired_to_stop() {
+        let mut response = cached_response("cached partial");
+        response.choices[0].finish_reason = None;
+        let fake = fake_stream_from_response(response);
+        let chunks: Vec<_> = fake
+            .filter_map(|result| async move { result.ok() })
+            .collect()
+            .await;
+        assert_eq!(
+            chunks.len(),
+            2,
+            "cache fake stream must not fabricate a terminal stop chunk"
+        );
+
+        let mut response = cached_response("cached partial");
+        response.choices[0].finish_reason = Some("provider_private_reason".into());
+        let body = sse_body(build_event_stream(fake_stream_from_response(response))).await;
+        assert!(body.contains("upstream_incomplete"));
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn cached_fake_stream_rejects_late_provider_frame_after_finish() {
+        let stream = fake_stream_from_response(cached_response("cached complete"))
+            .chain(futures::stream::iter(vec![Ok::<_, ProviderError>(
+                stream_chunk(Some("must-not-forward"), None, None),
+            )]))
+            .boxed();
+        let body = sse_body(build_event_stream(stream)).await;
+
+        assert!(body.contains("terminal_sequence_violation"), "body: {body}");
+        assert!(!body.contains("must-not-forward"));
+        assert!(!body.contains("[DONE]"));
     }
 
     #[tokio::test]
@@ -1857,6 +2704,9 @@ mod tests {
         let stream = futures::stream::iter(chunks).boxed();
         let mut tracker = UsageTrackingStream::new(stream, 100, 20, "anthropic");
         let _ = tracker.next().await;
+        // Cache eligibility is not established until the upstream has actually
+        // reached EOF after its terminal marker.
+        assert!(tracker.next().await.is_none());
 
         let usage = tracker.snapshot();
         assert_eq!(usage.cache_creation_tokens, Some(30));

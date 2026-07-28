@@ -108,7 +108,7 @@ crates/
 ├── mcp/                       MCP server
 ├── client/                    Rust SDK (typed gateway client; on crates.io as `tokentrimmer-client`, imports as `tt_client`)
 ├── cli/                       `tt` binary
-├── ts-types/                  Rust → TS bindings codegen (placeholder, not yet implemented)
+├── ts-types/                  Rust → schema → TS proof-contract generator + drift gate
 └── providers/
     ├── openai/                The canonical adapter
     ├── anthropic/             Worked reference (separate system field, cache_control)

@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.2.0",
+  "created_at": "2026-07-19T00:00:00Z",
+  "plan_input": {
+    "plan_id": "00000000-0000-0000-0000-000000000001",
+    "org_id": "00000000-0000-0000-0000-000000000002",
+    "window_start": "2026-05-01T00:00:00Z",
+    "window_end": "2026-05-08T00:00:00Z",
+    "requests": [
+      {
+        "id": "00000000-0000-0000-0000-000000000010",
+        "org_id": "00000000-0000-0000-0000-000000000002",
+        "ts": "2026-05-01T12:00:00Z",
+        "provider": "anthropic",
+        "model": "claude-3-5-sonnet",
+        "requested_model": "claude-3-5-sonnet",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "cached_tokens": 0,
+        "cost_usd": 0.0045,
+        "baseline_cost_usd": 0.0045,
+        "cached": false,
+        "cache_layer": null,
+        "matched_route_id": null,
+        "latency_ms": 100,
+        "upstream_latency_ms": 80,
+        "status": 200,
+        "tag": null,
+        "embedding": null,
+        "finish_reason": null,
+        "task_class": "chat_completions"
+      }
+    ],
+    "proposed_routes": [
+      {
+        "id": "00000000-0000-0000-0000-000000000099",
+        "name": "cheap-for-short",
+        "priority": 100,
+        "enabled": true,
+        "when": {
+          "model_in": [
+            "claude-3-5-sonnet"
+          ],
+          "input_tokens_lt": null,
+          "input_tokens_gt": null,
+          "tag_equals": null
+        },
+        "then": {
+          "target_model": "claude-3-5-haiku"
+        }
+      }
+    ],
+    "pricing": {
+      "anthropic:claude-3-5-haiku": {
+        "input_per_million": 0.25,
+        "output_per_million": 1.25,
+        "cached_input_per_million": 0.025
+      }
+    },
+    "config": {
+      "l1_ttl_seconds": null,
+      "l2_threshold_sweep": [
+        0.85,
+        0.9,
+        0.92,
+        0.95
+      ],
+      "l2_ttl_seconds": null
+    },
+    "seed": 42,
+    "bootstrap_iterations": 200
+  },
+  "expected_result": {
+    "plan_id": "00000000-0000-0000-0000-000000000001",
+    "org_id": "00000000-0000-0000-0000-000000000002",
+    "window_start": "2026-05-01T00:00:00Z",
+    "window_end": "2026-05-08T00:00:00Z",
+    "sample_size": 1,
+    "aggregates": {
+      "total_baseline_cost_usd": 0.0045,
+      "total_projected_cost_usd": 0.000375,
+      "projected_savings_usd": 0.004124999999999999,
+      "projected_savings_pct": 91.66666666666666,
+      "cache_hit_rate_projected": 0.0,
+      "p50_latency_ms_projected": 100.0,
+      "p95_latency_ms_projected": 100.0,
+      "requests_rerouted": 1,
+      "requests_unchanged": 0,
+      "requests_unprice_able": 0,
+      "l2_projections": [],
+      "l2_poisoning_candidates": 0
+    },
+    "confidence_intervals": {
+      "savings_usd_95": [
+        0.004124999999999999,
+        0.004124999999999999
+      ],
+      "savings_pct_95": [
+        91.66666666666666,
+        91.66666666666666
+      ],
+      "cache_hit_rate_95": [
+        0.0,
+        0.0
+      ],
+      "p50_latency_ms_95": [
+        100.0,
+        100.0
+      ],
+      "p95_latency_ms_95": [
+        100.0,
+        100.0
+      ]
+    },
+    "per_route_breakdown": [
+      {
+        "route_id": "00000000-0000-0000-0000-000000000099",
+        "route_name": "cheap-for-short",
+        "matched": 1,
+        "baseline_cost_usd": 0.0045,
+        "projected_cost_usd": 0.000375,
+        "savings_usd": 0.004124999999999999
+      }
+    ],
+    "caveats": [
+      "Small sample size (1 requests) — confidence intervals are wide.",
+      "1 rerouted request(s) had no latency history for the target model — their latency is shown unchanged, not projected."
+    ],
+    "proposed_routes": [
+      {
+        "id": "00000000-0000-0000-0000-000000000099",
+        "name": "cheap-for-short",
+        "priority": 100,
+        "enabled": true,
+        "when": {
+          "model_in": [
+            "claude-3-5-sonnet"
+          ],
+          "input_tokens_lt": null,
+          "input_tokens_gt": null,
+          "tag_equals": null
+        },
+        "then": {
+          "target_model": "claude-3-5-haiku"
+        }
+      }
+    ]
+  }
+}

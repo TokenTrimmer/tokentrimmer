@@ -9,10 +9,10 @@ your LLM calls more expensive.
 > standalone repo for this action once it's published to the Marketplace — it
 > does **not** exist yet. Until then the action ships inside the monorepo, so
 > consume it via the subpath form:
-> `uses: TokenTrimmer/tokentrimmer/inspect-action@<ref>` (pin `<ref>` to a tag
-> or commit SHA). The `tokentrimmer/cost-gate-action@v1` snippets below are
-> written against the future standalone repo; swap in the subpath ref to run
-> the action today.
+> `uses: TokenTrimmer/tokentrimmer/inspect-action@<commit-SHA>`. Pin the action
+> itself to an immutable full commit SHA, not a mutable branch or tag. The
+> `tokentrimmer/cost-gate-action@v1` snippets below are written against the
+> future standalone repo; swap in the subpath SHA to run the action today.
 
 It works by reading the model identifiers (`model = "..."`, `"model": "..."`,
 etc.) added and removed in `git diff <base> -- <path>`, pricing each against
@@ -38,12 +38,12 @@ jobs:
   cost-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0 # needed so the base ref is available for the diff
       # Until the standalone repo is published, use the monorepo subpath:
-      #   uses: TokenTrimmer/tokentrimmer/inspect-action@v1
-      - uses: tokentrimmer/cost-gate-action@v1
+      #   uses: TokenTrimmer/tokentrimmer/inspect-action@117b8d69c01e5a56a6c548355ef9453f6cdfaeac
+      - uses: TokenTrimmer/tokentrimmer/inspect-action@117b8d69c01e5a56a6c548355ef9453f6cdfaeac
         with:
           path: .
           fail-on-cost-increase: true
@@ -63,6 +63,21 @@ PR's base, prices the model changes, posts a comment like:
 
 …and fails the check if the net change is an increase.
 
+For release evidence, the install step logs the resolved immutable
+`tt-version` commit and the SHA-256 of the resulting local `tt` binary. Keep
+that job output with the reviewed action/source pin; it identifies this
+source-built binary but is not a substitute for a separately signed release
+archive.
+
+[`source-build-contract.json`](./source-build-contract.json) is the checked-in
+sync record for the default CLI source repository/revision and the supported
+`locked_source_build` delivery model. CI requires the action default and all
+usable monorepo examples in this README to match it. Its
+`signed_release_artifact: false` field is deliberate: it does not attest a
+GitHub Release, a crates.io package, or a downloadable binary. A reviewed
+release-to-SHA record and a signed/checksum-verified artifact remain separate
+release-owner evidence.
+
 > **Note:** `fetch-depth: 0` on `actions/checkout` is required so the base ref
 > is present in the local git history for the diff.
 
@@ -75,7 +90,7 @@ PR's base, prices the model changes, posts a comment like:
 | `fail-on-cost-increase` | `true` | Fail the check on a projected per-call cost increase. Set `false` to report only. |
 | `comment` | `true` | Post/update a sticky PR comment with the cost-diff report (pull requests only). |
 | `github-token` | `${{ github.token }}` | Token used to post the PR comment. |
-| `tt-version` | `latest` | `tt-cli` version to use. |
+| `tt-version` | `117b8d69c01e5a56a6c548355ef9453f6cdfaeac` | Immutable 40-character TokenTrimmer commit SHA used to build `tt-cli`. Mutable branch/tag refs and `latest` are rejected. |
 | `upload-sarif` | `false` | Also run the Inspect static-analysis rules over `path` and upload the results as SARIF 2.1.0 to the Code Scanning / Security tab. Requires `permissions: security-events: write`. |
 | `sarif-fail-on` | `critical` | With `upload-sarif: true`, the minimum finding severity that fails the job (`low`\|`medium`\|`high`\|`critical`). SARIF is still produced/uploaded regardless. |
 
@@ -103,11 +118,12 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
-      # Monorepo subpath today: TokenTrimmer/tokentrimmer/inspect-action@v1
-      - uses: tokentrimmer/cost-gate-action@v1
+      # Monorepo subpath today (pin to an immutable action commit):
+      # TokenTrimmer/tokentrimmer/inspect-action@117b8d69c01e5a56a6c548355ef9453f6cdfaeac
+      - uses: TokenTrimmer/tokentrimmer/inspect-action@117b8d69c01e5a56a6c548355ef9453f6cdfaeac
         with:
           path: .
           upload-sarif: true
@@ -131,8 +147,8 @@ Want the comment without blocking merges? Set `fail-on-cost-increase: false`:
 
 ```yaml
       # Or, from the monorepo today:
-      #   uses: TokenTrimmer/tokentrimmer/inspect-action@v1
-      - uses: tokentrimmer/cost-gate-action@v1
+      #   uses: TokenTrimmer/tokentrimmer/inspect-action@117b8d69c01e5a56a6c548355ef9453f6cdfaeac
+      - uses: TokenTrimmer/tokentrimmer/inspect-action@117b8d69c01e5a56a6c548355ef9453f6cdfaeac
         with:
           fail-on-cost-increase: false
 ```

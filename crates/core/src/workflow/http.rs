@@ -18,7 +18,7 @@
 //!   `{{secrets.*}}` so Model/Agent prompts, Transform exprs, and Branch conditions
 //!   are always secret-free.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -117,6 +117,7 @@ pub(crate) fn substitute_with_secrets(
     trigger_id: &str,
     outputs: &HashMap<String, NodeOutput>,
     secrets: &HashMap<String, SecretString>,
+    variables: &BTreeMap<String, String>,
 ) -> String {
     let mut result = String::with_capacity(template.len() + 16);
     let mut remaining = template;
@@ -127,7 +128,7 @@ pub(crate) fn substitute_with_secrets(
 
         if let Some(close) = remaining.find("}}") {
             let ref_str = remaining[..close].trim();
-            let resolved = resolve_secret_or_ref(ref_str, trigger_id, outputs, secrets);
+            let resolved = resolve_secret_or_ref(ref_str, trigger_id, outputs, secrets, variables);
             result.push_str(&resolved);
             remaining = &remaining[close + 2..];
         } else {
@@ -146,6 +147,7 @@ fn resolve_secret_or_ref(
     trigger_id: &str,
     outputs: &HashMap<String, NodeOutput>,
     secrets: &HashMap<String, SecretString>,
+    variables: &BTreeMap<String, String>,
 ) -> String {
     // `{{secrets.NAME}}` → expose the secret value (wire-only).
     if let Some(name) = ref_str.strip_prefix("secrets.") {
@@ -153,6 +155,9 @@ fn resolve_secret_or_ref(
             .get(name)
             .map(|s| s.expose().to_string())
             .unwrap_or_default();
+    }
+    if let Some(name) = ref_str.strip_prefix("variables.") {
+        return variables.get(name).cloned().unwrap_or_default();
     }
 
     // Split on the first `.` for `node.field` syntax.
@@ -336,16 +341,31 @@ mod tests {
         secrets.insert("API_KEY".to_string(), SecretString::new("sekret-value"));
         let outputs = HashMap::new();
 
-        let result = substitute_with_secrets("Bearer {{secrets.API_KEY}}", "t", &outputs, &secrets);
+        let result = substitute_with_secrets(
+            "Bearer {{secrets.API_KEY}}",
+            "t",
+            &outputs,
+            &secrets,
+            &BTreeMap::new(),
+        );
         assert_eq!(result, "Bearer sekret-value");
     }
 
     #[test]
-    fn substitute_with_secrets_missing_secret_is_empty() {
+    fn substitute_with_secrets_missing_secret_is_defensively_empty() {
         let secrets = HashMap::new();
         let outputs = HashMap::new();
 
-        let result = substitute_with_secrets("Bearer {{secrets.MISSING}}", "t", &outputs, &secrets);
+        let result = substitute_with_secrets(
+            "Bearer {{secrets.MISSING}}",
+            "t",
+            &outputs,
+            &secrets,
+            &BTreeMap::new(),
+        );
+        // The engine preflight prevents this helper from dispatching an Http
+        // node with a missing reference. Keep the wire helper non-panicking as
+        // a final defensive fallback.
         assert_eq!(result, "Bearer ");
     }
 
@@ -361,7 +381,13 @@ mod tests {
         );
         let secrets = HashMap::new();
 
-        let result = substitute_with_secrets("prefix-{{n1.token}}", "t", &outputs, &secrets);
+        let result = substitute_with_secrets(
+            "prefix-{{n1.token}}",
+            "t",
+            &outputs,
+            &secrets,
+            &BTreeMap::new(),
+        );
         assert_eq!(result, "prefix-node-value");
     }
 
@@ -378,9 +404,27 @@ mod tests {
             },
         );
 
-        let result =
-            substitute_with_secrets("{{input}} + {{secrets.KEY}}", "t", &outputs, &secrets);
+        let result = substitute_with_secrets(
+            "{{input}} + {{secrets.KEY}}",
+            "t",
+            &outputs,
+            &secrets,
+            &BTreeMap::new(),
+        );
         assert_eq!(result, "hello + s3cr3t");
+    }
+
+    #[test]
+    fn substitute_with_secrets_also_resolves_non_secret_variables() {
+        let variables = BTreeMap::from([("REGION".into(), "us-east".into())]);
+        let result = substitute_with_secrets(
+            "https://example.com/{{variables.REGION}}",
+            "t",
+            &HashMap::new(),
+            &HashMap::new(),
+            &variables,
+        );
+        assert_eq!(result, "https://example.com/us-east");
     }
 
     // ---- run_http: userinfo rejection ---------------------------------------

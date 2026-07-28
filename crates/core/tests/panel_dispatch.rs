@@ -207,6 +207,7 @@ async fn panel_header_dispatches_and_bills_one_aggregate_row() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {
@@ -257,6 +258,7 @@ async fn panel_header_dispatches_and_bills_one_aggregate_row() {
     let row = &rows[0];
     assert!(!row.cached, "INVARIANT: every panel row is cached=false");
     assert_eq!(row.provider, "panel", "decision-A sentinel provider stamp");
+    assert_eq!(row.requested_model.as_deref(), Some("gpt-4o"));
     assert_eq!(row.model, "gpt-4o", "row.model == arbiter model");
     assert!(
         row.cost_usd > 0.0,

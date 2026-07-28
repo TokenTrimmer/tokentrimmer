@@ -76,6 +76,7 @@ pub const VERDICT_REJECTED: &str = "rejected";
 /// payload. `verifying_key_hex` is the hex-encoded 32-byte public key the
 /// receipt was signed with, embedded so verification needs no key lookup
 /// (mirrors `VcrReceipt`).
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct L2Receipt {
     /// See [`L2_SCHEMA_VERSION`].

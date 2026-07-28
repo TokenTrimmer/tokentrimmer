@@ -1,0 +1,22 @@
+{
+  "run_id": "00000000-0000-0000-0000-0000000000a1",
+  "org_id": "00000000-0000-0000-0000-00000000002a",
+  "workflow_id": "00000000-0000-0000-0000-0000000000b2",
+  "status": "completed",
+  "cost_micros": 200000,
+  "baseline_micros": 180000,
+  "saved_micros": 0,
+  "signed_request_delta_micros": -50000,
+  "request_delta_formula_version": "tt.request-delta-estimate.v1",
+  "request_delta_eligible_requests": 2,
+  "request_delta_measured_requests": 2,
+  "cost_usd": 0.2,
+  "baseline_usd": 0.18,
+  "saved_usd": 0.0,
+  "signed_request_delta_usd": -0.05,
+  "signature_hex": "8fd362f6b9526fc52b541e74925299b9004b0780a2127ed150c5e1db65d6c25d02941f6016145984fceeb1b1c6cf08b54385074f476124bfe3714b176174cc02",
+  "verifying_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "canonical_version": "v3",
+  "quality_verdict": null,
+  "signed_at": "2026-07-19T00:00:00Z"
+}

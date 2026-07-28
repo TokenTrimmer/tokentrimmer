@@ -213,11 +213,38 @@ def test_async_log_success_event_records():
     assert logger.attributed_calls == 1
 
 
+def test_sync_post_api_hook_accounts_immediately_without_success_double_count():
+    logger = TokenTrimmerLiteLLMLogger(max_cost_usd=0.001, record_spans=False)
+    kwargs = {
+        "litellm_call_id": "call-1",
+        "response_headers": TT_HEADERS,
+    }
+
+    logger.log_post_api_call(kwargs, None, None, None)
+    assert logger.total_cost_usd == pytest.approx(0.0034)
+    assert logger.attributed_calls == 1
+    assert logger.budget_exceeded is True
+
+    # LiteLLM later dispatches the normal success callback on an executor. It
+    # may add token/span attributes, but must not account for this call twice.
+    logger.log_success_event(kwargs, _response(response_headers=TT_HEADERS), None, None)
+    assert logger.total_cost_usd == pytest.approx(0.0034)
+    assert logger.attributed_calls == 1
+
+
 def test_install_sets_return_response_headers_and_registers():
     import litellm
 
     saved_flag = litellm.return_response_headers
-    saved_callbacks = list(litellm.callbacks)
+    callback_names = (
+        "callbacks",
+        "input_callback",
+        "success_callback",
+        "failure_callback",
+        "_async_success_callback",
+        "_async_failure_callback",
+    )
+    saved_callbacks = {name: list(getattr(litellm, name)) for name in callback_names}
     try:
         litellm.callbacks = []
         litellm.return_response_headers = False
@@ -231,7 +258,8 @@ def test_install_sets_return_response_headers_and_registers():
         assert litellm.callbacks.count(logger) == 2  # append is not guarded
     finally:
         litellm.return_response_headers = saved_flag
-        litellm.callbacks = saved_callbacks
+        for name, callbacks in saved_callbacks.items():
+            setattr(litellm, name, callbacks)
 
 
 def test_end_to_end_litellm_completion_captures_cost():
@@ -241,7 +269,15 @@ def test_end_to_end_litellm_completion_captures_cost():
     import litellm
 
     saved_flag = litellm.return_response_headers
-    saved_callbacks = list(litellm.callbacks)
+    callback_names = (
+        "callbacks",
+        "input_callback",
+        "success_callback",
+        "failure_callback",
+        "_async_success_callback",
+        "_async_failure_callback",
+    )
+    saved_callbacks = {name: list(getattr(litellm, name)) for name in callback_names}
     body = {
         "id": "chatcmpl-1",
         "object": "chat.completion",
@@ -279,4 +315,5 @@ def test_end_to_end_litellm_completion_captures_cost():
             logger.raise_if_exceeded()
     finally:
         litellm.return_response_headers = saved_flag
-        litellm.callbacks = saved_callbacks
+        for name, callbacks in saved_callbacks.items():
+            setattr(litellm, name, callbacks)

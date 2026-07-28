@@ -4874,10 +4874,12 @@ version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "schemars_derive",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -6314,6 +6316,7 @@ dependencies = [
  "rand_core 0.6.4",
  "regex",
  "reqwest 0.12.28",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -6440,6 +6443,7 @@ dependencies = [
  "insta",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -6731,8 +6735,14 @@ name = "tt-routing"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "schemars",
  "serde",
  "serde_json",
+ "serde_path_to_error",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
@@ -6776,6 +6786,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rand_core 0.6.4",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -6801,10 +6812,20 @@ dependencies = [
 name = "tt-ts-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
+ "tt-core",
+ "tt-plan-core",
+ "tt-routing",
  "tt-shared",
+ "tt-telemetry",
+ "uuid",
 ]
 
 [[package]]

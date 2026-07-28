@@ -1,0 +1,464 @@
+{
+  "$comment": "Structural route-write contract generated from the exact tt_routing::RouteWriteRequest parser and its nested live-routing types. Runtime semantic validation, authorization, readiness, and execution remain separate gates.",
+  "$defs": {
+    "AgenticBudget": {
+      "additionalProperties": false,
+      "description": "Route-grained agentic context budget — the opt-in shaping mode that brings the CLI's loop-aware levers server-side. Every lever is OFF by default; the whole struct is `Option<AgenticBudget>` on [`RouteAction`], serde-omitted when `None`, so the default request path is byte-identical (no new tokens, no new headers, no behavior change). The levers do NOT stack at face value — the planner (`tt_core::passes::agentic_budget`) nets them per request.",
+      "properties": {
+        "cache_prefix": {
+          "default": false,
+          "description": "Sub-lever 1 (lossless): annotate cache_control breakpoints the caller forgot + restructure static-first. Default true when the mode is set.",
+          "type": "boolean"
+        },
+        "clear_at_least_tokens": {
+          "default": 0,
+          "description": "Each elision must free at least this many tokens to justify the re-cache it forces (R1 cache-thrash guard). Default 0 = off.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "elide_stale_tools": {
+          "default": false,
+          "description": "Sub-lever 2: field-drop (lossless, token-true-gated) + summarize (lossy, judge-gated) stale tool results.",
+          "type": "boolean"
+        },
+        "keep_recent_pairs": {
+          "default": 3,
+          "description": "Keep the last N tool-result pairs VERBATIM (caveat C1 blast-radius bound). Default 3 (mirrors Anthropic `keep=3`).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "route_mechanical_to": {
+          "description": "Sub-lever 3: down-route mechanical sub-steps to this model in a CACHE-ISOLATED subagent lane. `None` = no routing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "semantic_substep_cache": {
+          "default": false,
+          "description": "Sub-lever 4 (expectation-value, caveat C2): semantic sub-step cache for READ-ONLY/idempotent sub-steps only.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RouteAction": {
+      "additionalProperties": false,
+      "description": "What a matching [`Route`] does to the request before dispatch.",
+      "properties": {
+        "agentic_budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgenticBudget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Opt the matched (loop) traffic into the agentic context budget — the route-grained mode that brings the CLI's loop-aware levers server-side. `None` = off (no-op; never alters semantics for non-opted traffic). Composes with `target_model`/`fallbacks` + `auto_pause`. Levers do NOT stack at face value — the planner nets them per request (see `tt_core::passes::agentic_budget`). Default `None`; omitted from JSON when `None` (back-compat with existing rows)."
+        },
+        "auto_pause": {
+          "description": "OPT-IN auto-pause: when true AND the paired-judge pass-rate over the recent verdict window drops below the floor (with at least `pause_min_verdicts` classified verdicts), the gateway pauses this route's rewrite (sticky; resume via `POST /v1/routes/:id/resume?expected_revision=N`). Default false — no behavior change unless a route enables it; omitted from JSON when false (back-compat with existing rows).",
+          "type": "boolean"
+        },
+        "batch": {
+          "description": "Mark matched traffic **batch-eligible** (advisory, research Phase 2.1). The provider Batch APIs price async (≤24h) traffic at ~50%; the gateway is synchronous today, so this action does NOT detour dispatch and does NOT change the bill. It: (1) tags the request_logs row batch-eligible, (2) records the FORGONE batch discount (priced from the served model's real catalog batch rate — never a hardcoded 0.5) in `batch_forgone_usd` / the `X-TokenTrimmer-Batch-Forgone-Usd` header, and (3) emits a `batch_deferred_unavailable` warning. NEVER applied to streaming or interactive (`X-TokenTrimmer-Interactive`) requests — the gateway clears the marker and warns `batch_ineligible:<reason>`. Default false; omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "compress": {
+          "description": "Opt the matched request into the **conservative compression pass** (request-pass pipeline, compression pass #1): a content-lossless trim of *non-prose* blocks (collapse redundant whitespace/blank lines in system/tool-result payloads, de-duplicate exactly-repeated adjacent tool-result blocks, canonicalize `tool_calls` arguments JSON). User prose and the actual instruction content are never altered. The pass runs only when this is true; the removed input tokens lower the prompt-token bill and are attributed as a distinct `compression` savings source (standard baseline − compressed cost). **Off by default** — no behavior change unless a route enables it; omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "content_compress": {
+          "description": "Opt the matched request into the **content-aware compression pass** (content_compress, request-pass pipeline; Phase 1). For each LARGE non-prose text block the dispatcher classifies its [`ContentKind`](tt_shared::content_kind::ContentKind) and applies a specialized backend: in P1a, JSON / CSV / log blocks get a CONTENT-PRESERVING structural compaction (collapse insignificant JSON whitespace, collapse repeated identical log lines, trim CSV padding); Code / Prose blocks are classified but left UNTOUCHED (their backends land in P1c / P1b). It rides the pipeline's token-true gate (a token-growing result → verbatim); the measured token reduction is booked into the ISOLATED `content_compress_saved_est_usd` estimate (never the invoice-reconciled headline) + surfaced on `X-TokenTrimmer-Content-Compress-Saved-Est-Usd`. **Off by default** — no behavior change unless a route enables it; omitted from JSON when false (back-compat, mirrors `compress`).",
+          "type": "boolean"
+        },
+        "diff": {
+          "description": "OPT-IN delta/diff responses (research Phase 3.4) for edit/iteration routes: when the prior artifact is identifiable FROM THE REQUEST (`tt_extras[\"diff_prior\"]` echo, else the last assistant message), the gateway instructs the model to emit an anchored search/replace patch, applies + validates it, and returns the FULL reconstructed artifact (the caller's contract is preserved; the short patch is what the provider bills). ANY validation failure fails CLOSED to a full re-emit. Mutually exclusive with `format_switch` (rejected at creation). Default false; omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "disable_cache": {
+          "description": "When true, a request this route matches skips L1+L2 entirely (no lookup, no insert) — for privacy/sensitive traffic that must not persist in the shared cache. Default false; omitted from JSON when false.",
+          "type": "boolean"
+        },
+        "doc_compaction": {
+          "description": "Opt the matched request into the **lossless document-compaction pass** (Document Lane D2, request-pass pipeline): a content-preserving trim of LARGE non-prose text documents (system/tool-result blocks ≥ a size threshold) — markdown-normalize (collapse ≥3 blank lines, strip trailing whitespace), strip repeated pure separator/header/footer boilerplate lines, and de-duplicate exactly-repeated multi-line blocks (keeping the first). User prose and the actual instruction content are never altered and small blocks are left untouched. Text-only, so it rides the token-true gate cleanly; the removed input tokens lower the prompt-token bill and are attributed as a distinct `doc_compaction` savings source that folds into the baseline exactly like `compress`. **Off by default** — no behavior change unless a route enables it; omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "document_lane": {
+          "description": "Opt the matched request into the **Document Lane** (D4): the pre-routing image/document → text distillation seam. When true (and the seam is live — D4c), image/document input parts are distilled to text BEFORE routing, so `request_has_images`/`request_has_documents` flip false and a route may downgrade the request to a cheaper TEXT model; the vision-avoided saving books to the ISOLATED `doc_vision_saved_est_usd` (never the invoice-reconciled headline). Lossy substitution stays judge-gated (the `DocDistillGate` + 0.90 auto-pause floor) and fails open to the verbatim request. **Off by default** — in D4a this flag only carries opt-in intent (the seam is not wired yet); omitted from JSON when false (back-compat, mirrors `compress`).",
+          "type": "boolean"
+        },
+        "fallbacks": {
+          "description": "Ordered fallback model ids, tried in order when the primary dispatch fails with a fallback-eligible error (provider down / 5xx / timeout). Empty = no failover. The gateway resolves each via the registry, so a fallback may cross providers. Populated by the cloud routes schema; `#[serde(default)]` keeps older rows / payloads compatible.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "flex": {
+          "description": "Opt the matched request into OpenAI's **Flex** service tier (`service_tier: \"flex\"`) — a synchronous-but-slower processing tier billed at ~50% of standard. The gateway sets `service_tier=\"flex\"` on the upstream request only when the served model is flex-eligible (carries a Flex rate in the catalog); an ineligible model is left untouched and a `flex_not_applied:<model>` warning is surfaced. Savings are attributed as a distinct `flex` source (standard baseline − flex cost). Default false; omitted from JSON when false (back-compat with existing rows).",
+          "type": "boolean"
+        },
+        "format_switch": {
+          "description": "OPT-IN format switch (research Phase 3.3): instruct the model to emit `\"csv\"` (flat-uniform records) or `\"bare\"` (single value) instead of verbose JSON. **This changes the parse contract** — the caller opted in via the route, and every switched response is advertised with a `format_switch:<label>` warnings token. Wire values `\"csv\"` | `\"bare\"` are validated at route creation (`validate_output_shaping`); an unknown value at dispatch time NO-OPs with a warning (fail-open forward-compat). Eligibility is enforced in code at dispatch (schema-shape detection; strict structured output, streaming, tools, n>1 all no-op). Mutually exclusive with `diff` (rejected at creation). Default `None` — no behavior change unless a route sets it; omitted from JSON when `None` (back-compat with existing rows).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_cost_usd": {
+          "description": "Pre-dispatch estimated-cost admission limit (USD). After this route's rewrite, if the rerouted model's static estimate still exceeds this, the gateway rejects the request (402) instead of dispatching. It does not reserve or settle provider usage, so it is not a runtime or invoice ceiling. `None` = no admission limit.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "minify_json": {
+          "description": "Opt matched traffic into **minified-JSON output steering** (research Phase 3.1): the gateway appends a deterministic, conditionally-phrased system-suffix instruction telling the model to emit JSON with no indentation/newlines. Lossless by construction (whitespace between JSON tokens carries no meaning); inert for non-JSON answers (the instruction is phrased \"when responding with JSON\"). NEVER injected when the served provider honors `response_format: json_schema` natively (grammar-locked structured output already controls whitespace — no-op + no claim, `minify_skipped:structured_output`). Savings are an ESTIMATE (own column/header, never in the invoice-reconciled headline). Default false; omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "panel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoutePanel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Trigger + configure the Fusion panel for matched requests. None (default) ⇒ no panel. A panel route is typically modifier-only (target_model None); if target_model is also set, the panel governs dispatch and the rewrite is inert (complete_panel branches first)."
+        },
+        "pause_floor_pass_rate": {
+          "description": "Pass-rate floor as a fraction in (0, 1]. The route auto-pauses when its windowed paired pass rate drops STRICTLY below this. `None` = the gateway default (`DEFAULT_PAUSE_FLOOR_PASS_RATE` = 0.90 in tt-core). Omitted from JSON when `None`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "pause_min_verdicts": {
+          "description": "Minimum classified verdicts (acceptable + degraded) in-window before the floor can trigger. `None` = the gateway default (`DEFAULT_PAUSE_MIN_VERDICTS` = 20 in tt-core). Omitted from JSON when `None`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reasoning_budget_tokens": {
+          "description": "Cap Anthropic-style extended-thinking spend: when the request carries a `thinking` config (`extra[\"thinking\"].budget_tokens`) above this, the budget is lowered to this value. NEVER expressed via `max_tokens` (Anthropic's max_tokens INCLUDES thinking — bounding it would truncate the answer). Never ENABLES thinking on a request that didn't ask for it. Minimum 1024 (Anthropic's floor). Same class gate / $0 booking as `reasoning_max_effort`. `None` = off (default); omitted when `None`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reasoning_max_effort": {
+          "description": "Cap OpenAI-style `reasoning_effort` for matched traffic at this level (`\"low\"` | `\"medium\"`). Lower-only: a request already at or below the cap is untouched; an absent effort on a catalog-Reasoning-capable model is treated as the provider default (\"medium\") and lowered when the cap is \"low\". HARD class gate: requests classified math/code/legal/medical are never capped (`reasoning_cap_skipped:class:*`). Books $0 — the unspent thinking tokens are only statistically visible; the event is metered and the #163 netted route savings tell the truth over the window. `None` = off (default); omitted from JSON when `None`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redact": {
+          "description": "Opt the matched request into the **request-redaction guardrail** (request-pass pipeline): a conservative SAFETY transform that replaces PII/secrets in the OUTBOUND request (user prose, system blocks, tool-result content) with a `[REDACTED]` placeholder BEFORE the request is dispatched upstream. Reuses the Tier-1 secret patterns plus email/SSN matchers and prefers over-redacting to leaking. This is **not** a savings feature: no cost/savings is attributed to redaction; the `x-tokentrimmer-warnings` header (`redacted:<class>`) is the signal that redaction fired. It redacts the upstream request, not the gateway's logs. **Off by default** — no behavior change unless a route enables it; omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "shadow_model": {
+          "description": "Shadow-mode candidate model. When `Some(model)`, the gateway ALSO dispatches the matched request to `model` as a **shadow** (non-streaming, single candidate, NO failover), DISCARDS the shadow response, and records the shadow's cost/usage SEPARATELY (never folded into the primary cost). Only the primary (control/canary) response is ever returned to the client.\n\nShadow mode DOUBLES upstream spend for matched requests, so it is opt-in (default `None`) and the shadow cost is logged in its own column / span attribute for reconciliation. A `shadow_model` with no `traffic_pct` means 100% of matched requests are shadowed (the primary still serves normally). The configured `shadow_model` MUST resolve to a registered provider — config validation rejects an unresolvable shadow at route creation time (fail at config time, not silently at dispatch). Omitted from JSON when `None` (back-compat with existing rows).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_model": {
+          "description": "Rewrite to this model. May target a different provider than the request (V3d-1 cross-provider routing); the target is capability-checked and dispatch/savings use the target's own provider.\n\n`None` = **modifier-only route**: keep the caller's chosen model and apply only this action's other then-effects (e.g. `agentic_budget`, `compress`). A modifier-only route MUST carry at least one effect — a route with neither a `target_model` nor any effect is a no-op mistake and is rejected at creation (`validate_route_has_effect`). Existing route JSON always carries `target_model`, so it deserializes to `Some`; omitting it yields `None`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "traffic_pct": {
+          "description": "Canary traffic split (0-100). When `Some(pct)`, only a deterministic `pct`% of the matched requests are routed to `target_model` (the canary arm); the remaining `(100 - pct)%` pass through on their originally-requested model (the control arm). The arm is chosen by the replica-independent [`sticky_traffic_split`] hash so the same logical request always lands in the same arm across replicas and retries.\n\n`None` (the default) = 100% of matched requests take the route (unconditional rewrite, today's behavior). `Some(0)` = 0% canary (the route never rewrites, only its `shadow_model`/side-effects could fire). Values above 100 are clamped to 100 by the split function. Omitted from JSON when `None` (back-compat with existing rows).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workflow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RouteWorkflow"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "CO-1: Trigger + configure a governed workflow detour for matched requests. None (default) ⇒ no workflow detour. When present, this route dispatches the matched request through the named workflow (running it through the workflow engine — with per-node budgets, signed receipts, etc.) instead of a direct provider call. Mutually exclusive with `panel` and `target_model` (validated at route creation). Workflows are non- deterministic (same reason panel bypasses cache), so a workflow route skips L1+L2. The `mode` controls whether the workflow result REPLACES the upstream call (`detour`) or runs alongside it for comparison (`shadow` — the workflow result is compared + logged but not returned). Excludes the request from the savings headline unless `detour` mode produces a cheaper answer than the direct call would have."
+        }
+      },
+      "type": "object"
+    },
+    "RouteConditions": {
+      "additionalProperties": false,
+      "description": "Match conditions for a [`Route`]. Keep these fields in lockstep with [`RouteConditionField`] and the published route-preview coverage corpus.",
+      "properties": {
+        "content_type": {
+          "description": "Match only if the request's DOMINANT content kind (the classified kind of its largest text block — see [`tt_shared::capability_check::request_dominant_content_kind`]) equals this lowercase [`ContentKind`](tt_shared::content_kind::ContentKind) string (`\"json\"`, `\"csv\"`, `\"log\"`, `\"code\"`, `\"diff\"`, `\"prose\"`) — the content-aware compression routing signal (P1a). Lets a route target, e.g., `content_type=code` to opt code-dominant traffic into a compressor. `None` ignores. A request with no block large enough to classify never matches a `content_type` condition (an unclassifiable request is not \"of\" any kind).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimated_cost_gt": {
+          "description": "Match only if the request's estimated cost (USD) is greater than this. Unknown cost (caller passed `None`) never matches a cost condition.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "estimated_cost_lt": {
+          "description": "Match only if the request's estimated cost (USD) is less than this.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "has_audio": {
+          "description": "Match only if the request carries at least one audio input part (`ContentPart::InputAudio`). `Some(false)` requires no audio; `None` ignores.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "has_documents": {
+          "description": "Match only if the request carries at least one document input part (`ContentPart::Document`) — the Document Lane signal (D4a). `Some(false)` requires no document; `None` ignores. UNLIKE `has_images`/`has_audio`, this does NOT require a Vision-capable target: a document route targets a TEXT model (the pre-routing seam distills the document to text before dispatch), so it is deliberately absent from the `needs_vision` gate in `validate::validate_capability`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "has_images": {
+          "description": "Match only if the request carries at least one image input part (`ContentPart::ImageUrl`). `Some(false)` requires no image; `None` ignores.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "input_tokens_gt": {
+          "default": null,
+          "description": "Match only if estimated `input_tokens > this`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_tokens_lt": {
+          "default": null,
+          "description": "Match only if estimated `input_tokens < this`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model_in": {
+          "default": [],
+          "description": "Match only if `req.model` is in this list. Empty list matches any model.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "not_reasoning_class": {
+          "description": "Match only when the request is NOT classified as reasoning-is-the-work (Math/Code/Legal/Medical, via tt-core's reasoning_class). Used by the down-route catalog. The classification is computed in the gateway and supplied to the engine as the `is_reasoning_class` signal.",
+          "type": "boolean"
+        },
+        "prompt_contains_any_of": {
+          "description": "Match if the request's user+system text contains ANY of these keywords (case-insensitive substring). Empty = ignore.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tag_equals": {
+          "default": null,
+          "description": "Match only if `ctx.tag == Some(this)`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "upstream_latency_ms_p95_gt": {
+          "description": "Match only when the *live, gateway-observed* p95 upstream latency (in milliseconds) for the originally-requested `(provider, model)` exceeds this threshold — letting a route shift traffic off a primary that is currently slow.\n\n# In-process-window + cold-start behavior (READ THIS)\n\nThe signal is the gateway's OWN bounded rolling latency window ([`crate::LatencyTracker`]), NOT any cloud/`request_logs` data — those are unavailable at decision time. The window is per-instance and reflects only recent upstream behavior this replica observed. Consequently:\n\n- The condition is TRUE only when there are **enough samples** (`>= LATENCY_MIN_SAMPLES`) AND the observed p95 strictly exceeds the threshold — i.e. a genuinely slow primary triggers the alternate route. - The condition is **FALSE on cold start / insufficient data**: with no tracker supplied, or fewer than the minimum samples for the key, an unknown primary does NOT match. This is deliberate — the feature must never gate on a fabricated signal. See `matches` / `LatencyTracker::p95`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RoutePanel": {
+      "additionalProperties": false,
+      "description": "Fusion panel config for a route-triggered panel (the same panel engine as the X-TokenTrimmer-Panel header). Self-contained (not a re-export of tt_shared PanelExtras) to keep the routing wire contract explicit and avoid a tt_shared coupling in this crate — mirrors the AgenticBudget pattern.",
+      "properties": {
+        "arbiter": {
+          "description": "Arbiter model id; None ⇒ env TT_PANEL_DEFAULT_ARBITER.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_cost_usd": {
+          "description": "Fusion pre-dispatch admission budget (USD) for the static fan-out and arbitration estimate. This is not a runtime spending or invoice cap.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "members": {
+          "description": "Panel member model ids; empty ⇒ gateway env TT_PANEL_DEFAULT_MEMBERS.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "quorum": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "strategy": {
+          "description": "\"synthesize\" | \"best-of-n\" (or \"best_of_n\") | \"majority\". Validated at route creation against PANEL_STRATEGY_VALUES; parsed authoritatively at request time by tt_core's ArbiterStrategyKind::parse.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "strategy"
+      ],
+      "type": "object"
+    },
+    "RouteWorkflow": {
+      "additionalProperties": false,
+      "description": "Workflow-route config (CO-1) — an exact structural clone of the `RoutePanel` seam: a self-contained config that detours dispatch. No competitor gateway has \"routing rules that detour into governed, receipted multi-step workflows.\"",
+      "properties": {
+        "environment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RouteWorkflowEnvironment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional release environment resolved when the matched request is accepted. The gateway executes that environment's exact current immutable workflow version and non-secret variable snapshot. `None` preserves the legacy latest-saved-definition behavior."
+        },
+        "max_cost_usd": {
+          "description": "Pre-dispatch workflow admission budget (USD). The workflow engine uses it to admit a bounded static plan before dispatch; it is not a runtime spending reservation, settlement, or invoice ceiling. `None` falls back to the workflow definition's own budget.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "`\"detour\"` (default) = the workflow result REPLACES the upstream call. `\"shadow\"` = the workflow runs alongside; its result is compared + logged but the direct upstream call's answer is returned. Shadow mode is the safe rollout path: verify the workflow produces equivalent answers before flipping to detour.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_id": {
+          "description": "The workflow definition id to trigger (a UUID string in the workflow definitions table). Validated at route creation for existence + org scope.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id"
+      ],
+      "type": "object"
+    },
+    "RouteWorkflowEnvironment": {
+      "description": "Closed release selector for a route-triggered workflow invocation.",
+      "enum": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "urn:tokentrimmer:route:write-schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Version-aware gateway API envelope. `schema_version` is optional only for v1 backward compatibility; absent is interpreted as v1. A writer that sends any other explicit version receives a field-addressed validation error.",
+  "properties": {
+    "enabled": {
+      "default": true,
+      "type": "boolean"
+    },
+    "name": {
+      "type": "string"
+    },
+    "priority": {
+      "default": 100,
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "schema_version": {
+      "default": null,
+      "enum": [
+        1,
+        null
+      ],
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "then": {
+      "$ref": "#/$defs/RouteAction"
+    },
+    "when": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RouteConditions"
+        }
+      ],
+      "default": {
+        "input_tokens_gt": null,
+        "input_tokens_lt": null,
+        "model_in": [],
+        "tag_equals": null
+      }
+    }
+  },
+  "required": [
+    "name",
+    "then"
+  ],
+  "title": "TokenTrimmer route write contract",
+  "type": "object"
+}

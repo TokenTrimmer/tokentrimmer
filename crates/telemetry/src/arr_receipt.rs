@@ -1,0 +1,495 @@
+//! The agent-run (ARR) receipt — a signed, offline-verifiable proof of a
+//! top-level agent run's catalog-priced cost + savings estimate.
+//!
+//! The sign side lives in the cloud mint endpoint
+//! (`POST /v1/admin/agent-runs/{run_id}/receipt/sign`). This module is the
+//! public **verify** home shared by `tt verify-receipt` and other offline
+//! consumers. It mirrors `wfr_receipt.rs`: a canonical ASCII string with a
+//! disjoint domain-separation prefix (`arr:v1|` / `arr:v2|`), signed directly,
+//! with the signature and verifying key embedded in the share response.
+//!
+//! An agent run is top-level, not a workflow child. Its canonical payload has
+//! no `workflow_id`; that distinction is part of both the wire contract and
+//! the signed bytes.
+//!
+//! # Canonical payload
+//!
+//! `arr:v1|<org_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>`.
+//! v2 signs the strict request-delta formula, complete coverage, and signed
+//! result. Incomplete coverage is not mintable.
+//!
+//! Money values are already integer micro-USD (`i64`), so verification never
+//! round-trips convenience floats.
+//!
+//! # Domain separation
+//!
+//! `arr:v1|` is disjoint from `vcr:v1|` (compressions), `l2:v1|`
+//! (semantic-cache hits), `wfr:vN|` (workflow runs), `att:`
+//! (attestations), `pdf:v1|` (PDF reports), and the bare-32B audit hash. A
+//! signature from one family can never validate as another.
+
+use uuid::Uuid;
+
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use tt_shared::{RequestDeltaReceiptError, RequestDeltaReceiptFields};
+
+/// The domain-separation prefix for agent-run receipts.
+pub const ARR_PREFIX: &str = "arr:";
+
+/// Published agent-run canonical payload versions.
+pub const CANONICAL_VERSION_V1: &str = "v1";
+pub const CANONICAL_VERSION_V2: &str = "v2";
+
+/// A signed top-level agent-run receipt as deserialized from the cloud
+/// `VerifyReceiptResponse` JSON shape. The raw micro-USD fields are the
+/// canonical payload inputs; convenience `*_usd` values and `signed_at` are
+/// intentionally not signed.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct AgentRunReceipt {
+    /// Agent run UUID (also the receipt primary key).
+    pub run_id: Uuid,
+    /// Organization UUID — canonical payload field 2.
+    pub org_id: Uuid,
+    /// Terminal agent-run status — canonical payload field 7.
+    pub status: String,
+    /// Recorded run cost in integer micro-USD — canonical payload field 4.
+    pub cost_micros: i64,
+    /// Catalog-priced baseline estimate in integer micro-USD — field 5.
+    pub baseline_micros: i64,
+    /// Positive-only request delta. For v2 it must equal
+    /// `max(signed_request_delta_micros, 0)`.
+    pub saved_micros: i64,
+    /// Signed v2 request delta; regressions remain negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_request_delta_micros: Option<i64>,
+    /// Exact v2 request formula identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_delta_formula_version: Option<String>,
+    /// Non-truncated requests in the v2 run cohort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_delta_eligible_requests: Option<i64>,
+    /// Strictly measured requests in the v2 run cohort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_delta_measured_requests: Option<i64>,
+    /// Convenience display value only; not part of the signature.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    /// Convenience display value only; not part of the signature.
+    #[serde(default)]
+    pub baseline_usd: Option<f64>,
+    /// Convenience display value only; not part of the signature.
+    #[serde(default)]
+    pub saved_usd: Option<f64>,
+    /// Convenience signed request delta in USD; not part of the signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_request_delta_usd: Option<f64>,
+    /// Hex-encoded 64-byte Ed25519 signature over [`canonical_payload`].
+    pub signature_hex: String,
+    /// Hex-encoded 32-byte Ed25519 public key. Trust this key out of band.
+    pub verifying_key_hex: String,
+    /// Canonical schema version (`"v1"` legacy or `"v2"` request-delta).
+    pub canonical_version: String,
+    /// RFC3339 timestamp when the receipt was first minted; not signed.
+    #[serde(default)]
+    pub signed_at: Option<String>,
+}
+
+/// Build the canonical signed payload for an agent-run receipt.
+///
+/// Uses the same field order and bytes as the cloud run-receipt canonicalizer
+/// for every structurally valid cloud-minted receipt:
+/// `arr:v1|<org_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>`.
+///
+/// A pipe in a string field would alter the unambiguous field boundary and is
+/// rejected. Unknown versions are rejected rather than silently treated as v1.
+/// The public share response is minted only for a terminal run, so an empty
+/// status is structurally invalid here. The verifier deliberately does not
+/// hard-code today's terminal-status enum: any nonempty, separator-safe future
+/// status remains verifiable if that issuer-side allowlist evolves.
+pub fn canonical_payload(receipt: &AgentRunReceipt) -> Result<String, AgentRunReceiptError> {
+    if receipt.status.is_empty() {
+        return Err(AgentRunReceiptError::EmptyStatus);
+    }
+    if receipt.run_id.to_string().contains('|') || receipt.status.contains('|') {
+        return Err(AgentRunReceiptError::PipeInField);
+    }
+    match receipt.canonical_version.as_str() {
+        CANONICAL_VERSION_V1 => {
+            if receipt.signed_request_delta_micros.is_some()
+                || receipt.request_delta_formula_version.is_some()
+                || receipt.request_delta_eligible_requests.is_some()
+                || receipt.request_delta_measured_requests.is_some()
+                || receipt.signed_request_delta_usd.is_some()
+            {
+                return Err(AgentRunReceiptError::UnexpectedRequestDeltaEvidence);
+            }
+            Ok(format!(
+                "{ARR_PREFIX}v1|{}|{}|{}|{}|{}|{}",
+                receipt.org_id,
+                receipt.run_id,
+                receipt.cost_micros,
+                receipt.baseline_micros,
+                receipt.saved_micros,
+                receipt.status,
+            ))
+        }
+        CANONICAL_VERSION_V2 => {
+            let fields = RequestDeltaReceiptFields {
+                cost_micros: receipt.cost_micros,
+                baseline_micros: receipt.baseline_micros,
+                saved_micros: receipt.saved_micros,
+                signed_request_delta_micros: receipt
+                    .signed_request_delta_micros
+                    .ok_or(AgentRunReceiptError::MissingRequestDeltaEvidence)?,
+                formula_version: receipt
+                    .request_delta_formula_version
+                    .as_deref()
+                    .ok_or(AgentRunReceiptError::MissingRequestDeltaEvidence)?,
+                eligible_requests: receipt
+                    .request_delta_eligible_requests
+                    .ok_or(AgentRunReceiptError::MissingRequestDeltaEvidence)?,
+                measured_requests: receipt
+                    .request_delta_measured_requests
+                    .ok_or(AgentRunReceiptError::MissingRequestDeltaEvidence)?,
+            };
+            let fragment = fields
+                .canonical_fragment()
+                .map_err(AgentRunReceiptError::InvalidRequestDeltaEvidence)?;
+            Ok(format!(
+                "{ARR_PREFIX}v2|{}|{}|{fragment}|{}",
+                receipt.org_id, receipt.run_id, receipt.status,
+            ))
+        }
+        _ => Err(AgentRunReceiptError::UnknownVersion(
+            receipt.canonical_version.clone(),
+        )),
+    }
+}
+
+/// Errors building or verifying an agent-run receipt payload.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentRunReceiptError {
+    /// The terminal status was empty, outside the public receipt wire contract.
+    EmptyStatus,
+    /// A string field contained the `|` payload-field separator.
+    PipeInField,
+    /// A v1 receipt carried request-delta fields outside its signed bytes.
+    UnexpectedRequestDeltaEvidence,
+    /// A v2 receipt omitted its formula or coverage fields.
+    MissingRequestDeltaEvidence,
+    /// A v2 receipt's formula, coverage, or money state was inconsistent.
+    InvalidRequestDeltaEvidence(RequestDeltaReceiptError),
+    /// The payload version is not supported by this verifier.
+    UnknownVersion(String),
+}
+
+impl std::fmt::Display for AgentRunReceiptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyStatus => f.write_str("status must be nonempty"),
+            Self::PipeInField => f.write_str(
+                "field contained pipe character '|' which is the payload field separator",
+            ),
+            Self::UnexpectedRequestDeltaEvidence => {
+                f.write_str("v1 receipt carries request-delta evidence outside its signed payload")
+            }
+            Self::MissingRequestDeltaEvidence => {
+                f.write_str("v2 receipt is missing signed formula or coverage evidence")
+            }
+            Self::InvalidRequestDeltaEvidence(error) => {
+                write!(f, "invalid request-delta evidence: {error}")
+            }
+            Self::UnknownVersion(version) => write!(
+                f,
+                "unknown canonical_version \"{version}\" (expected v1 or v2)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AgentRunReceiptError {}
+
+/// Verify an agent-run receipt offline against an external, trusted
+/// verifying-key hex string. The embedded key is a convenience value; callers
+/// should supply a pinned or otherwise out-of-band trusted key when issuer
+/// identity matters.
+#[must_use]
+pub fn verify_with_key(verifying_key_hex_: &str, receipt: &AgentRunReceipt) -> bool {
+    let Ok(payload) = canonical_payload(receipt) else {
+        return false;
+    };
+    let Ok(vk_bytes) = hex::decode(verifying_key_hex_) else {
+        return false;
+    };
+    let Ok(vk_array): Result<[u8; 32], _> = vk_bytes.try_into() else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&vk_array) else {
+        return false;
+    };
+    let Ok(sig_bytes) = hex::decode(&receipt.signature_hex) else {
+        return false;
+    };
+    let Ok(sig_array): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        return false;
+    };
+    let signature = Signature::from_bytes(&sig_array);
+    verifying_key.verify(payload.as_bytes(), &signature).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Canonical-payload + verify drift gates for the ARR receipt family.
+    //!
+    //! The canonical string is mirrored by the cloud run-receipt canonicalizer.
+    //! If either side drifts, a cloud-minted receipt will stop verifying in
+    //! `tt verify-receipt`.
+
+    use std::collections::BTreeSet;
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::Value;
+
+    use super::*;
+
+    const ARR_STRUCTURAL_SCHEMA: &str =
+        include_str!("../../../docs/receipt-spec/arr-receipt.schema.json");
+    const ARR_V1_GOLDEN: &str = include_str!("../../../docs/receipt-spec/arr-v1.golden.json");
+    const ARR_V2_GOLDEN: &str = include_str!("../../../docs/receipt-spec/arr-v2.golden.json");
+    const ARR_V1_GOLDEN_PAYLOAD: &str =
+        "arr:v1|00000000-0000-0000-0000-00000000002a|00000000-0000-0000-0000-0000000000a1|70000|180000|110000|completed";
+    const ARR_V2_GOLDEN_PAYLOAD: &str =
+        "arr:v2|00000000-0000-0000-0000-00000000002a|00000000-0000-0000-0000-0000000000a1|200000|180000|0|-50000|tt.request-delta-estimate.v1|2|2|completed";
+
+    fn sample_v1() -> AgentRunReceipt {
+        AgentRunReceipt {
+            run_id: Uuid::parse_str("00000000-0000-0000-0000-0000000000a1").unwrap(),
+            org_id: Uuid::parse_str("00000000-0000-0000-0000-00000000002a").unwrap(),
+            status: "completed".to_string(),
+            cost_micros: 70_000,
+            baseline_micros: 180_000,
+            saved_micros: 110_000,
+            signed_request_delta_micros: None,
+            request_delta_formula_version: None,
+            request_delta_eligible_requests: None,
+            request_delta_measured_requests: None,
+            cost_usd: None,
+            baseline_usd: None,
+            saved_usd: None,
+            signed_request_delta_usd: None,
+            signature_hex: String::new(),
+            verifying_key_hex: String::new(),
+            canonical_version: CANONICAL_VERSION_V1.to_string(),
+            signed_at: None,
+        }
+    }
+
+    #[test]
+    fn structural_schema_covers_the_current_arr_wire_contract() {
+        let schema: Value =
+            serde_json::from_str(ARR_STRUCTURAL_SCHEMA).expect("ARR schema must be valid JSON");
+        assert_eq!(
+            schema["$id"],
+            "urn:tokentrimmer:receipt:arr:structural-schema:v1-v2"
+        );
+        assert_eq!(schema["additionalProperties"], Value::Bool(true));
+        assert_eq!(
+            schema["properties"]["canonical_version"]["enum"],
+            serde_json::json!([CANONICAL_VERSION_V1, CANONICAL_VERSION_V2])
+        );
+        assert_eq!(
+            schema["properties"]["status"]["minLength"],
+            serde_json::json!(1)
+        );
+
+        let required: BTreeSet<_> = schema["required"]
+            .as_array()
+            .expect("schema required must be an array")
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("schema required names must be strings")
+            })
+            .collect();
+        let expected_required: BTreeSet<_> = [
+            "run_id",
+            "org_id",
+            "status",
+            "cost_micros",
+            "baseline_micros",
+            "saved_micros",
+            "signature_hex",
+            "verifying_key_hex",
+            "canonical_version",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(required, expected_required);
+
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema properties must be an object");
+        let serialized = serde_json::to_value(sample_v1()).expect("ARR receipt must serialize");
+        let serialized_fields = serialized
+            .as_object()
+            .expect("serialized ARR receipt must be an object");
+        assert!(
+            !serialized_fields.contains_key("workflow_id"),
+            "ARR serialization must remain top-level rather than inherit WFR's workflow_id"
+        );
+        for field in serialized_fields.keys() {
+            assert!(
+                properties.contains_key(field),
+                "machine-readable schema is missing the serialized ARR field {field}"
+            );
+        }
+        assert!(
+            !properties.contains_key("workflow_id"),
+            "ARR must remain top-level rather than inherit WFR's workflow_id"
+        );
+        assert_eq!(
+            schema["allOf"][1]["then"]["properties"]["request_delta_formula_version"]["const"],
+            tt_shared::REQUEST_DELTA_ESTIMATE_V1
+        );
+    }
+
+    #[test]
+    fn checked_in_golden_vectors_verify_and_pin_canonical_payloads() {
+        for (raw, expected) in [
+            (ARR_V1_GOLDEN, ARR_V1_GOLDEN_PAYLOAD),
+            (ARR_V2_GOLDEN, ARR_V2_GOLDEN_PAYLOAD),
+        ] {
+            let receipt: AgentRunReceipt =
+                serde_json::from_str(raw).expect("golden ARR receipt must deserialize");
+            assert_eq!(
+                canonical_payload(&receipt).expect("golden receipt must build canonical payload"),
+                expected
+            );
+            assert!(
+                verify_with_key(&receipt.verifying_key_hex, &receipt),
+                "golden receipt must verify with its documented test key"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_payload_matches_cloud_builder() {
+        assert_eq!(
+            canonical_payload(&sample_v1()).unwrap(),
+            ARR_V1_GOLDEN_PAYLOAD
+        );
+    }
+
+    #[test]
+    fn canonical_v2_preserves_a_signed_regression_and_complete_coverage() {
+        let receipt: AgentRunReceipt = serde_json::from_str(ARR_V2_GOLDEN).unwrap();
+        assert_eq!(canonical_payload(&receipt).unwrap(), ARR_V2_GOLDEN_PAYLOAD);
+        assert_eq!(receipt.saved_micros, 0);
+        assert_eq!(receipt.signed_request_delta_micros, Some(-50_000));
+    }
+
+    #[test]
+    fn v1_rejects_unsigned_request_delta_fields() {
+        let mut receipt = sample_v1();
+        receipt.signed_request_delta_micros = Some(110_000);
+        receipt.request_delta_formula_version =
+            Some(tt_shared::REQUEST_DELTA_ESTIMATE_V1.to_string());
+        receipt.request_delta_eligible_requests = Some(1);
+        receipt.request_delta_measured_requests = Some(1);
+        receipt.signed_request_delta_usd = Some(0.11);
+        assert_eq!(
+            canonical_payload(&receipt),
+            Err(AgentRunReceiptError::UnexpectedRequestDeltaEvidence)
+        );
+    }
+
+    #[test]
+    fn v2_rejects_incomplete_or_inconsistent_evidence() {
+        let mut receipt: AgentRunReceipt = serde_json::from_str(ARR_V2_GOLDEN).unwrap();
+        receipt.request_delta_measured_requests = Some(1);
+        assert!(matches!(
+            canonical_payload(&receipt),
+            Err(AgentRunReceiptError::InvalidRequestDeltaEvidence(
+                RequestDeltaReceiptError::IncompleteCoverage
+            ))
+        ));
+
+        let mut receipt: AgentRunReceipt = serde_json::from_str(ARR_V2_GOLDEN).unwrap();
+        receipt.saved_micros = 1;
+        assert!(matches!(
+            canonical_payload(&receipt),
+            Err(AgentRunReceiptError::InvalidRequestDeltaEvidence(
+                RequestDeltaReceiptError::InvalidPositiveProjection
+            ))
+        ));
+    }
+
+    #[test]
+    fn unknown_version_is_rejected() {
+        let mut receipt = sample_v1();
+        receipt.canonical_version = "v9".to_string();
+        assert!(matches!(
+            canonical_payload(&receipt),
+            Err(AgentRunReceiptError::UnknownVersion(_))
+        ));
+    }
+
+    #[test]
+    fn pipe_in_status_is_rejected() {
+        let mut receipt = sample_v1();
+        receipt.status = "completed|forged".to_string();
+        assert_eq!(
+            canonical_payload(&receipt),
+            Err(AgentRunReceiptError::PipeInField)
+        );
+    }
+
+    #[test]
+    fn empty_status_is_rejected_by_the_public_wire_contract() {
+        let mut receipt = sample_v1();
+        receipt.status.clear();
+        assert_eq!(
+            canonical_payload(&receipt),
+            Err(AgentRunReceiptError::EmptyStatus)
+        );
+    }
+
+    #[test]
+    fn verifier_is_format_compatible_with_a_future_nonempty_separator_safe_status() {
+        // Current cloud mint eligibility is an issuer-side terminal-status
+        // allowlist. The canonical builder deliberately does not encode that
+        // exact enum, so a future nonempty terminal status signed by the cloud
+        // remains independently verifiable rather than being treated as
+        // malformed.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut receipt = sample_v1();
+        receipt.status = "cancelled".to_string();
+        let signature = key.sign(canonical_payload(&receipt).unwrap().as_bytes());
+        receipt.signature_hex = hex::encode(signature.to_bytes());
+        let key_hex = hex::encode(key.verifying_key().to_bytes());
+        assert!(verify_with_key(&key_hex, &receipt));
+    }
+
+    #[test]
+    fn verify_with_key_round_trips() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut receipt = sample_v1();
+        let signature = key.sign(canonical_payload(&receipt).unwrap().as_bytes());
+        receipt.signature_hex = hex::encode(signature.to_bytes());
+        receipt.verifying_key_hex = hex::encode(key.verifying_key().to_bytes());
+        assert!(verify_with_key(&receipt.verifying_key_hex, &receipt));
+    }
+
+    #[test]
+    fn verify_with_key_fails_when_saved_micros_is_tampered() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut receipt = sample_v1();
+        let signature = key.sign(canonical_payload(&receipt).unwrap().as_bytes());
+        receipt.signature_hex = hex::encode(signature.to_bytes());
+        receipt.saved_micros = 999_999;
+        let key_hex = hex::encode(key.verifying_key().to_bytes());
+        assert!(!verify_with_key(&key_hex, &receipt));
+    }
+}

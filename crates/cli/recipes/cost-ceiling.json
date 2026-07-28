@@ -1,9 +1,9 @@
 {
   "slug": "cost-ceiling",
-  "name": "Cost ceiling",
-  "optimizes": "Expensive single calls are downshifted, and a hard per-request cost cap blocks runaway spend.",
+  "name": "Cost admission limit",
+  "optimizes": "Expensive single calls are downshifted, and a pre-dispatch estimated-cost admission limit blocks work whose static plan is too expensive.",
   "savings_lane": "cap",
-  "description": "When a request's estimated cost crosses a threshold, reroute it to a cheaper model and enforce a hard per-request ceiling. If even the cheaper model would exceed the ceiling, the gateway rejects the request (402) instead of silently spending. Tune estimated_cost_gt and max_cost_usd to your budget.",
+  "description": "When a request's estimated cost crosses a threshold, reroute it to a cheaper model and apply a pre-dispatch estimated-cost admission limit. If the cheaper model's static estimate still exceeds that limit, the gateway rejects the request (402) before dispatch. It does not reserve or settle provider usage, so it is not a runtime or invoice ceiling. Tune estimated_cost_gt and max_cost_usd to your budget.",
   "routes": [
     {
       "name": "recipe:cost-ceiling",

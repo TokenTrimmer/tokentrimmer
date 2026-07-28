@@ -10,6 +10,7 @@
 //! - [`audit::verify_chain`] — standalone chain verifier.
 //! - [`audit::AuditEntry`] / [`audit::Actor`] — wire types.
 
+pub mod arr_receipt;
 pub mod audit;
 pub mod body_capture;
 pub mod gen_ai;

@@ -86,17 +86,110 @@ pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) 
     }
 }
 
+/// A complete, request-level estimate of the signed delta
+/// `baseline - cost - provider-cache - cache-bust - summarizer-tax`.
+///
+/// This is deliberately all-or-nothing. A missing, non-finite, or negative
+/// component is [`Unmeasured`](Self::Unmeasured), never a zero-filled value.
+/// It excludes judge/shadow measurement taxes and provider-invoice
+/// reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RequestDeltaEstimate {
+    Measured {
+        baseline_cost_usd: f64,
+        cost_usd: f64,
+        provider_cache_saved_usd: f64,
+        cache_bust_usd: f64,
+        summarizer_tax_usd: f64,
+        signed_usd: f64,
+        positive_usd: f64,
+        regression_usd: f64,
+    },
+    Unmeasured,
+}
+
+impl RequestDeltaEstimate {
+    /// Build an estimate only when every raw component is finite and
+    /// non-negative. This accepts raw transport fields rather than deriving a
+    /// baseline from legacy `saved_usd` compatibility data.
+    #[must_use]
+    pub fn from_components(
+        baseline_cost_usd: Option<f64>,
+        cost_usd: Option<f64>,
+        provider_cache_saved_usd: Option<f64>,
+        cache_bust_usd: Option<f64>,
+        summarizer_tax_usd: Option<f64>,
+    ) -> Self {
+        let (
+            Some(baseline_cost_usd),
+            Some(cost_usd),
+            Some(provider_cache_saved_usd),
+            Some(cache_bust_usd),
+            Some(summarizer_tax_usd),
+        ) = (
+            baseline_cost_usd,
+            cost_usd,
+            provider_cache_saved_usd,
+            cache_bust_usd,
+            summarizer_tax_usd,
+        )
+        else {
+            return Self::Unmeasured;
+        };
+        let Some(estimate) = tt_shared::estimate_request_delta_v1(tt_shared::RequestDeltaInput {
+            baseline_cost_usd: Some(baseline_cost_usd),
+            cost_usd: Some(cost_usd),
+            provider_cache_saved_usd: Some(provider_cache_saved_usd),
+            cache_bust_penalty_usd: Some(cache_bust_usd),
+            summarizer_tax_usd: Some(summarizer_tax_usd),
+        }) else {
+            return Self::Unmeasured;
+        };
+
+        Self::Measured {
+            baseline_cost_usd,
+            cost_usd,
+            provider_cache_saved_usd,
+            cache_bust_usd,
+            summarizer_tax_usd,
+            signed_usd: estimate.signed_request_delta_usd,
+            positive_usd: estimate.positive_request_delta_usd,
+            regression_usd: estimate.regression_request_delta_usd,
+        }
+    }
+}
+
 /// Cost/savings + routing metadata parsed from the gateway's `x-tokentrimmer-*`
 /// response headers. Each field is `None` when its header is absent/unparseable.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CostInfo {
     pub cost_usd: Option<f64>,
+    /// Legacy positive-only header retained for compatibility. It is not a
+    /// signed request-delta estimate.
     pub saved_usd: Option<f64>,
     pub baseline_cost_usd: Option<f64>,
+    pub provider_cache_saved_usd: Option<f64>,
+    pub cache_bust_usd: Option<f64>,
+    pub summarizer_tax_usd: Option<f64>,
     pub model_used: Option<String>,
     pub provider: Option<String>,
     pub trace_id: Option<String>,
     pub cache: Option<String>,
+}
+
+impl CostInfo {
+    /// The complete signed request delta from the raw response headers, or an
+    /// explicit unmeasured state when any component is absent or invalid.
+    #[must_use]
+    pub fn request_delta_estimate(&self) -> RequestDeltaEstimate {
+        RequestDeltaEstimate::from_components(
+            self.baseline_cost_usd,
+            self.cost_usd,
+            self.provider_cache_saved_usd,
+            self.cache_bust_usd,
+            self.summarizer_tax_usd,
+        )
+    }
 }
 
 fn header_str(h: &HeaderMap, name: &str) -> Option<String> {
@@ -116,6 +209,9 @@ pub fn parse_cost(headers: &HeaderMap) -> CostInfo {
         cost_usd: header_f64(headers, "x-tokentrimmer-cost-usd"),
         saved_usd: header_f64(headers, "x-tokentrimmer-saved-usd"),
         baseline_cost_usd: header_f64(headers, "x-tokentrimmer-baseline-cost-usd"),
+        provider_cache_saved_usd: header_f64(headers, "x-tokentrimmer-provider-cache-saved-usd"),
+        cache_bust_usd: header_f64(headers, "x-tokentrimmer-cache-bust-usd"),
+        summarizer_tax_usd: header_f64(headers, "x-tokentrimmer-summarizer-tax-usd"),
         model_used: header_str(headers, "x-tokentrimmer-model-used"),
         provider: header_str(headers, "x-tokentrimmer-provider"),
         trace_id: header_str(headers, "x-tokentrimmer-trace-id"),
@@ -160,11 +256,39 @@ fn inject_tools(body: &mut Value, tools: &[Tool], tool_choice: Option<&ToolChoic
 pub struct StreamUsage {
     pub cost_usd: f64,
     pub baseline_cost_usd: f64,
+    /// Legacy positive-only field retained for wire compatibility. Use
+    /// [`request_delta_estimate`](Self::request_delta_estimate) for signed
+    /// request accounting.
     pub saved_usd: f64,
+    /// All three raw components must be present together to produce a signed
+    /// request delta. `None` retains an explicit unmeasured state for old or
+    /// partial terminal events.
+    #[serde(default)]
+    pub provider_cache_saved_usd: Option<f64>,
+    #[serde(default)]
+    pub cache_bust_usd: Option<f64>,
+    #[serde(default)]
+    pub summarizer_tax_usd: Option<f64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+}
+
+impl StreamUsage {
+    /// The complete signed request delta from this terminal SSE event, or an
+    /// explicit unmeasured state. It never synthesizes a baseline from
+    /// `saved_usd` or mixes missing components with header values.
+    #[must_use]
+    pub fn request_delta_estimate(&self) -> RequestDeltaEstimate {
+        RequestDeltaEstimate::from_components(
+            Some(self.baseline_cost_usd),
+            Some(self.cost_usd),
+            self.provider_cache_saved_usd,
+            self.cache_bust_usd,
+            self.summarizer_tax_usd,
+        )
+    }
 }
 
 /// An event yielded by [`ChatStream::next`].
@@ -818,6 +942,19 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-tokentrimmer-cost-usd", "0.0001".parse().unwrap());
         h.insert("x-tokentrimmer-saved-usd", "0.0003".parse().unwrap());
+        h.insert(
+            "x-tokentrimmer-baseline-cost-usd",
+            "0.0005".parse().unwrap(),
+        );
+        h.insert(
+            "x-tokentrimmer-provider-cache-saved-usd",
+            "0.0001".parse().unwrap(),
+        );
+        h.insert("x-tokentrimmer-cache-bust-usd", "0.0001".parse().unwrap());
+        h.insert(
+            "x-tokentrimmer-summarizer-tax-usd",
+            "0.0001".parse().unwrap(),
+        );
         h.insert("x-tokentrimmer-model-used", "gpt-4o-mini".parse().unwrap());
         h.insert("x-tokentrimmer-cache", "miss".parse().unwrap());
         let c = parse_cost(&h);
@@ -826,6 +963,13 @@ mod tests {
         assert_eq!(c.model_used.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(c.cache.as_deref(), Some("miss"));
         assert_eq!(c.provider, None); // absent
+        assert!(matches!(
+            c.request_delta_estimate(),
+            RequestDeltaEstimate::Measured { signed_usd, positive_usd, regression_usd, .. }
+                if (signed_usd - 0.0001).abs() < 1e-12
+                    && (positive_usd - 0.0001).abs() < 1e-12
+                    && regression_usd == 0.0
+        ));
         assert_eq!(parse_cost(&HeaderMap::new()), CostInfo::default());
     }
 
@@ -834,6 +978,50 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-tokentrimmer-cost-usd", "n/a".parse().unwrap());
         assert_eq!(parse_cost(&h).cost_usd, None);
+    }
+
+    #[test]
+    fn request_delta_requires_every_raw_component_without_legacy_fallback() {
+        let measured = RequestDeltaEstimate::from_components(
+            Some(0.0010),
+            Some(0.0008),
+            Some(0.0001),
+            Some(0.0001),
+            Some(0.0002),
+        );
+        assert!(matches!(
+            measured,
+            RequestDeltaEstimate::Measured { signed_usd, positive_usd, regression_usd, .. }
+                if (signed_usd + 0.0002).abs() < 1e-12
+                    && positive_usd == 0.0
+                    && (regression_usd - 0.0002).abs() < 1e-12
+        ));
+
+        // A legacy positive saved header is not a substitute for the raw
+        // baseline/component tuple.
+        let legacy_only = CostInfo {
+            cost_usd: Some(0.0001),
+            saved_usd: Some(0.0003),
+            provider_cache_saved_usd: Some(0.0),
+            cache_bust_usd: Some(0.0),
+            summarizer_tax_usd: Some(0.0),
+            ..CostInfo::default()
+        };
+        assert_eq!(
+            legacy_only.request_delta_estimate(),
+            RequestDeltaEstimate::Unmeasured
+        );
+
+        assert_eq!(
+            RequestDeltaEstimate::from_components(
+                Some(0.001),
+                Some(0.0005),
+                Some(f64::NAN),
+                Some(0.0),
+                Some(0.0),
+            ),
+            RequestDeltaEstimate::Unmeasured
+        );
     }
 
     use httpmock::prelude::*;

@@ -1,0 +1,221 @@
+{
+  "$comment": "Structural ARR v1-v2 contract generated from tt_telemetry::arr_receipt::AgentRunReceipt. Structure alone does not prove signature integrity, issuer identity, math replay, provider usage, or invoice reconciliation.",
+  "$id": "urn:tokentrimmer:receipt:arr:structural-schema:v1-v2",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "canonical_version": {
+            "enum": [
+              "v1"
+            ]
+          }
+        },
+        "required": [
+          "canonical_version"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request_delta_eligible_requests": {
+            "type": "null"
+          },
+          "request_delta_formula_version": {
+            "type": "null"
+          },
+          "request_delta_measured_requests": {
+            "type": "null"
+          },
+          "signed_request_delta_micros": {
+            "type": "null"
+          },
+          "signed_request_delta_usd": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "canonical_version": {
+            "enum": [
+              "v2"
+            ]
+          }
+        },
+        "required": [
+          "canonical_version"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request_delta_eligible_requests": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "request_delta_formula_version": {
+            "const": "tt.request-delta-estimate.v1"
+          },
+          "request_delta_measured_requests": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "signed_request_delta_micros": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "signed_request_delta_micros",
+          "request_delta_formula_version",
+          "request_delta_eligible_requests",
+          "request_delta_measured_requests"
+        ]
+      }
+    }
+  ],
+  "description": "A signed top-level agent-run receipt as deserialized from the cloud `VerifyReceiptResponse` JSON shape. The raw micro-USD fields are the canonical payload inputs; convenience `*_usd` values and `signed_at` are intentionally not signed.",
+  "properties": {
+    "baseline_micros": {
+      "description": "Catalog-priced baseline estimate in integer micro-USD — field 5.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "baseline_usd": {
+      "default": null,
+      "description": "Convenience display value only; not part of the signature.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "canonical_version": {
+      "description": "Canonical schema version (`\"v1\"` legacy or `\"v2\"` request-delta).",
+      "enum": [
+        "v1",
+        "v2"
+      ],
+      "type": "string"
+    },
+    "cost_micros": {
+      "description": "Recorded run cost in integer micro-USD — canonical payload field 4.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "cost_usd": {
+      "default": null,
+      "description": "Convenience display value only; not part of the signature.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "org_id": {
+      "description": "Organization UUID — canonical payload field 2.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "request_delta_eligible_requests": {
+      "description": "Non-truncated requests in the v2 run cohort.",
+      "format": "int64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "request_delta_formula_version": {
+      "description": "Exact v2 request formula identifier.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request_delta_measured_requests": {
+      "description": "Strictly measured requests in the v2 run cohort.",
+      "format": "int64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "run_id": {
+      "description": "Agent run UUID (also the receipt primary key).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "saved_micros": {
+      "description": "Positive-only request delta. For v2 it must equal `max(signed_request_delta_micros, 0)`.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "saved_usd": {
+      "default": null,
+      "description": "Convenience display value only; not part of the signature.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "signature_hex": {
+      "description": "Hex-encoded 64-byte Ed25519 signature over [`canonical_payload`].",
+      "pattern": "^[0-9A-Fa-f]{128}$",
+      "type": "string"
+    },
+    "signed_at": {
+      "default": null,
+      "description": "RFC3339 timestamp when the receipt was first minted; not signed.",
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "signed_request_delta_micros": {
+      "description": "Signed v2 request delta; regressions remain negative.",
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "signed_request_delta_usd": {
+      "description": "Convenience signed request delta in USD; not part of the signature.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "status": {
+      "description": "Terminal agent-run status — canonical payload field 7.",
+      "minLength": 1,
+      "pattern": "^[^|]+$",
+      "type": "string"
+    },
+    "verifying_key_hex": {
+      "description": "Hex-encoded 32-byte Ed25519 public key. Trust this key out of band.",
+      "pattern": "^[0-9A-Fa-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "baseline_micros",
+    "canonical_version",
+    "cost_micros",
+    "org_id",
+    "run_id",
+    "saved_micros",
+    "signature_hex",
+    "status",
+    "verifying_key_hex"
+  ],
+  "title": "TokenTrimmer agent-run receipt",
+  "type": "object"
+}

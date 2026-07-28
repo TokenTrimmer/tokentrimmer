@@ -1,13 +1,14 @@
 # Workflow template pack
 
-Five first-party TokenTrimmer workflow templates — cost-controlled, signable
-graphs that run in the in-gateway workflow engine. Each is a `POST /v1/workflows`-
+Five first-party TokenTrimmer workflow templates — cost-controlled graphs that
+run in the in-gateway workflow engine. Each is a `POST /v1/workflows`-
 loadable JSON definition (see `docs/05-workflow-dsl-reference.md` for the DSL).
 
-Every template's run is signable as a receipt:
+An eligible retained terminal run from a template can be minted on demand as a
+signed estimate:
 
 ```bash
-# After a run completes:
+# After an eligible terminal run completes:
 curl -X POST https://api.tokentrimmer.com/v1/admin/workflow-runs/<run_id>/receipt/sign \
   -H "Authorization: Bearer $TT_ADMIN_KEY" -d '{"org_id":"<your-org>"}' > receipt.json
 
@@ -15,8 +16,10 @@ curl -X POST https://api.tokentrimmer.com/v1/admin/workflow-runs/<run_id>/receip
 tt verify-receipt --receipt receipt.json --key-hex <the-key-you-trust>
 ```
 
-The receipts are the differentiator: competitors can reproduce the savings
-number, they can't sign it.
+The receipt preserves a signed estimate for offline inspection. A valid
+signature only shows that the supplied, independently trusted key signed an
+unchanged payload; it is not provider-invoice reconciliation or an economic
+guarantee.
 
 ## Templates
 
@@ -26,11 +29,16 @@ number, they can't sign it.
 | 02 | `doc-summarize-with-fetch` | Http node (allowlisted host) → summarize. The `allowed_hosts` + the `max_response_bytes` size cap. |
 | 03 | `agent-with-tool-budget` | An agentic loop with `max_turns` + `max_cost_usd` + the runaway-repeat detector. The cost-controlled agent base. |
 | 04 | `cost-capped-translation` | Detect language → branch → translate (or transform-passthrough). The Transform node + per-node `max_cost_usd`. |
-| 05 | `retry-with-fallback` | Primary call → branch on empty/errored → fallback. Cost-aware error handling (the retry overhead is visible per the receipt, not hidden). |
+| 05 | `retry-with-fallback` | Primary call → branch on empty/errored → fallback. Cost-aware error handling (retry overhead is visible in run detail; an eligible terminal receipt is a signed aggregate estimate minted on demand). |
 
 ## The cost-control levers in every template
 
-- **`max_cost_usd` per Model/Agent node** — a hard ceiling; the loop terminates as `Incomplete` with `stop_reason = budget_exhausted` BEFORE a turn that would breach it.
+- **`max_cost_usd` per Model/Agent node** — an admission estimate used to avoid
+  starting a turn predicted to breach that node's cap. A capped workflow turn
+  is re-priced after route/shaping and uses one provider attempt without
+  fallback or auxiliary fan-out. It is not a settled provider-invoice figure or
+  a whole-workflow hard-spend guarantee; provider-hard settlement remains
+  separate.
 - **`selection: { type: "route", route_ref: "<route>" }`** — down-routes the call to a cheaper same-family model (the catalog's flagship→mini mappings). Auto-pauses on recall-drop below 0.90.
 - **`max_turns` (Agent)** — clamped to `[1, 32]`, default 8.
 - **`max_response_bytes` (Http)** — bounds the fetched payload.

@@ -1,0 +1,69 @@
+{
+  "id": "00000000-0000-0000-0000-0000000000c1",
+  "version": 1,
+  "name": "generated-contract-smoke",
+  "nodes": [
+    {
+      "id": "input",
+      "type": "trigger"
+    },
+    {
+      "id": "answer",
+      "type": "model",
+      "selection": {
+        "type": "model",
+        "model": "gpt-4o-mini"
+      },
+      "prompt": "Answer {{input}}",
+      "max_output_tokens": 256,
+      "max_cost_usd": 0.02
+    },
+    {
+      "id": "output",
+      "type": "output"
+    }
+  ],
+  "edges": [
+    {
+      "from": "input",
+      "to": "answer",
+      "map": null
+    },
+    {
+      "from": "answer",
+      "to": "output",
+      "map": null
+    }
+  ],
+  "inputs": {
+    "question": "Why is exact wire generation useful?"
+  },
+  "budget": {
+    "max_cost_usd": 0.05,
+    "on_exceed": "Stop"
+  },
+  "allowed_hosts": [],
+  "metadata": {
+    "canvas_positions": {
+      "answer": {
+        "x": 240,
+        "y": 0
+      },
+      "input": {
+        "x": 0,
+        "y": 0
+      },
+      "output": {
+        "x": 480,
+        "y": 0
+      }
+    }
+  },
+  "triggers": [
+    {
+      "type": "schedule",
+      "interval": "1d",
+      "environment": "production"
+    }
+  ]
+}

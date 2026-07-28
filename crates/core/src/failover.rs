@@ -118,6 +118,156 @@ pub struct CapCheck<'a> {
     pub estimated_tokens: u64,
 }
 
+/// A route-derived cost ceiling to apply to every resolved failover candidate.
+///
+/// Route conditions historically use the fixed input estimate captured while
+/// matching the route. Keep that estimate intact across the fallback chain.
+#[derive(Clone, Copy, Debug)]
+pub struct RouteCostConstraint {
+    pub ceiling_usd: f64,
+    pub input_tokens: u32,
+    pub max_tokens: Option<u32>,
+}
+
+/// A request-header cost ceiling to apply to every resolved failover candidate.
+///
+/// Unlike a route condition, the header covers the final whole prompt. Its
+/// token count is deliberately derived only after each candidate's provider is
+/// resolved: provider tokenizers differ, so carrying the primary's estimate
+/// into a cross-provider fallback can under- or over-admit it.
+#[derive(Clone, Copy, Debug)]
+pub struct HeaderCostConstraint {
+    pub ceiling_usd: f64,
+    pub max_tokens: Option<u32>,
+}
+
+/// Optional route and request-header cost ceilings for failover candidates.
+///
+/// Both constraints are evaluated when present, in route-then-header order.
+/// Candidates with unknown pricing remain permissive, matching the existing
+/// direct admission policy.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CandidateCostCheck {
+    pub route: Option<RouteCostConstraint>,
+    pub header: Option<HeaderCostConstraint>,
+}
+
+/// A known-priced candidate's first violated request cost ceiling.
+///
+/// This remains crate-visible so `chat` can reject an explicitly pinned
+/// provider before it resolves that provider's credentials. The value carries
+/// no request content or tokenized prompt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CostLimitViolation {
+    pub(crate) limit_kind: &'static str,
+    pub(crate) estimated_usd: f64,
+    pub(crate) ceiling_usd: f64,
+}
+
+impl CandidateCostCheck {
+    /// Return the first applicable ceiling the resolved candidate exceeds.
+    ///
+    /// Route checks retain their historical route-match token estimate. Header
+    /// checks rebuild the final text-only prompt for the candidate provider so
+    /// cross-provider fallback is admitted against that provider's tokenizer.
+    /// Unknown pricing is intentionally permissive, matching direct admission.
+    pub(crate) fn violation_for(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        req: &ChatCompletionRequest,
+    ) -> Option<CostLimitViolation> {
+        let pricing = provider.pricing(model)?;
+
+        if let Some(route) = self.route {
+            let estimated_usd = crate::routes::chat::estimate_cost_usd(
+                &pricing,
+                route.input_tokens,
+                route.max_tokens,
+            );
+            if estimated_usd > route.ceiling_usd {
+                return Some(CostLimitViolation {
+                    limit_kind: "route",
+                    estimated_usd,
+                    ceiling_usd: route.ceiling_usd,
+                });
+            }
+        }
+
+        let header = self.header?;
+        let prompt = tt_shared::message_text_for_estimation(req);
+        let input_tokens = tt_tokenize::estimate_tokens(provider.id(), &prompt);
+        let estimated_usd =
+            crate::routes::chat::estimate_cost_usd(&pricing, input_tokens, header.max_tokens);
+        (estimated_usd > header.ceiling_usd).then_some(CostLimitViolation {
+            limit_kind: "header",
+            estimated_usd,
+            ceiling_usd: header.ceiling_usd,
+        })
+    }
+}
+
+/// Error returned while selecting a provider from a failover chain.
+///
+/// Provider errors preserve the historical retry/failover semantics. A known
+/// priced candidate that exceeds an applicable ceiling is reported
+/// separately so callers can serialize it as a request cost-limit error
+/// instead of a generic unavailable-upstream failure.
+#[derive(Debug, thiserror::Error)]
+pub enum FailoverError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+
+    #[error(
+        "estimated cost ${estimated_usd:.4} exceeds the ${ceiling_usd:.4} per-request ceiling"
+    )]
+    CostLimitExceeded {
+        estimated_usd: f64,
+        ceiling_usd: f64,
+    },
+}
+
+/// Exhaustion state for cost-gated failover.
+///
+/// A terminal cost rejection is useful only when it was the sole remaining
+/// recovery blocker: a primary may have failed before the final, over-ceiling
+/// fallback, but a later ordinary failure or any capability/resolution/
+/// credential/breaker skip means the chain was not exhausted *because of*
+/// cost alone. Keep this state shared by buffered and streaming dispatch so
+/// their public error priority stays identical.
+#[derive(Default)]
+struct CostGateExhaustion {
+    first_violation: Option<CostLimitViolation>,
+    saw_non_cost_skip: bool,
+    saw_attempt_failure_after_cost: bool,
+}
+
+impl CostGateExhaustion {
+    fn record_cost_violation(&mut self, violation: CostLimitViolation) {
+        self.first_violation.get_or_insert(violation);
+    }
+
+    fn record_non_cost_skip(&mut self) {
+        self.saw_non_cost_skip = true;
+    }
+
+    fn record_attempt_failure(&mut self) {
+        if self.first_violation.is_some() {
+            self.saw_attempt_failure_after_cost = true;
+        }
+    }
+
+    fn terminal_error(&self) -> Option<FailoverError> {
+        let violation = self.first_violation?;
+        (!self.saw_non_cost_skip && !self.saw_attempt_failure_after_cost).then_some(
+            FailoverError::CostLimitExceeded {
+                estimated_usd: violation.estimated_usd,
+                ceiling_usd: violation.ceiling_usd,
+            },
+        )
+    }
+}
+
 /// Per-provider circuit breaker with a half-open trial state.
 ///
 /// After `failure_threshold` consecutive failures a provider's circuit OPENS
@@ -295,6 +445,10 @@ impl Default for CircuitBreaker {
 /// capabilities and context-window size.  A candidate that positively fails
 /// the check is skipped (with a `route_skipped_capability` tracing event)
 /// rather than dispatched.  Unknown-catalog models are permissive — not blocked.
+///
+/// When `cost_check` is present, each resolved and known-priced candidate must
+/// satisfy its route and header ceilings before credentials, breaker state, or
+/// provider dispatch are touched. Unknown pricing remains permissive.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_with_failover(
     registry: &ProviderRegistry,
@@ -309,7 +463,8 @@ pub async fn dispatch_with_failover(
     >,
     now: DateTime<Utc>,
     cap_check: Option<CapCheck<'_>>,
-) -> Result<(Arc<dyn Provider>, ChatCompletionResponse), ProviderError> {
+    cost_check: Option<CandidateCostCheck>,
+) -> Result<(Arc<dyn Provider>, ChatCompletionResponse), FailoverError> {
     // When multiple candidates form a chain, cap per-candidate retries so the
     // total upstream call count stays bounded (see module-level docs).
     let chained = candidates.len() > 1;
@@ -322,7 +477,8 @@ pub async fn dispatch_with_failover(
     };
 
     let mut last_err: Option<ProviderError> = None;
-    for model in candidates {
+    let mut cost_exhaustion = CostGateExhaustion::default();
+    'candidates: for model in candidates {
         // Capability guard: skip candidates we know can't serve the request.
         if let Some(cc) = cap_check {
             if let Some(info) = registry.model_info(model) {
@@ -333,14 +489,34 @@ pub async fn dispatch_with_failover(
                         reasons = ?reasons,
                         "route_skipped_capability: failover candidate lacks required capabilities"
                     );
+                    cost_exhaustion.record_non_cost_skip();
                     continue;
                 }
             }
         }
 
         let Some(provider) = registry.resolve(model) else {
+            cost_exhaustion.record_non_cost_skip();
             continue;
         };
+        // Cost guard: resolved candidates with known pricing must fit each
+        // active ceiling before they can claim credentials, a breaker trial,
+        // or an upstream attempt. Route limits run first so a candidate that
+        // violates both reports the route ceiling deterministically.
+        if let Some(violation) = cost_check
+            .and_then(|cost_check| cost_check.violation_for(provider.as_ref(), model, req))
+        {
+            tracing::info!(
+                model = %model,
+                provider = %provider.id(),
+                limit_kind = violation.limit_kind,
+                estimated_usd = violation.estimated_usd,
+                ceiling_usd = violation.ceiling_usd,
+                "route_skipped_cost_limit: failover candidate exceeds request cost ceiling"
+            );
+            cost_exhaustion.record_cost_violation(violation);
+            continue 'candidates;
+        }
         // Per-candidate upstream credentials: each candidate may live on a
         // different provider than the request (cross-provider failover). Skip a
         // candidate the org has no credential for rather than forwarding a
@@ -352,9 +528,11 @@ pub async fn dispatch_with_failover(
                 provider = %provider.id(),
                 "failover_skip: no upstream credential for candidate provider"
             );
+            cost_exhaustion.record_non_cost_skip();
             continue;
         };
         if breaker.is_open(provider.id(), now) {
+            cost_exhaustion.record_non_cost_skip();
             continue;
         }
         let mut cand_ctx = ctx.clone();
@@ -380,6 +558,7 @@ pub async fn dispatch_with_failover(
                 // exhaustion signal.
                 breaker.record_failure(provider.id(), now);
                 metrics::counter!("provider_failover_total", "from" => provider.id()).increment(1);
+                cost_exhaustion.record_attempt_failure();
                 last_err = Some(e);
             }
             Err(e) if e.is_retriable() => {
@@ -387,7 +566,7 @@ pub async fn dispatch_with_failover(
                 // still feed the failure into the breaker so a hot-looping
                 // provider trips it faster, then surface the error.
                 breaker.record_failure(provider.id(), now);
-                return Err(e);
+                return Err(e.into());
             }
             // Not fallback-eligible, not retriable (bad request, unsupported,
             // …) — surface immediately. The provider responded, so this is not
@@ -396,14 +575,20 @@ pub async fn dispatch_with_failover(
             // instead of staying stuck open forever.
             Err(e) => {
                 breaker.record_trial_abandoned(provider.id());
-                return Err(e);
+                return Err(e.into());
             }
         }
     }
-    Err(last_err.unwrap_or(ProviderError::ProviderUpstream {
-        status: 503,
-        message: "no candidate provider available (unknown models or open circuits)".to_string(),
-    }))
+    if let Some(error) = cost_exhaustion.terminal_error() {
+        return Err(error);
+    }
+    Err(last_err
+        .unwrap_or(ProviderError::ProviderUpstream {
+            status: 503,
+            message: "no candidate provider available (unknown models or open circuits)"
+                .to_string(),
+        })
+        .into())
 }
 
 /// Streaming sibling of [`dispatch_with_failover`]: establish a chat-completion
@@ -412,9 +597,10 @@ pub async fn dispatch_with_failover(
 /// streaming a mid-stream error cannot be retried on another provider. Returns
 /// the serving provider, the model it served, and the stream.
 ///
-/// Accepts the same [`CapCheck`] parameter as [`dispatch_with_failover`] —
-/// incapable candidates are skipped before dispatch, and unknown-catalog
-/// models are permissive.
+/// Accepts the same [`CapCheck`] and [`CandidateCostCheck`] parameters as
+/// [`dispatch_with_failover`] — incapable or over-ceiling candidates are
+/// skipped before dispatch, and unknown-catalog or unknown-priced models are
+/// permissive.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_stream_with_failover(
     registry: &ProviderRegistry,
@@ -429,13 +615,14 @@ pub async fn dispatch_stream_with_failover(
     >,
     now: DateTime<Utc>,
     cap_check: Option<CapCheck<'_>>,
+    cost_check: Option<CandidateCostCheck>,
 ) -> Result<
     (
         Arc<dyn Provider>,
         String,
         BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
     ),
-    ProviderError,
+    FailoverError,
 > {
     // Mirror the fan-out bound from dispatch_with_failover.
     let chained = candidates.len() > 1;
@@ -448,7 +635,8 @@ pub async fn dispatch_stream_with_failover(
     };
 
     let mut last_err: Option<ProviderError> = None;
-    for model in candidates {
+    let mut cost_exhaustion = CostGateExhaustion::default();
+    'candidates: for model in candidates {
         // Capability guard.
         if let Some(cc) = cap_check {
             if let Some(info) = registry.model_info(model) {
@@ -459,14 +647,33 @@ pub async fn dispatch_stream_with_failover(
                         reasons = ?reasons,
                         "route_skipped_capability: failover stream candidate lacks required capabilities"
                     );
+                    cost_exhaustion.record_non_cost_skip();
                     continue;
                 }
             }
         }
 
         let Some(provider) = registry.resolve(model) else {
+            cost_exhaustion.record_non_cost_skip();
             continue;
         };
+        // Keep stream establishment on the same admission boundary as
+        // buffered dispatch. Once a stream begins, failover is no longer
+        // possible, so this must happen before credentials/breaker/dispatch.
+        if let Some(violation) = cost_check
+            .and_then(|cost_check| cost_check.violation_for(provider.as_ref(), model, req))
+        {
+            tracing::info!(
+                model = %model,
+                provider = %provider.id(),
+                limit_kind = violation.limit_kind,
+                estimated_usd = violation.estimated_usd,
+                ceiling_usd = violation.ceiling_usd,
+                "route_skipped_cost_limit: failover stream candidate exceeds request cost ceiling"
+            );
+            cost_exhaustion.record_cost_violation(violation);
+            continue 'candidates;
+        }
         // Per-candidate upstream credentials: each candidate may live on a
         // different provider than the request (cross-provider failover). Skip a
         // candidate the org has no credential for rather than forwarding a
@@ -478,9 +685,11 @@ pub async fn dispatch_stream_with_failover(
                 provider = %provider.id(),
                 "failover_skip: no upstream credential for candidate provider"
             );
+            cost_exhaustion.record_non_cost_skip();
             continue;
         };
         if breaker.is_open(provider.id(), now) {
+            cost_exhaustion.record_non_cost_skip();
             continue;
         }
         let mut cand_ctx = ctx.clone();
@@ -501,25 +710,32 @@ pub async fn dispatch_stream_with_failover(
             Err(e) if e.is_fallback_eligible() => {
                 breaker.record_failure(provider.id(), now);
                 metrics::counter!("provider_failover_total", "from" => provider.id()).increment(1);
+                cost_exhaustion.record_attempt_failure();
                 last_err = Some(e);
             }
             Err(e) if e.is_retriable() => {
                 breaker.record_failure(provider.id(), now);
-                return Err(e);
+                return Err(e.into());
             }
             // Not fallback-eligible, not retriable — surface immediately, but
             // release any half-open trial `is_open` admitted above so the
             // breaker can re-trial later instead of staying stuck open forever.
             Err(e) => {
                 breaker.record_trial_abandoned(provider.id());
-                return Err(e);
+                return Err(e.into());
             }
         }
     }
-    Err(last_err.unwrap_or(ProviderError::ProviderUpstream {
-        status: 503,
-        message: "no candidate provider available (unknown models or open circuits)".to_string(),
-    }))
+    if let Some(error) = cost_exhaustion.terminal_error() {
+        return Err(error);
+    }
+    Err(last_err
+        .unwrap_or(ProviderError::ProviderUpstream {
+            status: 503,
+            message: "no candidate provider available (unknown models or open circuits)"
+                .to_string(),
+        })
+        .into())
 }
 
 #[cfg(test)]
@@ -888,6 +1104,11 @@ mod tests {
             "pa",
             "pb",
             "pc",
+            "cost-primary",
+            "cost-fallback",
+            "cost-final",
+            "openai",
+            "gemini",
             "prov",
             "x",
             "flaky",
@@ -918,6 +1139,485 @@ mod tests {
         }
     }
 
+    /// Focused mock for failover cost-gate tests. Unlike the general-purpose
+    /// mocks above, it exposes both deterministic pricing and call counts so
+    /// the tests can prove an over-ceiling fallback never reaches dispatch.
+    struct CostCountingProvider {
+        id: &'static str,
+        model: &'static str,
+        pricing: ModelPricing,
+        fail: bool,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    fn cost_pricing(input_per_million: f64, output_per_million: f64) -> ModelPricing {
+        ModelPricing {
+            input_per_million,
+            output_per_million,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    fn cost_mock_response(model: String) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "x".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("ok".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CostCountingProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                id: self.model.to_string(),
+                provider: self.id.to_string(),
+                capabilities: vec![Capability::Text],
+                max_input_tokens: 128_000,
+                max_output_tokens: 4096,
+            }]
+        }
+
+        fn pricing(&self, model: &str) -> Option<ModelPricing> {
+            (model == self.model).then(|| self.pricing.clone())
+        }
+
+        async fn chat_completion(
+            &self,
+            req: ChatCompletionRequest,
+            _: &RequestContext,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(ProviderError::ProviderUpstream {
+                    status: 503,
+                    message: "down".into(),
+                });
+            }
+            Ok(cost_mock_response(req.model))
+        }
+
+        async fn chat_completion_stream(
+            &self,
+            _: ChatCompletionRequest,
+            _: &RequestContext,
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(ProviderError::ProviderUpstream {
+                    status: 503,
+                    message: "down".into(),
+                });
+            }
+            Ok(Box::pin(futures::stream::iter(Vec::<
+                Result<ChatCompletionChunk, ProviderError>,
+            >::new())))
+        }
+
+        async fn embeddings(
+            &self,
+            _: EmbeddingsRequest,
+            _: &RequestContext,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+    }
+
+    fn cost_check() -> CandidateCostCheck {
+        CandidateCostCheck {
+            // Both limits intentionally reject the expensive fallback. The
+            // route limit must be reported first, preserving chain order.
+            route: Some(RouteCostConstraint {
+                ceiling_usd: 10.0,
+                input_tokens: 1_000_000,
+                max_tokens: Some(0),
+            }),
+            header: Some(HeaderCostConstraint {
+                ceiling_usd: 5.0,
+                max_tokens: Some(0),
+            }),
+        }
+    }
+
+    fn assert_cost_rejection(result: Result<(), FailoverError>) {
+        match result {
+            Err(FailoverError::CostLimitExceeded {
+                estimated_usd,
+                ceiling_usd,
+            }) => {
+                assert!((estimated_usd - 20.0).abs() < f64::EPSILON);
+                assert!((ceiling_usd - 10.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected route cost-limit rejection, got {other:?}"),
+        }
+    }
+
+    fn assert_provider_upstream_503(result: Result<(), FailoverError>) {
+        match result {
+            Err(FailoverError::Provider(ProviderError::ProviderUpstream {
+                status: 503, ..
+            })) => {}
+            other => panic!("expected the final provider 503, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cost_gate_skips_expensive_buffered_fallback_before_dispatch() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-primary",
+            model: "cheap-failing",
+            pricing: cost_pricing(1.0, 1.0),
+            fail: true,
+            calls: primary_calls.clone(),
+        }));
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-fallback",
+            model: "expensive-fallback",
+            pricing: cost_pricing(20.0, 20.0),
+            fail: false,
+            calls: fallback_calls.clone(),
+        }));
+
+        let breaker = CircuitBreaker::default();
+        let candidates = vec![
+            "cheap-failing".to_string(),
+            "expensive-fallback".to_string(),
+        ];
+        let result = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("cheap-failing"),
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+            Some(cost_check()),
+        )
+        .await
+        .map(|_| ());
+
+        assert_cost_rejection(result);
+        assert!(
+            primary_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the under-ceiling primary should be attempted before failover"
+        );
+        assert_eq!(
+            fallback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the over-ceiling fallback must never reach buffered dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_gate_skips_expensive_streaming_fallback_before_dispatch() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-primary",
+            model: "cheap-failing",
+            pricing: cost_pricing(1.0, 1.0),
+            fail: true,
+            calls: primary_calls.clone(),
+        }));
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-fallback",
+            model: "expensive-fallback",
+            pricing: cost_pricing(20.0, 20.0),
+            fail: false,
+            calls: fallback_calls.clone(),
+        }));
+
+        let breaker = CircuitBreaker::default();
+        let candidates = vec![
+            "cheap-failing".to_string(),
+            "expensive-fallback".to_string(),
+        ];
+        let result = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("cheap-failing"),
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+            Some(cost_check()),
+        )
+        .await
+        .map(|_| ());
+
+        assert_cost_rejection(result);
+        assert!(
+            primary_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the under-ceiling primary should establish before failover"
+        );
+        assert_eq!(
+            fallback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the over-ceiling fallback must never reach stream establishment"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_skip_does_not_mask_later_buffered_provider_failure() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let expensive_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let final_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-primary",
+            model: "cheap-failing",
+            pricing: cost_pricing(1.0, 1.0),
+            fail: true,
+            calls: primary_calls.clone(),
+        }));
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-fallback",
+            model: "expensive-fallback",
+            pricing: cost_pricing(20.0, 20.0),
+            fail: false,
+            calls: expensive_calls.clone(),
+        }));
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-final",
+            model: "cheap-final-failing",
+            pricing: cost_pricing(1.0, 1.0),
+            fail: true,
+            calls: final_calls.clone(),
+        }));
+
+        let breaker = CircuitBreaker::default();
+        let candidates = vec![
+            "cheap-failing".to_string(),
+            "expensive-fallback".to_string(),
+            "cheap-final-failing".to_string(),
+        ];
+        let result = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("cheap-failing"),
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+            Some(cost_check()),
+        )
+        .await
+        .map(|_| ());
+
+        assert_provider_upstream_503(result);
+        assert!(
+            primary_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the initial under-ceiling provider should have been attempted"
+        );
+        assert_eq!(
+            expensive_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the over-ceiling middle fallback must never dispatch"
+        );
+        assert!(
+            final_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "a later attempted 503 must win over an earlier cost skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_skip_does_not_mask_later_streaming_provider_failure() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let expensive_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let final_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-primary",
+            model: "cheap-failing",
+            pricing: cost_pricing(1.0, 1.0),
+            fail: true,
+            calls: primary_calls.clone(),
+        }));
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-fallback",
+            model: "expensive-fallback",
+            pricing: cost_pricing(20.0, 20.0),
+            fail: false,
+            calls: expensive_calls.clone(),
+        }));
+        reg.register(Arc::new(CostCountingProvider {
+            id: "cost-final",
+            model: "cheap-final-failing",
+            pricing: cost_pricing(1.0, 1.0),
+            fail: true,
+            calls: final_calls.clone(),
+        }));
+
+        let breaker = CircuitBreaker::default();
+        let candidates = vec![
+            "cheap-failing".to_string(),
+            "expensive-fallback".to_string(),
+            "cheap-final-failing".to_string(),
+        ];
+        let result = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("cheap-failing"),
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+            Some(cost_check()),
+        )
+        .await
+        .map(|_| ());
+
+        assert_provider_upstream_503(result);
+        assert!(
+            primary_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the initial under-ceiling provider should establish before failover"
+        );
+        assert_eq!(
+            expensive_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the over-ceiling middle fallback must never establish a stream"
+        );
+        assert!(
+            final_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "a later stream-establishment 503 must win over an earlier cost skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_cost_gate_retokenizes_for_the_fallback_provider() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(CostCountingProvider {
+            id: "openai",
+            model: "openai-primary",
+            // With max_tokens=0 this turns the input-token count directly
+            // into the estimated USD value, making the provider divergence
+            // obvious without a route-derived direct-cap condition.
+            pricing: cost_pricing(1_000_000.0, 0.0),
+            fail: true,
+            calls: primary_calls.clone(),
+        }));
+        reg.register(Arc::new(CostCountingProvider {
+            id: "gemini",
+            model: "gemini-fallback",
+            pricing: cost_pricing(1_000_000.0, 0.0),
+            fail: false,
+            calls: fallback_calls.clone(),
+        }));
+
+        let mut request = req("openai-primary");
+        request.max_tokens = Some(0);
+        request.messages = vec![Message::User {
+            // `openai` uses cl100k while `gemini` uses the chars/4 estimate;
+            // a long whitespace run makes that difference intentionally large.
+            content: MessageContent::Text(" ".repeat(4_096)),
+            name: None,
+        }];
+        let prompt = tt_shared::message_text_for_estimation(&request);
+        let openai_tokens = tt_tokenize::estimate_tokens("openai", &prompt);
+        let gemini_tokens = tt_tokenize::estimate_tokens("gemini", &prompt);
+        assert!(
+            gemini_tokens > openai_tokens,
+            "the regression fixture requires provider tokenizer estimates to diverge: openai={openai_tokens}, gemini={gemini_tokens}"
+        );
+        let ceiling_usd = (f64::from(openai_tokens) + f64::from(gemini_tokens)) / 2.0;
+        assert!(
+            f64::from(openai_tokens) < ceiling_usd,
+            "the direct primary header admission must remain under the ceiling"
+        );
+        assert!(
+            f64::from(gemini_tokens) > ceiling_usd,
+            "the fallback must exceed the ceiling only under Gemini tokenization"
+        );
+        let cost_check = CandidateCostCheck {
+            route: None,
+            header: Some(HeaderCostConstraint {
+                ceiling_usd,
+                max_tokens: Some(0),
+            }),
+        };
+
+        let breaker = CircuitBreaker::default();
+        let candidates = vec!["openai-primary".to_string(), "gemini-fallback".to_string()];
+        let result = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &request,
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+            Some(cost_check),
+        )
+        .await
+        .map(|_| ());
+
+        match result {
+            Err(FailoverError::CostLimitExceeded {
+                estimated_usd,
+                ceiling_usd: rejected_ceiling,
+            }) => {
+                assert_eq!(estimated_usd, f64::from(gemini_tokens));
+                assert_eq!(rejected_ceiling, ceiling_usd);
+            }
+            other => panic!("expected Gemini-tokenized header rejection, got {other:?}"),
+        }
+        assert!(
+            primary_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the under-ceiling OpenAI primary should be attempted"
+        );
+        assert_eq!(
+            fallback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the Gemini fallback must be rejected before dispatch"
+        );
+    }
+
     #[tokio::test]
     async fn falls_over_to_next_candidate_on_5xx() {
         let mut reg = ProviderRegistry::new();
@@ -942,6 +1642,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             now(),
+            None,
             None,
         )
         .await
@@ -977,6 +1678,7 @@ mod tests {
             &all_creds(),
             now(),
             None,
+            None,
         )
         .await
         .expect("a 429 on the primary should fall over to the healthy candidate");
@@ -1008,6 +1710,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             now(),
+            None,
             None,
         )
         .await
@@ -1041,10 +1744,14 @@ mod tests {
             &all_creds(),
             now(),
             None,
+            None,
         )
         .await;
         assert!(
-            matches!(r, Err(ProviderError::InvalidRequest(_))),
+            matches!(
+                r,
+                Err(FailoverError::Provider(ProviderError::InvalidRequest(_)))
+            ),
             "must not fall over on a non-fallback-eligible error"
         );
     }
@@ -1073,6 +1780,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             now(),
+            None,
             None,
         )
         .await
@@ -1106,9 +1814,13 @@ mod tests {
             &all_creds(),
             now(),
             None,
+            None,
         )
         .await;
-        assert!(matches!(r, Err(ProviderError::InvalidRequest(_))));
+        assert!(matches!(
+            r,
+            Err(FailoverError::Provider(ProviderError::InvalidRequest(_)))
+        ));
     }
 
     #[tokio::test]
@@ -1136,6 +1848,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             now(),
+            None,
             None,
         )
         .await
@@ -1269,6 +1982,7 @@ mod tests {
                 required: &required,
                 estimated_tokens: 0,
             }),
+            None,
         )
         .await
         .expect("vision-model should serve");
@@ -1314,6 +2028,7 @@ mod tests {
                 required: &required,
                 estimated_tokens: est_tokens,
             }),
+            None,
         )
         .await
         .expect("large-model should serve");
@@ -1380,6 +2095,7 @@ mod tests {
                 required: &required,
                 estimated_tokens: 0,
             }),
+            None,
         )
         .await
         .expect("capable model-c should serve");
@@ -1452,6 +2168,7 @@ mod tests {
                 required: &required,
                 estimated_tokens: 0,
             }),
+            None,
         )
         .await
         .expect("known capable model should serve");
@@ -1490,6 +2207,7 @@ mod tests {
                 required: &required,
                 estimated_tokens: 0,
             }),
+            None,
         )
         .await
         .expect("capable model should serve");
@@ -1605,6 +2323,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             now(),
+            None,
             None,
         )
         .await;
@@ -1733,6 +2452,7 @@ mod tests {
             &all_creds(),
             now(),
             None,
+            None,
         )
         .await
         .expect("should succeed on 3rd attempt");
@@ -1779,6 +2499,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             now(),
+            None,
             None,
         )
         .await;
@@ -1911,10 +2632,14 @@ mod tests {
             &all_creds(),
             later,
             None,
+            None,
         )
         .await;
         assert!(
-            matches!(r, Err(ProviderError::InvalidRequest(_))),
+            matches!(
+                r,
+                Err(FailoverError::Provider(ProviderError::InvalidRequest(_)))
+            ),
             "non-retriable error must surface"
         );
 
@@ -1930,6 +2655,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             later,
+            None,
             None,
         )
         .await
@@ -1978,6 +2704,7 @@ mod tests {
             &empty_creds,
             later,
             None,
+            None,
         )
         .await;
         assert!(r.is_err(), "no credential → no candidate available");
@@ -1993,6 +2720,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             later,
+            None,
             None,
         )
         .await
@@ -2032,10 +2760,14 @@ mod tests {
             &all_creds(),
             later,
             None,
+            None,
         )
         .await;
         assert!(
-            matches!(r, Err(ProviderError::InvalidRequest(_))),
+            matches!(
+                r,
+                Err(FailoverError::Provider(ProviderError::InvalidRequest(_)))
+            ),
             "non-retriable error must surface"
         );
 
@@ -2049,6 +2781,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             later,
+            None,
             None,
         )
         .await
@@ -2090,6 +2823,7 @@ mod tests {
             &empty_creds,
             later,
             None,
+            None,
         )
         .await;
         assert!(r.is_err(), "no credential → no candidate available");
@@ -2103,6 +2837,7 @@ mod tests {
             &ctx(),
             &all_creds(),
             later,
+            None,
             None,
         )
         .await

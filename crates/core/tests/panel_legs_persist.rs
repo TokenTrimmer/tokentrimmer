@@ -180,6 +180,7 @@ async fn happy_panel_writes_one_billing_row_and_three_leg_rows() {
         .body(Body::from(
             json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {
@@ -410,6 +411,7 @@ async fn panicked_member_leg_index_is_contiguous_not_sentinel() {
         .body(Body::from(
             json!({
                 "model": "model-ok",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {

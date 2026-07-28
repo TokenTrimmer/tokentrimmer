@@ -9,12 +9,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::types::{ModelSelection, NodeKind, WorkflowDefinition, WorkflowTrigger};
+use super::{environment_variables::required_variable_names, secrets::required_secret_names};
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Validate a [`WorkflowDefinition`] against structural and model constraints.
+/// Validate a newly written [`WorkflowDefinition`] against structural and model
+/// constraints.
 ///
 /// `model_exists(model_id)` should return `true` when the given model id is
 /// known to the gateway (i.e. `registry.resolve(model_id).is_some()`).  Only
@@ -22,16 +24,44 @@ use super::types::{ModelSelection, NodeKind, WorkflowDefinition, WorkflowTrigger
 /// selections are accepted without a lookup.  [`ModelSelection::Auto`] is
 /// rejected with an error — callers must pin a model or `route_ref` for W1a.
 ///
+/// New and updated schedule triggers must meet the current one-hour minimum.
+/// Stored definitions execute through `validate_for_execution` so a schedule
+/// persisted before that write-time floor is not silently disabled.
+///
 /// Returns `Ok(())` when the definition is valid, or `Err(errors)` where
 /// `errors` is a **complete** list of all violations found.
 pub fn validate(
     def: &WorkflowDefinition,
     model_exists: &dyn Fn(&str) -> bool,
 ) -> Result<(), Vec<String>> {
+    validate_with_schedule_floor(def, model_exists, true)
+}
+
+/// Validate a definition loaded from durable storage before it executes.
+///
+/// This preserves the structural, model, maximum-interval, and webhook checks
+/// from [`validate`], but deliberately permits a sub-hour schedule written
+/// before the current write contract. The only callers load a persisted
+/// definition first; new and updated API writes always use [`validate`]. An
+/// operator must explicitly migrate legacy schedules to one hour or longer.
+pub(crate) fn validate_for_execution(
+    def: &WorkflowDefinition,
+    model_exists: &dyn Fn(&str) -> bool,
+) -> Result<(), Vec<String>> {
+    validate_with_schedule_floor(def, model_exists, false)
+}
+
+fn validate_with_schedule_floor(
+    def: &WorkflowDefinition,
+    model_exists: &dyn Fn(&str) -> bool,
+    enforce_current_schedule_minimum: bool,
+) -> Result<(), Vec<String>> {
     let mut errors: Vec<String> = Vec::new();
 
-    // Build a set of all declared node ids for O(1) lookup.
-    let node_ids: HashSet<&str> = def.nodes.iter().map(|n| n.id.as_str()).collect();
+    // Validate node identity and ordinary-edge invariants before any graph
+    // traversal. Kahn's maps are keyed by node id, so duplicate ids would
+    // collapse distinct nodes and can manufacture a false cycle.
+    let (node_ids, graph_structure_is_valid) = validate_graph_structure(def, &mut errors);
 
     // ------------------------------------------------------------------
     // 1. Exactly one Trigger node.
@@ -64,14 +94,17 @@ pub fn validate(
     // ------------------------------------------------------------------
     // 3. Edge endpoints reference existing node ids.
     // ------------------------------------------------------------------
+    let mut references_are_valid = true;
     for edge in &def.edges {
         if !node_ids.contains(edge.from.as_str()) {
+            references_are_valid = false;
             errors.push(format!(
                 "edge references unknown source node id \"{}\"",
                 edge.from
             ));
         }
         if !node_ids.contains(edge.to.as_str()) {
+            references_are_valid = false;
             errors.push(format!(
                 "edge references unknown target node id \"{}\"",
                 edge.to
@@ -90,12 +123,14 @@ pub fn validate(
         } = &node.kind
         {
             if !node_ids.contains(when_true.as_str()) {
+                references_are_valid = false;
                 errors.push(format!(
                     "Branch node \"{}\" when_true references unknown node id \"{}\"",
                     node.id, when_true
                 ));
             }
             if !node_ids.contains(when_false.as_str()) {
+                references_are_valid = false;
                 errors.push(format!(
                     "Branch node \"{}\" when_false references unknown node id \"{}\"",
                     node.id, when_false
@@ -132,6 +167,22 @@ pub fn validate(
                 }
             }
             _ => {}
+        }
+
+        let output_cap = match &node.kind {
+            NodeKind::Model {
+                max_output_tokens, ..
+            }
+            | NodeKind::Agent {
+                max_output_tokens, ..
+            } => *max_output_tokens,
+            _ => None,
+        };
+        if output_cap == Some(0) {
+            errors.push(format!(
+                "node \"{}\": max_output_tokens must be a positive integer when set",
+                node.id
+            ));
         }
     }
 
@@ -226,6 +277,16 @@ pub fn validate(
         }
     }
 
+    // Secret references are syntactic definition metadata. Reject malformed
+    // names on both write and execution validation; actual availability is a
+    // runtime preflight because secrets rotate independently of definitions.
+    if let Err(secret_errors) = required_secret_names(def) {
+        errors.extend(secret_errors);
+    }
+    if let Err(variable_errors) = required_variable_names(def) {
+        errors.extend(variable_errors);
+    }
+
     // ------------------------------------------------------------------
     // 6b. Loop nodes: max_iters must be 1..=100.
     // ------------------------------------------------------------------
@@ -290,7 +351,12 @@ pub fn validate(
     // infinite-loop-inducing as one through def.edges.  We treat both as
     // directed arcs in the adjacency map.
     // ------------------------------------------------------------------
-    check_cycles(def, &mut errors);
+    // A traversal is only meaningful once identity, ordinary-edge, and
+    // endpoint invariants hold. In particular, duplicate ids would collapse
+    // Kahn's HashMaps and report a fabricated cycle for malformed input.
+    if graph_structure_is_valid && references_are_valid {
+        check_cycles(def, &mut errors);
+    }
 
     // ------------------------------------------------------------------
     // CO-2: triggers (schedule/webhook) — optional invokers. At most one
@@ -298,7 +364,7 @@ pub fn validate(
     // token_id is a non-empty URL-safe string. Empty `triggers` is the default
     // (human-Run only) and is fine.
     // ------------------------------------------------------------------
-    validate_triggers(def, &mut errors);
+    validate_triggers(def, &mut errors, enforce_current_schedule_minimum);
 
     if errors.is_empty() {
         Ok(())
@@ -307,26 +373,101 @@ pub fn validate(
     }
 }
 
+/// Validate the graph facts that must be true before a node-id-keyed traversal
+/// can safely reason about the definition. Ordinary `Edge`s are distinct from
+/// Branch arms: branch arm targets remain part of cycle detection, while only
+/// duplicate ordinary `from` → `to` pairs are rejected here.
+fn validate_graph_structure<'a>(
+    def: &'a WorkflowDefinition,
+    errors: &mut Vec<String>,
+) -> (HashSet<&'a str>, bool) {
+    let mut node_ids = HashSet::with_capacity(def.nodes.len());
+    let mut edge_pairs = HashSet::with_capacity(def.edges.len());
+    let mut is_valid = true;
+
+    for (index, node) in def.nodes.iter().enumerate() {
+        if node.id.trim().is_empty() {
+            is_valid = false;
+            errors.push(format!(
+                "node {} has a blank or whitespace-only id",
+                index + 1
+            ));
+            continue;
+        }
+        if !node_ids.insert(node.id.as_str()) {
+            is_valid = false;
+            errors.push(format!("node id \"{}\" is duplicated", node.id));
+        }
+    }
+
+    for (index, edge) in def.edges.iter().enumerate() {
+        if edge.from == edge.to {
+            is_valid = false;
+            errors.push(format!(
+                "edge {} connects node \"{}\" to itself",
+                index + 1,
+                edge.from
+            ));
+        }
+        // The tuple is collision-free even when imported node ids contain
+        // arbitrary separators; `map` does not make a second ordinary edge
+        // distinct for execution ordering.
+        if !edge_pairs.insert((edge.from.as_str(), edge.to.as_str())) {
+            is_valid = false;
+            errors.push(format!(
+                "edge {} duplicates an ordinary connection from \"{}\" to \"{}\"",
+                index + 1,
+                edge.from,
+                edge.to
+            ));
+        }
+    }
+
+    (node_ids, is_valid)
+}
+
 // ---------------------------------------------------------------------------
 // CO-2: triggers (schedule/webhook) validation
 // ---------------------------------------------------------------------------
 
+/// The hosted schedule dispatcher normally sweeps hourly.  Accepting a shorter
+/// write-time interval would promise a cadence the dispatcher cannot honor.
+const MIN_SCHEDULE_INTERVAL_SECS: u64 = 60 * 60;
+
+/// The floor enforced before the one-hour write contract. Execution retains it
+/// for legacy definitions so corrupt or impossible sub-five-minute schedules
+/// cannot become runnable through the compatibility path.
+const LEGACY_MIN_SCHEDULE_INTERVAL_SECS: u64 = 5 * 60;
+
 /// Validate the workflow's `triggers` invokers. Empty is the default
 /// (human-Run only) and is fine. At most one `Schedule` (two cadences is
-/// ambiguous). `Schedule.interval` parses to a bounded `Duration` (min 5 min,
-/// max 30 d — no busy-loops, no months-long silent gaps). `Webhook.token_id`
-/// is a non-empty URL-safe string.
-fn validate_triggers(def: &WorkflowDefinition, errors: &mut Vec<String>) {
+/// ambiguous). New or updated `Schedule.interval` values parse to a bounded
+/// `Duration` (min 1 h, max 30 d — no unsupported sub-hour promise or
+/// months-long silent gaps). Stored legacy definitions retain their former
+/// five-minute safety floor during execution. Hosted pickup is an approximate
+/// hourly sweep, not an exact-time trigger. `Webhook.token_id` is a non-empty
+/// URL-safe string.
+fn validate_triggers(
+    def: &WorkflowDefinition,
+    errors: &mut Vec<String>,
+    enforce_current_schedule_minimum: bool,
+) {
     let mut schedule_count = 0;
     for t in &def.triggers {
         match t {
-            WorkflowTrigger::Schedule { interval } => {
+            WorkflowTrigger::Schedule { interval, .. } => {
                 schedule_count += 1;
                 match parse_interval(interval) {
                     Some(d) => {
-                        if d.as_secs() < 300 {
+                        if enforce_current_schedule_minimum
+                            && d.as_secs() < MIN_SCHEDULE_INTERVAL_SECS
+                        {
                             errors.push(format!(
-                                "schedule interval '{interval}' is below the 5-minute minimum"
+                                "schedule interval '{interval}' is below the 1-hour minimum; hosted schedules use an approximate hourly sweep, not exact-time delivery"
+                            ));
+                        } else if d.as_secs() < LEGACY_MIN_SCHEDULE_INTERVAL_SECS {
+                            errors.push(format!(
+                                "schedule interval '{interval}' is below the 5-minute legacy compatibility minimum"
                             ));
                         } else if d.as_secs() > 30 * 24 * 3600 {
                             errors.push(format!(
@@ -335,11 +476,11 @@ fn validate_triggers(def: &WorkflowDefinition, errors: &mut Vec<String>) {
                         }
                     }
                     None => errors.push(format!(
-                        "schedule interval '{interval}' is not a valid duration (use e.g. '6h', '30m', '1d')"
+                        "schedule interval '{interval}' is not a valid duration (use e.g. '1h', '6h', '1d')"
                     )),
                 }
             }
-            WorkflowTrigger::Webhook { token_id } => {
+            WorkflowTrigger::Webhook { token_id, .. } => {
                 if token_id.is_empty() {
                     errors.push("webhook trigger token_id must not be empty".to_string());
                 } else if !token_id
@@ -360,7 +501,7 @@ fn validate_triggers(def: &WorkflowDefinition, errors: &mut Vec<String>) {
     }
 }
 
-/// Parse a duration string (`"6h"`, `"30m"`, `"1d"`, or a sum like `"1d6h"`)
+/// Parse a duration string (`"1h"`, `"1h30m"`, `"1d"`, or a sum like `"1d6h"`)
 /// into a `Duration`. Returns `None` for garbage. The cloud sweep mirrors the
 /// fixed-`Duration` cadence discipline (no cron crate), so this is the only
 /// schedule grammar in v1.
@@ -517,6 +658,7 @@ mod tests {
                             model: model.to_string(),
                         },
                         prompt: "hello".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -676,9 +818,9 @@ mod tests {
         );
     }
 
-    /// A self-loop (a→a) must also be caught.
+    /// Ordinary self-edges are structural errors, not cycle-analysis input.
     #[test]
-    fn self_loop_is_cycle_error() {
+    fn ordinary_self_edge_is_rejected_before_cycle_processing() {
         let def = WorkflowDefinition {
             triggers: vec![],
             id: Uuid::nil(),
@@ -726,8 +868,106 @@ mod tests {
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
         assert!(
-            combined.contains("cycle"),
-            "expected self-loop to be reported as cycle; got: {combined}"
+            combined.contains("connects node \"x\" to itself"),
+            "expected self-edge rejection; got: {combined}"
+        );
+        assert!(
+            !combined.contains("cycle"),
+            "invalid ordinary edge must not enter cycle analysis; got: {combined}"
+        );
+    }
+
+    #[test]
+    fn blank_or_whitespace_node_ids_are_rejected() {
+        for id in ["", " \t\n "] {
+            let mut def = linear_def("gpt-4o");
+            def.nodes[0].id = id.to_string();
+            let errs = validate(&def, &any_model).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|error| error.contains("blank or whitespace-only id")),
+                "id {id:?} should be rejected: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_node_ids_do_not_enter_collapsed_cycle_analysis() {
+        let mut def = linear_def("gpt-4o");
+        // Retain an output node and only valid ordinary endpoints. Before the
+        // identity gate, Kahn's id-keyed maps collapsed these two `m` nodes and
+        // falsely reported a cycle because it visited two map entries for three
+        // declared nodes.
+        def.nodes[2].id = "m".into();
+        def.edges.truncate(1);
+
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("node id \"m\" is duplicated"),
+            "expected duplicate-id rejection; got: {combined}"
+        );
+        assert!(
+            !combined.contains("cycle"),
+            "duplicate ids must not be passed to collapsed Kahn maps: {combined}"
+        );
+    }
+
+    #[test]
+    fn duplicate_ordered_ordinary_edges_are_rejected_before_cycle_processing() {
+        let mut def = linear_def("gpt-4o");
+        def.edges.push(Edge {
+            from: "t".into(),
+            to: "m".into(),
+            map: Some("a separately configured map is still the same edge".into()),
+        });
+
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("duplicates an ordinary connection from \"t\" to \"m\""),
+            "expected duplicate-edge rejection; got: {combined}"
+        );
+        assert!(
+            !combined.contains("cycle"),
+            "invalid ordinary edges must not enter cycle analysis; got: {combined}"
+        );
+    }
+
+    #[test]
+    fn validate_for_execution_shares_identity_and_ordinary_edge_invariants() {
+        let mut def = linear_def("gpt-4o");
+        def.nodes[0].id = "   ".into();
+        def.nodes[2].id = "m".into();
+        def.edges = vec![
+            Edge {
+                from: "m".into(),
+                to: "m".into(),
+                map: None,
+            },
+            Edge {
+                from: "m".into(),
+                to: "m".into(),
+                map: Some("different map does not make a distinct edge".into()),
+            },
+        ];
+
+        let errs = validate_for_execution(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        for expected in [
+            "blank or whitespace-only id",
+            "node id \"m\" is duplicated",
+            "connects node \"m\" to itself",
+            "duplicates an ordinary connection from \"m\" to \"m\"",
+        ] {
+            assert!(
+                combined.contains(expected),
+                "expected {expected:?} from execution validation; got: {combined}"
+            );
+        }
+        assert!(
+            !combined.contains("cycle"),
+            "execution validation must also skip collapsed cycle analysis: {combined}"
         );
     }
 
@@ -743,6 +983,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn output_token_cap_must_be_positive_for_models_and_agents() {
+        let mut model_def = linear_def("gpt-4o");
+        if let NodeKind::Model {
+            max_output_tokens, ..
+        } = &mut model_def.nodes[1].kind
+        {
+            *max_output_tokens = Some(0);
+        }
+        let model_errors = validate(&model_def, &any_model).unwrap_err();
+        assert!(model_errors
+            .iter()
+            .any(|error| error.contains("max_output_tokens must be a positive integer")));
+
+        let mut agent_def = linear_def("gpt-4o");
+        agent_def.nodes[1].kind = NodeKind::Agent {
+            selection: ModelSelection::Model {
+                model: "gpt-4o".into(),
+            },
+            prompt: "{{input}}".into(),
+            max_turns: Some(1),
+            max_output_tokens: Some(0),
+            max_cost_usd: None,
+            tools: vec![],
+        };
+        let agent_errors = validate(&agent_def, &any_model).unwrap_err();
+        assert!(agent_errors
+            .iter()
+            .any(|error| error.contains("max_output_tokens must be a positive integer")));
+    }
+
     /// An Auto selection on an Agent node is also rejected at validate-time.
     #[test]
     fn auto_selection_on_agent_node_is_error() {
@@ -753,6 +1024,7 @@ mod tests {
                 selection: ModelSelection::Auto,
                 prompt: "go".into(),
                 max_turns: None,
+                max_output_tokens: None,
                 max_cost_usd: None,
                 tools: vec![],
             },
@@ -777,6 +1049,7 @@ mod tests {
                 },
                 prompt: "go".into(),
                 max_turns: None,
+                max_output_tokens: None,
                 max_cost_usd: None,
                 tools: vec![],
             },
@@ -1135,6 +1408,7 @@ mod tests {
                             model: "bad-model".into(),
                         },
                         prompt: "p".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1243,6 +1517,24 @@ mod tests {
             validate(&def2, &any_model).is_ok(),
             "host in allowed_hosts should pass validation"
         );
+    }
+
+    #[test]
+    fn http_secret_reference_names_are_validated_at_definition_write() {
+        let def = http_def(
+            "https://api.example.com/x",
+            vec!["api.example.com".to_string()],
+            vec![(
+                "authorization".to_string(),
+                "Bearer {{secrets.bad-name}}".to_string(),
+            )],
+            None,
+        );
+        let errors = validate(&def, &any_model).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("invalid secret reference")));
+        assert!(errors.iter().all(|error| !error.contains("bad-name")));
     }
 
     /// An Http node with an http:// (non-https) url must be rejected.
@@ -1516,11 +1808,23 @@ mod tests {
         def.triggers = vec![
             WorkflowTrigger::Schedule {
                 interval: "6h".into(),
+                environment: None,
             },
             WorkflowTrigger::Webhook {
                 token_id: "t-1_a".into(),
+                environment: None,
             },
         ];
+        assert!(validate(&def, &any_model).is_ok());
+    }
+
+    #[test]
+    fn validate_triggers_accepts_the_one_hour_schedule_floor() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "1h".into(),
+            environment: None,
+        }];
         assert!(validate(&def, &any_model).is_ok());
     }
 
@@ -1529,6 +1833,7 @@ mod tests {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
             interval: "soon".into(),
+            environment: None,
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(
@@ -1541,11 +1846,39 @@ mod tests {
     fn validate_triggers_rejects_interval_below_minimum() {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
-            interval: "1m".into(),
+            interval: "30m".into(),
+            environment: None,
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("5-minute minimum")),
+            errs.iter().any(|e| {
+                e.contains("1-hour minimum") && e.contains("approximate hourly sweep")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_for_execution_keeps_legacy_sub_hour_schedule_runnable() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "30m".into(),
+            environment: None,
+        }];
+        assert!(validate_for_execution(&def, &any_model).is_ok());
+    }
+
+    #[test]
+    fn validate_for_execution_keeps_the_preexisting_safety_floor() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "1m".into(),
+            environment: None,
+        }];
+        let errs = validate_for_execution(&def, &any_model).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("5-minute legacy compatibility minimum")),
             "{errs:?}"
         );
     }
@@ -1556,9 +1889,11 @@ mod tests {
         def.triggers = vec![
             WorkflowTrigger::Schedule {
                 interval: "6h".into(),
+                environment: None,
             },
             WorkflowTrigger::Schedule {
                 interval: "12h".into(),
+                environment: None,
             },
         ];
         let errs = validate(&def, &any_model).unwrap_err();
@@ -1573,6 +1908,7 @@ mod tests {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Webhook {
             token_id: "".into(),
+            environment: None,
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(
@@ -1582,6 +1918,7 @@ mod tests {
 
         def.triggers = vec![WorkflowTrigger::Webhook {
             token_id: "bad token!".into(),
+            environment: None,
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("URL-safe")), "{errs:?}");

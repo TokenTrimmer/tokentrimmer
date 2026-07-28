@@ -216,6 +216,181 @@ fn migrator_includes_batch_jobs_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_gateway_owned_cost_breakdown_columns() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let thirty_ninth = migrations
+        .iter()
+        .find(|m| m.version == 39)
+        .expect("migration version 39 not found");
+    let desc = thirty_ninth.description.to_lowercase();
+    assert!(
+        desc.contains("cost") || desc.contains("breakdown") || desc.contains("columns"),
+        "migration 0039 description is '{}', expected to mention cost/breakdown/columns",
+        thirty_ninth.description,
+    );
+}
+
+#[test]
+fn migrator_includes_route_version_request_provenance() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_first = migrations
+        .iter()
+        .find(|m| m.version == 41)
+        .expect("migration version 41 not found");
+    let desc = forty_first.description.to_lowercase();
+    assert!(
+        desc.contains("route") && desc.contains("version"),
+        "migration 0041 description is '{}', expected to mention route-version provenance",
+        forty_first.description,
+    );
+
+    let up = include_str!("../migrations/0041_request_logs_route_version_provenance.up.sql");
+    assert!(
+        up.contains("route_version_id BIGINT"),
+        "route version must be a nullable BIGINT"
+    );
+    assert!(
+        up.contains("request_logs_org_route_version_ts_idx"),
+        "migration must make immutable-version trace reads indexable"
+    );
+    assert!(
+        !up.to_ascii_lowercase()
+            .contains("references public.route_versions"),
+        "public migration must not require the cloud-owned route_versions table"
+    );
+    assert!(
+        !up.to_ascii_lowercase().contains("update request_logs"),
+        "historical request rows must remain honestly unlinked"
+    );
+}
+
+#[test]
+fn migrator_includes_requested_model_snapshot_provenance() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_second = migrations
+        .iter()
+        .find(|m| m.version == 42)
+        .expect("migration version 42 not found");
+    let desc = forty_second.description.to_lowercase();
+    assert!(
+        desc.contains("requested") && desc.contains("model"),
+        "migration 0042 description is '{}', expected to mention requested-model provenance",
+        forty_second.description,
+    );
+
+    let up = include_str!("../migrations/0042_request_logs_requested_model_snapshot.up.sql");
+    assert!(
+        up.contains("requested_model TEXT"),
+        "requested-model snapshots must be nullable TEXT"
+    );
+    assert!(
+        up.contains("request_logs_org_requested_model_ts_idx"),
+        "migration must make snapshot-scoped historical reads indexable"
+    );
+    assert!(
+        !up.to_ascii_lowercase().contains("update request_logs"),
+        "historical request rows must remain honestly without a caller-model snapshot"
+    );
+    assert!(
+        !up.contains("DEFAULT "),
+        "an unknown historical caller model must remain NULL, not acquire a default"
+    );
+}
+
+#[test]
+fn migrator_includes_workflow_environment_release_ledger() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_third = migrations
+        .iter()
+        .find(|migration| migration.version == 43)
+        .expect("migration version 43 not found");
+    let description = forty_third.description.to_lowercase();
+    assert!(
+        description.contains("workflow")
+            && description.contains("environment")
+            && description.contains("release"),
+        "migration 0043 description is '{}', expected workflow environment release semantics",
+        forty_third.description,
+    );
+
+    let up = include_str!("../migrations/0043_workflow_environment_releases.up.sql");
+    assert!(up.contains("CREATE TABLE IF NOT EXISTS workflow_environment_state"));
+    assert!(up.contains("CREATE TABLE IF NOT EXISTS workflow_environment_releases"));
+    assert!(up.contains("PRIMARY KEY (org_id, workflow_id, environment, revision)"));
+    assert!(up.contains("REFERENCES workflow_definitions (org_id, id, version)"));
+    assert!(up.contains("action IN ('publish', 'promote', 'rollback')"));
+    assert!(up.contains("environment IN ('development', 'staging', 'production')"));
+    assert!(
+        !up.to_ascii_lowercase().contains("definition json"),
+        "release ledger must not duplicate definition values"
+    );
+}
+
+#[test]
+fn migrator_includes_workflow_run_release_provenance() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_fourth = migrations
+        .iter()
+        .find(|migration| migration.version == 44)
+        .expect("migration version 44 not found");
+    let description = forty_fourth.description.to_lowercase();
+    assert!(
+        description.contains("workflow")
+            && description.contains("run")
+            && description.contains("release")
+            && description.contains("provenance"),
+        "migration 0044 description is '{}', expected workflow-run release provenance",
+        forty_fourth.description,
+    );
+
+    let up = include_str!("../migrations/0044_workflow_run_release_provenance.up.sql");
+    assert!(up.contains("ADD COLUMN release_environment TEXT"));
+    assert!(up.contains("ADD COLUMN release_revision INT"));
+    assert!(up.contains("workflow_runs_release_pair_check"));
+    assert!(up.contains("workflow_runs_release_provenance_fk"));
+    assert!(up.contains("REFERENCES workflow_environment_releases"));
+    assert!(up.contains("release_environment,"));
+    assert!(up.contains("release_revision,"));
+    assert!(up.contains("workflow_version"));
+}
+
+#[test]
+fn migrator_includes_versioned_workflow_environment_variables() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_fifth = migrations
+        .iter()
+        .find(|migration| migration.version == 45)
+        .expect("migration version 45 not found");
+    let description = forty_fifth.description.to_lowercase();
+    assert!(
+        description.contains("workflow")
+            && description.contains("environment")
+            && description.contains("variable"),
+        "migration 0045 description is '{}', expected workflow environment variables",
+        forty_fifth.description,
+    );
+
+    let up = include_str!("../migrations/0045_workflow_environment_variables.up.sql");
+    let normalized_up = up.split_whitespace().collect::<Vec<_>>().join(" ");
+    for fragment in [
+        "CREATE TABLE IF NOT EXISTS workflow_environment_variable_sets",
+        "CREATE TABLE IF NOT EXISTS workflow_environment_variable_state",
+        "PRIMARY KEY (org_id, workflow_id, environment, revision)",
+        "REFERENCES workflow_environment_variable_sets",
+        "variables JSONB NOT NULL",
+        "ADD COLUMN variables_revision INT",
+        "SET variables_revision = 0",
+        "workflow_runs_variables_revision_check",
+        "workflow_runs_variables_scope_check",
+    ] {
+        assert!(
+            normalized_up.contains(fragment),
+            "missing variables contract: {fragment}"
+        );
+    }
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -251,6 +426,44 @@ async fn migrate_only_applies_schema() {
     assert!(
         bust_col,
         "request_logs.cache_bust_penalty_usd should exist after migration 0016"
+    );
+    let cost_breakdown_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'request_logs' \
+           AND column_name = ANY(ARRAY[\
+             'flex_saved_usd', 'doc_compaction_saved_usd', 'summarizer_tax_usd'\
+           ])",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query cost-breakdown columns");
+    assert_eq!(
+        cost_breakdown_columns, 3,
+        "gateway-owned cost-breakdown columns should exist after migration 0039"
+    );
+    let route_version_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='request_logs' \
+         AND column_name='route_version_id' AND data_type='bigint')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query route version provenance column");
+    assert!(
+        route_version_column,
+        "request_logs.route_version_id BIGINT should exist after migration 0041"
+    );
+    let requested_model_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='request_logs' \
+         AND column_name='requested_model' AND data_type='text')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query requested-model snapshot column");
+    assert!(
+        requested_model_column,
+        "request_logs.requested_model TEXT should exist after migration 0042"
     );
 }
 
@@ -308,6 +521,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
+        requested_model: Some("caller-model".into()),
         model: "test-1".into(),
         input_tokens: 120,
         output_tokens: 60,
@@ -316,9 +530,13 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         baseline_cost_usd: 0.001,
         provider_cache_saved_usd: 0.0002,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: false,
         cache_layer: None,
         route_id: None,
+        route_version_id: None,
         latency_ms: 5,
         upstream_latency_ms: None,
         status: 200,
@@ -361,6 +579,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
     unreported.id = Uuid::now_v7();
     unreported.cache_read_input_tokens = None;
     unreported.cache_creation_input_tokens = None;
+    unreported.requested_model = None;
     let unreported_id = unreported.id;
     writer.write(unreported).await.expect("insert unreported");
 
@@ -374,8 +593,8 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
     let fetch = |id: Uuid| {
         let pool = pool.clone();
         async move {
-            sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
-                "SELECT cache_read_input_tokens, cache_creation_input_tokens \
+            sqlx::query_as::<_, (Option<i32>, Option<i32>, Option<String>)>(
+                "SELECT cache_read_input_tokens, cache_creation_input_tokens, requested_model \
                  FROM request_logs WHERE id = $1",
             )
             .bind(id)
@@ -385,15 +604,18 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         }
     };
 
-    assert_eq!(fetch(reported_id).await, (Some(80), Some(20)));
+    assert_eq!(
+        fetch(reported_id).await,
+        (Some(80), Some(20), Some("caller-model".into()))
+    );
     assert_eq!(
         fetch(unreported_id).await,
-        (None, None),
-        "unreported must persist as SQL NULL"
+        (None, None, None),
+        "unreported cache telemetry and requested-model snapshot must persist as SQL NULL"
     );
     assert_eq!(
         fetch(zero_id).await,
-        (Some(0), Some(0)),
+        (Some(0), Some(0), Some("caller-model".into())),
         "an explicit provider-reported zero must persist as 0, not NULL"
     );
 
@@ -430,6 +652,7 @@ async fn request_log_insert_round_trips_batch_columns() {
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
+        requested_model: None,
         model: "batch-eligible".into(),
         input_tokens: 1000,
         output_tokens: 500,
@@ -438,9 +661,13 @@ async fn request_log_insert_round_trips_batch_columns() {
         baseline_cost_usd: 0.025,
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: false,
         cache_layer: None,
         route_id: None,
+        route_version_id: None,
         latency_ms: 5,
         upstream_latency_ms: None,
         status: 200,
@@ -547,6 +774,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
+        requested_model: None,
         model: "test-1".into(),
         input_tokens: 100,
         output_tokens: 50,
@@ -555,9 +783,15 @@ async fn request_logs_insert_round_trips_against_postgres() {
         baseline_cost_usd: 0.0045,
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.000611,
+        doc_compaction_saved_usd: 0.000733,
+        summarizer_tax_usd: 0.000199,
         cached: false,
         cache_layer: None,
         route_id: None,
+        // Pin a real immutable-ledger-shaped BIGINT through the full writer
+        // bind chain; this must not be confused with a route revision.
+        route_version_id: Some(9_876_543_210),
         latency_ms: 800,
         upstream_latency_ms: Some(750),
         status: 200,
@@ -608,17 +842,43 @@ async fn request_logs_insert_round_trips_against_postgres() {
         .await
         .expect("PostgresRequestLogWriter::write must succeed (bind chain == placeholders)");
 
-    let (provider, route_paused, minify_est, doc_vision_est, cc_est, cc_kind) =
-        sqlx::query_as::<_, (String, bool, f64, f64, f64, Option<String>)>(
-            "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8, \
+    let (
+        provider,
+        route_paused,
+        minify_est,
+        doc_vision_est,
+        cc_est,
+        cc_kind,
+        flex_saved,
+        doc_compaction_saved,
+        summarizer_tax,
+        route_version_id,
+    ) = sqlx::query_as::<
+        _,
+        (
+            String,
+            bool,
+            f64,
+            f64,
+            f64,
+            Option<String>,
+            f64,
+            f64,
+            f64,
+            Option<i64>,
+        ),
+    >(
+        "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8, \
              doc_vision_saved_est_usd::FLOAT8, \
-             content_compress_saved_est_usd::FLOAT8, content_compress_kind \
+             content_compress_saved_est_usd::FLOAT8, content_compress_kind, \
+             flex_saved_usd::FLOAT8, doc_compaction_saved_usd::FLOAT8, \
+             summarizer_tax_usd::FLOAT8, route_version_id \
              FROM request_logs WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .expect("fetch row");
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch row");
     assert_eq!(provider, "test-provider");
     assert!(route_paused, "route_paused=true must survive write→read");
     assert!(
@@ -637,6 +897,23 @@ async fn request_logs_insert_round_trips_against_postgres() {
         cc_kind.as_deref(),
         Some("json"),
         "content_compress_kind (TEXT) must round-trip"
+    );
+    assert!(
+        (flex_saved - 0.000611).abs() < 1e-9,
+        "flex_saved_usd must round-trip through NUMERIC(12,6), got {flex_saved}"
+    );
+    assert!(
+        (doc_compaction_saved - 0.000733).abs() < 1e-9,
+        "doc_compaction_saved_usd must round-trip through NUMERIC(12,6), got {doc_compaction_saved}"
+    );
+    assert!(
+        (summarizer_tax - 0.000199).abs() < 1e-9,
+        "summarizer_tax_usd must round-trip through NUMERIC(12,6), got {summarizer_tax}"
+    );
+    assert_eq!(
+        route_version_id,
+        Some(9_876_543_210),
+        "immutable route-version ID must round-trip as BIGINT"
     );
 
     sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
@@ -671,6 +948,7 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
+        requested_model: None,
         model: "shaped".into(),
         input_tokens: 1000,
         output_tokens: 50,
@@ -679,9 +957,13 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         baseline_cost_usd: 0.02,
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: false,
         cache_layer: None,
         route_id: None,
+        route_version_id: None,
         latency_ms: 5,
         upstream_latency_ms: None,
         status: 200,

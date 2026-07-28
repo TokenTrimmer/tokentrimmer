@@ -330,7 +330,7 @@ pub struct AppState {
     /// endpoints answer 503 (`batch processing is not configured`) — no other
     /// path consults it, so leaving it unset never affects chat/embeddings.
     pub batch_store: Option<Arc<dyn crate::batch_store::BatchStore>>,
-    /// Kill-switch for the deep-research panel feature. **Off by default.**
+    /// Kill-switch for the Fusion panel feature. **Off by default.**
     ///
     /// When `false` (the default), any panel request is rejected immediately
     /// with [`crate::error::ApiError::PanelDisabled`] — no silent fallback to
@@ -338,7 +338,7 @@ pub struct AppState {
     /// [`AppState::with_panel_enabled`] or the `TT_PANEL_ENABLED` env var
     /// (`"1"` or case-insensitive `"true"`).
     pub panel_enabled: bool,
-    /// Minimum [`tt_shared::CallerTier`] required to use the deep-research panel.
+    /// Minimum [`tt_shared::CallerTier`] required to use the Fusion panel.
     ///
     /// Defaults to `CallerTier::Free` (allow-all — the gate is a no-op until an
     /// operator tightens it). Production wires `panel_min_tier_from_env()`.
@@ -638,7 +638,7 @@ impl AppState {
         self
     }
 
-    /// Builder-style: enable or disable the deep-research panel feature. Off by
+    /// Builder-style: enable or disable the Fusion panel feature. Off by
     /// default — callers that never call this cannot accidentally enable panel
     /// dispatch. Production wires `true` when `TT_PANEL_ENABLED=1` or
     /// `TT_PANEL_ENABLED=true`.

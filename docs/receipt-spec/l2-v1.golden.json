@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "org_id": "00000000-0000-0000-0000-00000000002a",
+  "trace_id": "00000000-0000-0000-0000-000000000063",
+  "matched_entry_id": "00000000-0000-0000-0000-000000000007",
+  "similarity": 0.9312,
+  "verdict": "verified",
+  "served_cost_usd": 0.0,
+  "baseline_cost_usd": 0.0117,
+  "ts": "2026-07-08T12:00:00Z",
+  "verifying_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "signature": "00510ad32d19d60e2d8d34b8735ed21614fd86480f440e71f5745ccd3ef904517319da915cd72c1aedf101ffa5823f320cacd27033f89c26398f03cb80df3601"
+}

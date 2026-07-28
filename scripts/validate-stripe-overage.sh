@@ -3,6 +3,7 @@
 #
 #   STRIPE_SECRET_KEY=sk_test_... \
 #   STRIPE_PRICE_PRO=price_... STRIPE_OVERAGE_PRICE_PRO=price_... \
+#   STRIPE_PRICE_PRO_ANNUAL=price_... STRIPE_OVERAGE_PRICE_PRO_ANNUAL=price_... \
 #   ./scripts/validate-stripe-overage.sh
 #
 # Flow: create a test clock + customer (test card) → subscribe to the flat Pro
@@ -19,6 +20,8 @@ case "$STRIPE_SECRET_KEY" in
 esac
 : "${STRIPE_PRICE_PRO:?set the flat Pro price id}"
 : "${STRIPE_OVERAGE_PRICE_PRO:?set the metered overage price id}"
+: "${STRIPE_PRICE_PRO_ANNUAL:?set the annual flat Pro price id}"
+: "${STRIPE_OVERAGE_PRICE_PRO_ANNUAL:?set the annual metered Pro overage price id}"
 for b in curl jq; do command -v "$b" >/dev/null 2>&1 || { echo "missing $b" >&2; exit 1; }; done
 
 API=https://api.stripe.com/v1
@@ -27,11 +30,11 @@ auth() { curl -sS "$@" -u "${STRIPE_SECRET_KEY}:"; }
 cleanup() { [ -n "${CLOCK:-}" ] && auth -X DELETE "$API/test_helpers/test_clocks/$CLOCK" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-# rv-annual-checkout-guard (§7.8): if any annual price ids are configured, assert
-# each resolves to a live Stripe price with a YEARLY recurring interval. A
-# monthly price id wired into an *_ANNUAL slot silently breaks annual checkout
-# (the items would mix intervals). Unset annual vars are skipped (annual is
-# optional; the gateway falls back to monthly).
+# Annual checkout never falls back to monthly. The hosted API requires a flat
+# and metered annual price for every paid tier when Stripe billing is enabled;
+# this focused Pro test therefore requires and verifies the Pro annual pair.
+# Optional sibling variables below are checked when supplied, but this script
+# is not a replacement for the API's strict full-catalog boot validation.
 check_yearly() {
   local var="$1" id="${2:-}"
   [ -z "$id" ] && return 0
@@ -44,7 +47,7 @@ check_yearly() {
   fi
   echo "   ✅ $var is a yearly price"
 }
-echo "0) validate any configured annual price ids resolve to yearly Stripe prices"
+echo "0) validate the required Pro annual pair (and any supplied sibling slots)"
 check_yearly STRIPE_PRICE_PRO_ANNUAL           "${STRIPE_PRICE_PRO_ANNUAL:-}"
 check_yearly STRIPE_PRICE_TEAM_ANNUAL          "${STRIPE_PRICE_TEAM_ANNUAL:-}"
 check_yearly STRIPE_PRICE_SCALE_ANNUAL         "${STRIPE_PRICE_SCALE_ANNUAL:-}"

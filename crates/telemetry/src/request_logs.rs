@@ -28,6 +28,12 @@ pub struct RequestLogRow {
     pub api_key_id: Uuid,
     pub ts: DateTime<Utc>,
     pub provider: String,
+    /// Exact model ID the caller supplied before route matching, rewrites,
+    /// cache lookup, and failover. `None` for legacy/older-writer rows, which
+    /// historical `model_in` evidence must treat as uncovered rather than
+    /// infer from the final served [`Self::model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
     pub model: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
@@ -53,11 +59,35 @@ pub struct RequestLogRow {
     /// nothing), for TT cache hits, and for rows before migration 0016.
     #[serde(default)]
     pub cache_bust_penalty_usd: f64,
+    /// Measured USD saving from the OpenAI Flex service tier. This belongs in
+    /// the durable row because the gateway exposes it in the per-request cost
+    /// breakdown and cloud reports must not silently replace it with a zero.
+    /// `0.0` for non-Flex traffic and rows before migration 0039.
+    #[serde(default)]
+    pub flex_saved_usd: f64,
+    /// Measured USD saving from the lossless Document Lane compaction pass.
+    /// It is a separate attribution component of the gateway's durable
+    /// cost-breakdown contract; `0.0` when the pass did not run.
+    #[serde(default)]
+    pub doc_compaction_saved_usd: f64,
+    /// Realized auxiliary summarizer/judge spend. This is a tax, not a saving,
+    /// and stays separate so net savings and customer-visible cost waterfalls
+    /// can reconcile without hiding the spend. `0.0` when no summarizer ran.
+    #[serde(default)]
+    pub summarizer_tax_usd: f64,
     /// `true` when ANY cache layer served the response (L1 or L2).
     pub cached: bool,
     /// `Some("l1")` / `Some("l2")` / `None`. Matches the SQL CHECK constraint.
     pub cache_layer: Option<String>,
     pub route_id: Option<Uuid>,
+    /// Immutable `public.route_versions.id` captured with the matched runtime
+    /// definition. This is a nullable BIGINT ledger identity, deliberately
+    /// distinct from the mutable route revision used for optimistic
+    /// concurrency. `None` means no route matched or the ledger was
+    /// unavailable/legacy at route-cache refresh time; it is never synthesized
+    /// from `route_id` or a revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_version_id: Option<i64>,
     pub latency_ms: i32,
     pub upstream_latency_ms: Option<i32>,
     pub status: i32,
@@ -132,7 +162,7 @@ pub struct RequestLogRow {
     #[serde(default)]
     pub batch_forgone_usd: f64,
     /// `true` when a matched route's rewrite was suppressed by a sticky pause
-    /// (research Phase 2.3 auto-pause / `POST /v1/routes/:id/pause`): the
+    /// (research Phase 2.3 auto-pause / `POST /v1/routes/:id/pause?expected_revision=N`): the
     /// request flowed to the ORIGINALLY-requested model with every cost lever
     /// off. The route still attributes (`route_id` is stamped) so paused
     /// traffic is auditable per route; cost == baseline on these rows (no
@@ -491,7 +521,9 @@ pub mod postgres {
                       compression_saved_usd, compression_tokens_removed,
                       doc_vision_saved_est_usd,
                       content_compress_saved_est_usd, content_compress_kind,
-                      l2_matched_entry_id, l2_similarity, l2_verdict)
+                      l2_matched_entry_id, l2_similarity, l2_verdict,
+                      flex_saved_usd, doc_compaction_saved_usd, summarizer_tax_usd,
+                      route_version_id, requested_model)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -515,11 +547,13 @@ pub mod postgres {
                       $43, $44,
                       $45,
                       $46, $47,
-                      $48, $49, $50)"#;
+                      $48, $49, $50,
+                      $51, $52, $53,
+                      $54, $55)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 50;
+    pub const INSERT_BIND_COUNT: usize = 55;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -575,6 +609,11 @@ pub mod postgres {
                 .bind(row.l2_matched_entry_id) // $48
                 .bind(row.l2_similarity) // $49
                 .bind(row.l2_verdict.as_deref()) // $50
+                .bind(row.flex_saved_usd) // $51
+                .bind(row.doc_compaction_saved_usd) // $52
+                .bind(row.summarizer_tax_usd) // $53
+                .bind(row.route_version_id) // $54
+                .bind(row.requested_model.as_deref()) // $55
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -656,6 +695,7 @@ mod tests {
             api_key_id: Uuid::nil(),
             ts: Utc::now(),
             provider: "openai".into(),
+            requested_model: None,
             model: "gpt-4o".into(),
             input_tokens: 100,
             output_tokens: 50,
@@ -664,9 +704,13 @@ mod tests {
             baseline_cost_usd: 0.0045,
             provider_cache_saved_usd: 0.0,
             cache_bust_penalty_usd: 0.0,
+            flex_saved_usd: 0.0,
+            doc_compaction_saved_usd: 0.0,
+            summarizer_tax_usd: 0.0,
             cached: false,
             cache_layer: None,
             route_id: None,
+            route_version_id: None,
             latency_ms: 800,
             upstream_latency_ms: Some(750),
             status: 200,
@@ -849,6 +893,52 @@ mod tests {
         // NULL-vs-0: a reported zero survives as Some(0), not None.
         assert_eq!(rows[1].cache_read_input_tokens, Some(0));
         assert_eq!(rows[1].cache_creation_input_tokens, None);
+    }
+
+    /// Immutable route-version provenance is additive: a live ledger BIGINT
+    /// survives the in-memory writer/serde boundary, while pre-0041 JSON that
+    /// omits it remains an honest NULL rather than acquiring a derived value.
+    #[tokio::test]
+    async fn route_version_provenance_round_trips_and_legacy_omits_to_null() {
+        let writer = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.route_version_id = Some(9_876_543_210);
+        writer.write(row.clone()).await.unwrap();
+
+        assert_eq!(writer.rows()[0].route_version_id, Some(9_876_543_210));
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("route_version_id"), "{json}");
+
+        let legacy = serde_json::to_string(&sample_row()).unwrap();
+        let decoded: RequestLogRow = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(
+            decoded.route_version_id, None,
+            "legacy request-log JSON must not fabricate a route version"
+        );
+    }
+
+    /// The caller-model snapshot is additive: a newly written row preserves
+    /// the exact pre-routing model, while legacy JSON that predates migration
+    /// 0042 remains NULL rather than deriving it from the final served model.
+    #[tokio::test]
+    async fn requested_model_snapshot_round_trips_and_legacy_omits_to_null() {
+        let writer = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.requested_model = Some("gpt-4o".into());
+        row.model = "gpt-4o-mini".into();
+        writer.write(row.clone()).await.unwrap();
+
+        assert_eq!(writer.rows()[0].requested_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(writer.rows()[0].model, "gpt-4o-mini");
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("requested_model"), "{json}");
+
+        let legacy = serde_json::to_string(&sample_row()).unwrap();
+        let decoded: RequestLogRow = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(
+            decoded.requested_model, None,
+            "legacy request-log JSON must not infer a caller model from the served model"
+        );
     }
 
     /// Legacy JSON (rows serialized before migration 0015) deserializes with

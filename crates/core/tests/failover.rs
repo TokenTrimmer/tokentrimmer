@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use futures::stream::BoxStream;
@@ -40,9 +40,27 @@ struct MockProvider {
     /// `true` → always 503 (fallback-eligible); `false` → 200.
     fails: bool,
     calls: Arc<AtomicUsize>,
+    /// Per-provider pricing lets the failover ceiling tests distinguish a
+    /// cheap primary from an expensive fallback.
+    pricing: ModelPricing,
     /// Usage override for the 200 response; `None` → a plain 10/5/15 block
     /// with no provider-cache report.
     usage: Option<Usage>,
+}
+
+fn mock_pricing(input_per_million: f64, output_per_million: f64) -> ModelPricing {
+    ModelPricing {
+        input_per_million,
+        output_per_million,
+        cached_input_per_million: None,
+        cache_write_per_million: None,
+        batch_input_per_million: None,
+        batch_output_per_million: None,
+        flex_input_per_million: None,
+        flex_output_per_million: None,
+        prompt_cache_min_tokens: None,
+        effective_at: Utc::now(),
+    }
 }
 
 #[async_trait]
@@ -56,25 +74,14 @@ impl Provider for MockProvider {
             .map(|m| ModelInfo {
                 id: (*m).to_string(),
                 provider: self.id.to_string(),
-                capabilities: vec![Capability::Text],
+                capabilities: vec![Capability::Text, Capability::Streaming],
                 max_input_tokens: 128_000,
                 max_output_tokens: 4096,
             })
             .collect()
     }
     fn pricing(&self, _model: &str) -> Option<ModelPricing> {
-        Some(ModelPricing {
-            input_per_million: 0.1,
-            output_per_million: 0.1,
-            cached_input_per_million: None,
-            cache_write_per_million: None,
-            batch_input_per_million: None,
-            batch_output_per_million: None,
-            flex_input_per_million: None,
-            flex_output_per_million: None,
-            prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
-        })
+        Some(self.pricing.clone())
     }
     async fn chat_completion(
         &self,
@@ -117,7 +124,16 @@ impl Provider for MockProvider {
         _req: ChatCompletionRequest,
         _ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
-        Err(ProviderError::Unsupported("no streaming".into()))
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if self.fails {
+            return Err(ProviderError::ProviderUpstream {
+                status: 503,
+                message: "primary is down".into(),
+            });
+        }
+        Ok(Box::pin(futures::stream::empty::<
+            Result<ChatCompletionChunk, ProviderError>,
+        >()))
     }
     async fn embeddings(
         &self,
@@ -131,6 +147,10 @@ impl Provider for MockProvider {
 /// Seed a route under `DOGFOOD_ORG_ID` that rewrites `gpt-4o` → `primary-model`
 /// with `fallbacks: [fallback-model]`.
 fn failover_routing_store() -> Arc<CachingRoutingStore> {
+    failover_routing_store_with_ceiling(None)
+}
+
+fn failover_routing_store_with_ceiling(max_cost_usd: Option<f64>) -> Arc<CachingRoutingStore> {
     let backing = Arc::new(InMemoryRoutingStore::new());
     backing.set_routes(
         DOGFOOD_ORG_ID,
@@ -159,7 +179,7 @@ fn failover_routing_store() -> Arc<CachingRoutingStore> {
                 target_model: Some("primary-model".into()),
                 fallbacks: vec!["fallback-model".into()],
                 disable_cache: false,
-                max_cost_usd: None,
+                max_cost_usd,
                 flex: false,
                 batch: false,
                 compress: false,
@@ -190,6 +210,32 @@ fn short_request() -> Request<Body> {
         .unwrap()
 }
 
+fn capped_request(stream: bool) -> Request<Body> {
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 100,
+        "stream": stream,
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn error_code(resp: axum::response::Response) -> String {
+    let bytes = to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("error response body");
+    serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON error response")["error"]
+        ["code"]
+        .as_str()
+        .expect("error code")
+        .to_owned()
+}
+
 #[tokio::test]
 async fn fails_over_to_fallback_when_primary_returns_503() {
     let primary_calls = Arc::new(AtomicUsize::new(0));
@@ -203,6 +249,7 @@ async fn fails_over_to_fallback_when_primary_returns_503() {
         models: &["gpt-4o", "primary-model"],
         fails: true,
         calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
         usage: None,
     }));
     registry.register(Arc::new(MockProvider {
@@ -210,6 +257,7 @@ async fn fails_over_to_fallback_when_primary_returns_503() {
         models: &["fallback-model"],
         fails: false,
         calls: Arc::clone(&fallback_calls),
+        pricing: mock_pricing(0.1, 0.1),
         usage: None,
     }));
 
@@ -257,6 +305,7 @@ async fn uses_primary_and_skips_fallback_when_primary_healthy() {
         models: &["gpt-4o", "primary-model"],
         fails: false,
         calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
         usage: None,
     }));
     registry.register(Arc::new(MockProvider {
@@ -264,6 +313,7 @@ async fn uses_primary_and_skips_fallback_when_primary_healthy() {
         models: &["fallback-model"],
         fails: false,
         calls: Arc::clone(&fallback_calls),
+        pricing: mock_pricing(0.1, 0.1),
         usage: None,
     }));
 
@@ -311,6 +361,7 @@ async fn failover_logs_fallback_providers_cache_token_counts() {
         models: &["gpt-4o", "primary-model"],
         fails: true,
         calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
         usage: None,
     }));
     registry.register(Arc::new(MockProvider {
@@ -318,6 +369,7 @@ async fn failover_logs_fallback_providers_cache_token_counts() {
         models: &["fallback-model"],
         fails: false,
         calls: Arc::clone(&fallback_calls),
+        pricing: mock_pricing(0.1, 0.1),
         usage: Some(Usage {
             prompt_tokens: 10,
             completion_tokens: 5,
@@ -355,10 +407,115 @@ async fn failover_logs_fallback_providers_cache_token_counts() {
     );
     assert_eq!(row.model, "fallback-model");
     assert_eq!(
+        row.requested_model.as_deref(),
+        Some("gpt-4o"),
+        "the row must retain the pre-routing caller model, not the fallback served model"
+    );
+    assert_eq!(
         row.cache_read_input_tokens,
         Some(8),
         "fallback provider's raw cache reads must be persisted"
     );
     assert_eq!(row.cache_creation_input_tokens, Some(2));
     assert_eq!(row.cached_tokens, 8);
+}
+
+/// A route ceiling must remain in force for every failover candidate. The
+/// cheap routed primary is allowed to establish its 503; the known-priced,
+/// expensive fallback must be rejected before any upstream dispatch.
+#[tokio::test]
+async fn route_cost_ceiling_blocks_priced_fallback_after_primary_503() {
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockProvider {
+        id: "primary",
+        models: &["gpt-4o", "primary-model"],
+        fails: true,
+        calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
+        usage: None,
+    }));
+    registry.register(Arc::new(MockProvider {
+        id: "expensive-fallback",
+        models: &["fallback-model"],
+        fails: false,
+        calls: Arc::clone(&fallback_calls),
+        pricing: mock_pricing(0.1, 1_000.0),
+        usage: None,
+    }));
+
+    let app = build_router(
+        AppState::new(registry)
+            .with_routing_store(failover_routing_store_with_ceiling(Some(0.001)))
+            .with_dogfood_enabled(),
+    );
+
+    let resp = app.oneshot(capped_request(false)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "the expensive fallback must be rejected with the normal cost error"
+    );
+    assert_eq!(error_code(resp).await, "cost_limit_exceeded");
+    assert!(
+        primary_calls.load(Ordering::Relaxed) >= 1,
+        "the cheap primary must have been attempted first"
+    );
+    assert_eq!(
+        fallback_calls.load(Ordering::Relaxed),
+        0,
+        "an over-ceiling fallback must not receive an upstream request"
+    );
+}
+
+/// The same guard must apply while establishing an SSE response. Failover is
+/// only permitted before the first chunk, so the expensive candidate must be
+/// denied with a normal HTTP 402 instead of opening an SSE stream.
+#[tokio::test]
+async fn route_cost_ceiling_blocks_priced_fallback_during_stream_establishment() {
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockProvider {
+        id: "primary",
+        models: &["gpt-4o", "primary-model"],
+        fails: true,
+        calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
+        usage: None,
+    }));
+    registry.register(Arc::new(MockProvider {
+        id: "expensive-fallback",
+        models: &["fallback-model"],
+        fails: false,
+        calls: Arc::clone(&fallback_calls),
+        pricing: mock_pricing(0.1, 1_000.0),
+        usage: None,
+    }));
+
+    let app = build_router(
+        AppState::new(registry)
+            .with_routing_store(failover_routing_store_with_ceiling(Some(0.001)))
+            .with_dogfood_enabled(),
+    );
+
+    let resp = app.oneshot(capped_request(true)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "the costly fallback must be denied before stream establishment"
+    );
+    assert_eq!(error_code(resp).await, "cost_limit_exceeded");
+    assert!(
+        primary_calls.load(Ordering::Relaxed) >= 1,
+        "the cheap primary must have been attempted first"
+    );
+    assert_eq!(
+        fallback_calls.load(Ordering::Relaxed),
+        0,
+        "an over-ceiling fallback must not receive a stream-establishment call"
+    );
 }

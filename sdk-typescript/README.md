@@ -80,7 +80,7 @@ The class is an `openai.OpenAI` subclass — every other method (`embeddings`, `
 
 ### `openai` version compatibility
 
-`openai` is a **peer dependency** (`^6.44.0`). Install it alongside this package —
+`openai` is a **peer dependency** (`^6.45.0`). Install it alongside this package —
 your copy is the one that gets used, with no risk of a duplicate instance in the tree.
 Because `TokenTrimmer` subclasses `openai.OpenAI`, sharing a single copy is required
 for correct subclassing and TypeScript types. The package is developed and tested

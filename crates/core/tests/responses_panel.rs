@@ -156,6 +156,7 @@ async fn responses_tt_extras_passthrough_returns_200_not_400() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_output_tokens": 64,
                 "input": [{"role": "user", "content": "hello"}],
                 "tt_extras": {
                     "panel": {
@@ -245,6 +246,7 @@ async fn responses_panel_render_body_has_tokentrimmer_panel() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_output_tokens": 64,
                 "input": [{"role": "user", "content": "hello"}],
                 "tt_extras": {
                     "panel": {

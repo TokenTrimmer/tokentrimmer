@@ -15,7 +15,7 @@
 //!
 //! `engine::run_workflow` accepts a *synchronous* `FnMut(NodeJournalEntry)` so
 //! it can be called from a normal `async fn` without the async-closure complexity.
-//! `store::insert_node_run` is async. Solution: collect journal entries into a
+//! `node_run_store::insert_node_run` is async. Solution: collect journal entries into a
 //! `Vec` inside the sync closure, then loop + `await` each one **after**
 //! `run_workflow` returns. Best-effort: a DB error never fails the run response.
 //!
@@ -23,7 +23,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -32,6 +32,7 @@ use axum::{
 };
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tt_auth::ApiKeyContext;
 use uuid::Uuid;
 
@@ -40,12 +41,20 @@ use crate::{
     routes::chat::{CompletionHeaders, CompletionOutcome, CostBreakdown, Prepared},
     workflow::{
         self,
+        activation::{
+            resolve_workflow_execution_definition, workflow_execution_selector,
+            ResolvedWorkflowRelease, WorkflowExecutionEnvironment,
+        },
         engine::{self, WfStatus},
         estimate,
-        events::WfEvent,
+        events::{WfEvent, WorkflowRunStartEnvironment, WorkflowRunStartRelease},
         executor::GatewayNodeExecutor,
-        secrets::{is_valid_secret_name, load_secrets, master_key_from_env, store_secret},
-        store::{self, WorkflowRunRecord},
+        node_run_store,
+        secrets::{
+            delete_secret, is_valid_secret_name, list_secret_rows, load_secrets,
+            master_key_from_env, store_secret,
+        },
+        store::{self, WorkflowRunRecord, WorkflowRunReleaseProvenance},
         types::content_hash,
         validate,
     },
@@ -75,17 +84,51 @@ fn db_pool(state: &AppState) -> ApiResult<&sqlx::PgPool> {
     })
 }
 
+/// Invocation surfaces sharing workflow execution must all pass this gate
+/// before they allocate a run record or construct an executor. The static
+/// check is intentionally only admission; the engine separately performs
+/// in-memory per-node reservation/settlement for an admitted capped run, but
+/// neither layer is a provider-invoice ceiling.
+#[derive(Clone, Copy)]
+enum WorkflowBudgetAdmissionPath {
+    Direct,
+    Detour,
+    Shadow,
+}
+
+fn admit_workflow_budget_before_dispatch_with_variables(
+    path: WorkflowBudgetAdmissionPath,
+    def: &workflow::types::WorkflowDefinition,
+    inputs: &serde_json::Value,
+    variables: &BTreeMap<String, String>,
+    max_cost_usd: Option<f64>,
+) -> Result<(), String> {
+    let subject = match path {
+        WorkflowBudgetAdmissionPath::Direct => "this run",
+        WorkflowBudgetAdmissionPath::Detour => "this route",
+        WorkflowBudgetAdmissionPath::Shadow => "shadow run",
+    };
+    estimate::admit_budgeted_workflow_with_variables(def, inputs, variables, max_cost_usd).map_err(
+        |error| format!("workflow budget admission rejected {subject} before dispatch: {error}"),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
 
-/// `POST /v1/workflows` request body.  Both `id` and `version` are optional:
-/// if `id` is absent a new `UUIDv4` is generated; `version` is ignored (the
-/// store computes the next version atomically via `MAX(version)+1`).
+/// `POST /v1/workflows` request body. `id` and `version` are optional: if `id`
+/// is absent a new `UUIDv4` is generated, while `version` remains ignored.
+/// `expected_latest_version` is a write-only optimistic precondition: `0`
+/// requires no retained version, and a positive value must match the current
+/// latest version before the immutable next version is appended.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct CreateWorkflowRequest {
     pub id: Option<Uuid>,
     pub version: Option<u32>,
+    pub expected_latest_version: Option<u32>,
     pub name: String,
     pub nodes: Vec<workflow::types::Node>,
     pub edges: Vec<workflow::types::Edge>,
@@ -101,6 +144,45 @@ pub struct CreateWorkflowRequest {
     /// defaulted so a save without it (an older editor) is unchanged.
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Out-of-band workflow invokers (schedule and signed webhook).  These
+    /// must round-trip on every definition update: dropping them silently
+    /// disables production automations.
+    #[serde(default)]
+    pub triggers: Vec<workflow::types::WorkflowTrigger>,
+}
+
+fn expected_latest_workflow_version(value: Option<u32>) -> Result<Option<i32>, ApiError> {
+    value
+        .map(|version| {
+            i32::try_from(version).map_err(|_| {
+                ApiError::InvalidRequest(format!(
+                    "expected_latest_version must be between 0 and {}",
+                    i32::MAX
+                ))
+            })
+        })
+        .transpose()
+}
+
+impl CreateWorkflowRequest {
+    /// Turn the public write contract into the canonical persisted definition.
+    /// Keeping this conversion in one tested place prevents a newly added
+    /// top-level definition field from being accepted by the API and then
+    /// silently discarded on update.
+    fn into_definition(self) -> workflow::WorkflowDefinition {
+        workflow::WorkflowDefinition {
+            id: self.id.unwrap_or_else(Uuid::new_v4),
+            version: self.version.unwrap_or(0),
+            name: self.name,
+            nodes: self.nodes,
+            edges: self.edges,
+            inputs: self.inputs,
+            budget: self.budget,
+            allowed_hosts: self.allowed_hosts,
+            metadata: self.metadata,
+            triggers: self.triggers,
+        }
+    }
 }
 
 /// Response from `POST /v1/workflows`.
@@ -129,16 +211,38 @@ pub struct WorkflowDefMetaView {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+struct LoadedRouteWorkflow {
+    definition: workflow::types::WorkflowDefinition,
+    version: i32,
+    release: Option<ResolvedWorkflowRelease>,
+    variables: BTreeMap<String, String>,
+}
+
 /// `POST /v1/workflows/:id/estimate` request body.
 #[derive(Debug, Deserialize)]
 pub struct EstimateRequest {
     #[serde(default)]
     pub inputs: serde_json::Value,
+    /// Optional immutable definition version to estimate. When omitted, the
+    /// latest version is used for backward compatibility.
+    #[serde(default, alias = "version")]
+    pub workflow_version: Option<i32>,
+    /// Optional current release pointer to estimate. Mutually exclusive with
+    /// `workflow_version`; the exact resolved version is immutable afterward.
+    #[serde(default)]
+    pub workflow_environment: Option<WorkflowExecutionEnvironment>,
 }
 
 /// `POST /v1/workflows/:id/estimate` response.
 #[derive(Debug, Serialize)]
 pub struct EstimateResponse {
+    pub workflow_version: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_environment: Option<WorkflowExecutionEnvironment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_revision: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables_revision: Option<i32>,
     pub projected_cost_usd: f64,
     pub per_node: Vec<NodeEstimateView>,
     pub warnings: Vec<String>,
@@ -157,6 +261,27 @@ pub struct NodeEstimateView {
 pub struct CreateRunRequest {
     #[serde(default)]
     pub inputs: serde_json::Value,
+    /// Optional immutable definition version to execute. When omitted, a fresh
+    /// invocation selects the latest version; an `Idempotency-Key` replay keeps
+    /// the version accepted by the original request.
+    #[serde(default, alias = "version")]
+    pub workflow_version: Option<i32>,
+    /// Optional current environment release to execute when supplied alone.
+    /// Durable automatic delivery combines it with the complete frozen
+    /// version/release/variables tuple; it does not change trigger defaults.
+    #[serde(default)]
+    pub workflow_environment: Option<WorkflowExecutionEnvironment>,
+    /// Exact immutable release revision for a durably accepted automatic
+    /// invocation. This is valid only as part of the complete frozen selector
+    /// with `workflow_version`, `workflow_environment`, and
+    /// `variables_revision`.
+    #[serde(default)]
+    pub release_revision: Option<i32>,
+    /// Exact immutable non-secret variable snapshot for a durably accepted
+    /// automatic invocation. Revision `0` is the implicit empty set. This is
+    /// valid only as part of the complete frozen selector.
+    #[serde(default)]
+    pub variables_revision: Option<i32>,
     /// Optional run-level USD budget cap. Superseded by
     /// `def.budget.max_cost_usd` when that is set.
     #[serde(default)]
@@ -171,11 +296,28 @@ pub struct CreateRunRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateRunResponse {
     pub run_id: Uuid,
+    pub workflow_version: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_environment: Option<WorkflowExecutionEnvironment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_revision: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables_revision: Option<i32>,
     pub status: String,
     pub cost_usd: f64,
     pub baseline_cost_usd: f64,
     pub saved_usd: f64,
     pub node_outputs: Vec<NodeOutputView>,
+}
+
+/// Private additive replay envelope. Keeping this separate from the public
+/// [`CreateRunResponse`] preserves Rust callers that construct the normal
+/// response type while making replay status explicit on the HTTP wire.
+#[derive(Debug, Serialize)]
+struct CreateRunReplayResponse {
+    #[serde(flatten)]
+    run: CreateRunResponse,
+    replayed: bool,
 }
 
 /// Per-node output inside [`CreateRunResponse`].
@@ -186,6 +328,224 @@ pub struct NodeOutputView {
     pub cost_usd: f64,
 }
 
+/// Standard header used to bind a retried logical invocation to its original
+/// gateway run. The raw value is validated here and hashed before persistence.
+const WORKFLOW_RUN_IDEMPOTENCY_HEADER: &str = "idempotency-key";
+const MAX_WORKFLOW_RUN_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
+/// Extract an optional stable invocation key without changing legacy callers:
+/// no `Idempotency-Key` retains the historical fresh-run behavior.
+fn workflow_run_idempotency_key(headers: &HeaderMap) -> ApiResult<Option<String>> {
+    let Some(value) = headers.get(WORKFLOW_RUN_IDEMPOTENCY_HEADER) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::InvalidRequest("Idempotency-Key must be valid visible text".into())
+    })?;
+    if value.trim().is_empty()
+        || value.len() > MAX_WORKFLOW_RUN_IDEMPOTENCY_KEY_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ApiError::InvalidRequest(format!(
+            "Idempotency-Key must be 1..={MAX_WORKFLOW_RUN_IDEMPOTENCY_KEY_BYTES} visible bytes"
+        )));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// A duplicate logical invocation is a status/reconciliation response, never
+/// another workflow execution. The existing run endpoint remains the durable
+/// detail/status surface; `node_outputs` is intentionally empty here because a
+/// replay may arrive while the original run is still executing.
+fn workflow_run_replay_response(run: WorkflowRunRecord) -> Response {
+    let status = if run.finished_at.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    let selected_release = run.release;
+    let mut response = (
+        status,
+        Json(CreateRunReplayResponse {
+            run: CreateRunResponse {
+                run_id: run.id,
+                workflow_version: run.version,
+                workflow_environment: selected_release
+                    .map(|release| WorkflowExecutionEnvironment::from_store(release.environment)),
+                release_revision: selected_release.map(|release| release.revision),
+                variables_revision: selected_release.map(|release| release.variables_revision),
+                status: run.status,
+                cost_usd: run.cost_usd,
+                baseline_cost_usd: run.baseline_cost_usd,
+                saved_usd: run.saved_usd,
+                node_outputs: vec![],
+            },
+            replayed: true,
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("idempotent-replay", HeaderValue::from_static("true"));
+    response
+}
+
+fn validate_workflow_run_idempotency_binding(
+    existing: &store::WorkflowRunIdempotencyBinding,
+    requested_workflow_version: Option<i32>,
+    input_hash: &[u8; 32],
+    request_options_hash: &[u8; 32],
+) -> ApiResult<()> {
+    if let Some(requested) = requested_workflow_version {
+        if requested != existing.workflow_version {
+            return Err(ApiError::Conflict(
+                "Idempotency-Key is already bound to a different workflow_version".into(),
+            ));
+        }
+    }
+    if &existing.input_hash != input_hash {
+        return Err(ApiError::Conflict(
+            "Idempotency-Key is already bound to different workflow inputs".into(),
+        ));
+    }
+    if &existing.request_options_hash != request_options_hash {
+        return Err(ApiError::Conflict(
+            "Idempotency-Key is already bound to different execution options".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a mapped run strictly. A malformed or temporarily unreadable mapping
+/// must fail closed; treating it as a miss would permit a duplicate paid run.
+async fn resolve_idempotent_workflow_run(
+    pool: &sqlx::PgPool,
+    org: Uuid,
+    workflow_id: Uuid,
+    binding: &store::WorkflowRunIdempotencyBinding,
+) -> ApiResult<Response> {
+    let run = store::get_run_strict(pool, binding.run_id, org)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                workflow_id = %workflow_id,
+                run_id = %binding.run_id,
+                error = %error,
+                "idempotent workflow run lookup failed; refusing duplicate execution"
+            );
+            ApiError::ServiceUnavailable(
+                "existing idempotent workflow run is temporarily unavailable; retry its status lookup"
+                    .into(),
+            )
+        })?
+        .ok_or_else(|| {
+            tracing::error!(
+                workflow_id = %workflow_id,
+                run_id = %binding.run_id,
+                "idempotent workflow mapping has no readable run; refusing duplicate execution"
+            );
+            ApiError::ServiceUnavailable(
+                "existing idempotent workflow run is unavailable; retry its status lookup".into(),
+            )
+        })?;
+    if run.workflow_id != workflow_id || run.version != binding.workflow_version {
+        tracing::error!(
+            workflow_id = %workflow_id,
+            run_id = %run.id,
+            expected_version = binding.workflow_version,
+            actual_workflow_id = %run.workflow_id,
+            actual_version = run.version,
+            "idempotent workflow mapping/run invariant failed; refusing duplicate execution"
+        );
+        return Err(ApiError::ServiceUnavailable(
+            "existing idempotent workflow run is inconsistent; retry its status lookup".into(),
+        ));
+    }
+    Ok(workflow_run_replay_response(run))
+}
+
+#[cfg(test)]
+mod workflow_run_idempotency_contract_tests {
+    use super::*;
+
+    fn binding() -> store::WorkflowRunIdempotencyBinding {
+        store::WorkflowRunIdempotencyBinding {
+            run_id: Uuid::from_u128(7),
+            workflow_version: 3,
+            input_hash: [1; 32],
+            request_options_hash: [2; 32],
+        }
+    }
+
+    #[test]
+    fn legacy_callers_without_idempotency_key_remain_unmodified() {
+        assert_eq!(
+            workflow_run_idempotency_key(&HeaderMap::new()).expect("no header is valid"),
+            None
+        );
+    }
+
+    #[test]
+    fn idempotency_key_rejects_blank_or_oversized_values() {
+        let mut blank = HeaderMap::new();
+        blank.insert(
+            WORKFLOW_RUN_IDEMPOTENCY_HEADER,
+            HeaderValue::from_static("   "),
+        );
+        assert!(matches!(
+            workflow_run_idempotency_key(&blank),
+            Err(ApiError::InvalidRequest(_))
+        ));
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            WORKFLOW_RUN_IDEMPOTENCY_HEADER,
+            HeaderValue::from_str(&"a".repeat(MAX_WORKFLOW_RUN_IDEMPOTENCY_KEY_BYTES + 1))
+                .expect("ASCII header value"),
+        );
+        assert!(matches!(
+            workflow_run_idempotency_key(&oversized),
+            Err(ApiError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn replay_binding_accepts_the_same_request_and_rejects_drift() {
+        let existing = binding();
+        assert!(
+            validate_workflow_run_idempotency_binding(&existing, Some(3), &[1; 32], &[2; 32],)
+                .is_ok()
+        );
+        // Omitting a version is a retry of the first accepted immutable version,
+        // not a request to silently switch to whatever version is latest now.
+        assert!(
+            validate_workflow_run_idempotency_binding(&existing, None, &[1; 32], &[2; 32]).is_ok()
+        );
+        assert!(matches!(
+            validate_workflow_run_idempotency_binding(&existing, Some(4), &[1; 32], &[2; 32]),
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            validate_workflow_run_idempotency_binding(&existing, Some(3), &[9; 32], &[2; 32]),
+            Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            validate_workflow_run_idempotency_binding(&existing, Some(3), &[1; 32], &[8; 32]),
+            Err(ApiError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn workflow_version_must_be_positive_when_present() {
+        assert!(workflow_execution_selector(None, None, None, None).is_ok());
+        assert!(workflow_execution_selector(Some(1), None, None, None).is_ok());
+        assert!(matches!(
+            workflow_execution_selector(Some(0), None, None, None),
+            Err(ApiError::InvalidRequest(_))
+        ));
+    }
+}
+
 /// `POST /v1/workflows/secrets` request body.
 #[derive(Debug, Deserialize)]
 pub struct SetWorkflowSecretRequest {
@@ -194,13 +554,43 @@ pub struct SetWorkflowSecretRequest {
     pub value: String,
 }
 
+const WORKFLOW_SECRET_INVENTORY_LIMIT: usize = 500;
+const MAX_WORKFLOW_SECRET_VALUE_BYTES: usize = 64 * 1024;
+
+/// Safe secret metadata for management and workflow pickers. `ready` means
+/// only that the stored ciphertext decrypts with this gateway's current master
+/// key; it does not validate the credential with any downstream provider.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSecretState {
+    Ready,
+    Unusable,
+    Unavailable,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowSecretView {
+    pub name: String,
+    pub state: WorkflowSecretState,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListWorkflowSecretsResponse {
+    pub object: &'static str,
+    pub data: Vec<WorkflowSecretView>,
+    pub truncated: bool,
+}
+
 // ---------------------------------------------------------------------------
 // POST /v1/workflows — create / update a workflow definition
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/workflows` — validate + store a workflow definition.
 ///
-/// Ordering: `require_org` → assemble def → `validate` (400) →
+/// Ordering: `require_org` → validate the optional write precondition →
+/// assemble def → `validate` (400) →
 /// `db_pool` (503) → `insert_definition`.  This lets callers see a useful
 /// validation error without needing a live database.
 pub async fn create(
@@ -209,22 +599,11 @@ pub async fn create(
     Json(body): Json<CreateWorkflowRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateWorkflowResponse>)> {
     let org = require_org(ctx)?;
+    let expected_latest_version = expected_latest_workflow_version(body.expected_latest_version)?;
 
-    // Assemble a full WorkflowDefinition from the request body.
-    let def = workflow::WorkflowDefinition {
-        triggers: vec![],
-        id: body.id.unwrap_or_else(Uuid::new_v4),
-        version: body.version.unwrap_or(0),
-        name: body.name,
-        nodes: body.nodes,
-        edges: body.edges,
-        inputs: body.inputs,
-        budget: body.budget,
-        allowed_hosts: body.allowed_hosts,
-        // WF-3: forward editor metadata (canvas positions) through to the stored
-        // definition. Body.metadata defaults to Null when the editor omits it.
-        metadata: body.metadata,
-    };
+    // Assemble a full WorkflowDefinition from the request body.  The conversion
+    // deliberately carries every accepted top-level field, including triggers.
+    let def = body.into_definition();
 
     // Validate first — returns 400 with the full error list before any DB call.
     let registry = state.registry.clone();
@@ -235,7 +614,7 @@ pub async fn create(
     let pool = db_pool(&state)?;
 
     let hash = content_hash(&def);
-    let version = store::insert_definition(pool, org, &def, &hash)
+    let version = store::insert_definition(pool, org, &def, &hash, expected_latest_version)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -247,7 +626,7 @@ pub async fn create(
         })?
         .ok_or_else(|| {
             ApiError::Conflict(format!(
-                "workflow id {} version conflict: a concurrent insert won the race; retry",
+                "workflow id {} version conflict: the expected latest version was stale or a concurrent insert won; reload before retrying",
                 def.id
             ))
         })?;
@@ -323,7 +702,8 @@ pub async fn get(
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/workflows/:id/estimate` — return a static pre-run cost projection
-/// for the workflow's latest definition.  No model calls are made.
+/// for an exact requested version, or latest when omitted. No model calls are
+/// made.
 pub async fn estimate(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,
@@ -333,13 +713,18 @@ pub async fn estimate(
     let org = require_org(ctx)?;
     let pool = db_pool(&state)?;
 
-    let (def, _version) = store::get_definition(pool, org, id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))?;
+    let selector =
+        workflow_execution_selector(body.workflow_version, body.workflow_environment, None, None)?;
+    let (def, version, release, variables) =
+        resolve_workflow_execution_definition(pool, org, id, selector).await?;
 
-    let est = estimate::estimate_workflow(&def, &body.inputs);
+    let est = estimate::estimate_workflow_with_variables(&def, &body.inputs, &variables);
 
     Ok(Json(EstimateResponse {
+        workflow_version: version,
+        workflow_environment: release.map(|release| release.environment),
+        release_revision: release.map(|release| release.revision),
+        variables_revision: release.map(|release| release.variables_revision),
         projected_cost_usd: est.projected_cost_usd,
         per_node: est
             .per_node
@@ -369,7 +754,7 @@ async fn persist_run_results(
     result: &engine::WorkflowRunResult,
 ) -> &'static str {
     for entry in journal {
-        store::insert_node_run(
+        node_run_store::insert_node_run(
             pool,
             run_id,
             &entry.node_id,
@@ -378,6 +763,8 @@ async fn persist_run_results(
             entry.cost_usd,
             entry.model_used.as_deref(),
             entry.error.as_deref(),
+            entry.started_at,
+            entry.finished_at,
         )
         .await;
     }
@@ -409,7 +796,8 @@ async fn persist_run_results(
 /// per-turn-judge precedent at `agent_run.rs:2091`, which re-dispatches the
 /// ORIGINAL request to its source provider for the reference answer). The
 /// verdict is written to `workflow_runs.quality_verdict` via
-/// [`store::upsert_quality_verdict`] (the cloud mint reads it to sign `wfr:v2`).
+/// [`store::upsert_quality_verdict`] (the cloud mint reads it for the current
+/// quality-bearing workflow receipt version).
 ///
 /// **Fail-open + opt-in:** off by default (`judge_config.sample_rate == 0`); a
 /// judge error / timeout / disabled-config records `NotSampled` (nothing
@@ -590,45 +978,163 @@ pub async fn create_run(
         .to_string();
 
     let pool = db_pool(&state)?;
+    let CreateRunRequest {
+        inputs,
+        workflow_version: requested_workflow_version,
+        workflow_environment: requested_workflow_environment,
+        release_revision: requested_release_revision,
+        variables_revision: requested_variables_revision,
+        max_cost_usd,
+        stream,
+    } = body;
+    let selector = workflow_execution_selector(
+        requested_workflow_version,
+        requested_workflow_environment,
+        requested_release_revision,
+        requested_variables_revision,
+    )?;
 
-    // --- Load + defense-in-depth validate -----------------------------------
-    let (def, version) = store::get_definition(pool, org, id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))?;
+    // A supplied key is resolved before reading the latest definition. That is
+    // what lets a lost response safely reconcile to its original immutable
+    // version after an editor has saved a newer one.
+    let idempotency_key = workflow_run_idempotency_key(&headers)?;
+    if selector.frozen_release().is_some() && idempotency_key.is_none() {
+        return Err(ApiError::InvalidRequest(
+            "a frozen workflow release invocation requires Idempotency-Key".into(),
+        ));
+    }
+    let input_hash = store::workflow_run_input_hash(&inputs).map_err(|error| {
+        ApiError::InvalidRequest(format!("workflow inputs cannot be canonicalized: {error}"))
+    })?;
+    let request_options_hash = match selector.frozen_release() {
+        Some((workflow_version, release)) => store::workflow_run_exact_activation_options_hash(
+            max_cost_usd,
+            workflow_version,
+            release,
+        ),
+        None => store::workflow_run_request_options_hash(
+            max_cost_usd,
+            requested_workflow_environment.map(WorkflowExecutionEnvironment::as_store),
+        ),
+    }
+    .map_err(|error| {
+        ApiError::InvalidRequest(format!(
+            "workflow execution options cannot be canonicalized: {error}"
+        ))
+    })?;
+    let idempotency_key_hash = idempotency_key
+        .as_deref()
+        .map(|key| store::workflow_run_invocation_key_hash(org, id, key));
+
+    if let Some(key_hash) = idempotency_key_hash.as_ref() {
+        let existing = store::get_workflow_run_idempotency(pool, org, id, key_hash)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    workflow_id = %id,
+                    error = %error,
+                    "workflow idempotency lookup failed; refusing duplicate execution"
+                );
+                ApiError::ServiceUnavailable(
+                    "workflow idempotency storage is temporarily unavailable; retry".into(),
+                )
+            })?;
+        if let Some(existing) = existing {
+            validate_workflow_run_idempotency_binding(
+                &existing,
+                selector.requested_version(),
+                &input_hash,
+                &request_options_hash,
+            )?;
+            return resolve_idempotent_workflow_run(pool, org, id, &existing).await;
+        }
+    }
+
+    // --- Load the accepted immutable version + defense-in-depth validate ----
+    let (def, version, release, variables) =
+        resolve_workflow_execution_definition(pool, org, id, selector).await?;
 
     {
         let registry = state.registry.clone();
-        validate::validate(&def, &|m| registry.resolve(m).is_some())
+        validate::validate_for_execution(&def, &|m| registry.resolve(m).is_some())
             .map_err(|errors| ApiError::InvalidRequest(errors.join("; ")))?;
     }
 
-    // --- Insert initial run record (status = "running") ----------------------
-    let run_id = Uuid::new_v4();
-    let run_max_cost = def.budget.max_cost_usd.or(body.max_cost_usd);
-    let inputs = body.inputs; // extract for ownership — moved/borrowed per branch below
-    store::insert_run(
-        pool,
-        &WorkflowRunRecord {
-            id: run_id,
-            workflow_id: def.id,
-            version,
-            org_id: org,
-            status: "running".to_string(),
-            inputs: Some(inputs.clone()),
-            cost_usd: 0.0,
-            max_cost_usd: run_max_cost,
-            baseline_cost_usd: 0.0,
-            saved_usd: 0.0,
-            error: None,
-            started_at: chrono::Utc::now(),
-            finished_at: None,
-        },
+    // --- Atomically claim a stable key + insert initial running record -------
+    let run_max_cost = def.budget.max_cost_usd.or(max_cost_usd);
+    admit_workflow_budget_before_dispatch_with_variables(
+        WorkflowBudgetAdmissionPath::Direct,
+        &def,
+        &inputs,
+        &variables,
+        run_max_cost,
     )
-    .await;
+    .map_err(ApiError::InvalidRequest)?;
+    let run_record = WorkflowRunRecord {
+        id: Uuid::new_v4(),
+        workflow_id: def.id,
+        version,
+        org_id: org,
+        release: release.map(|release| WorkflowRunReleaseProvenance {
+            environment: release.environment.as_store(),
+            revision: release.revision,
+            variables_revision: release.variables_revision,
+        }),
+        status: "running".to_string(),
+        inputs: Some(inputs.clone()),
+        cost_usd: 0.0,
+        max_cost_usd: run_max_cost,
+        baseline_cost_usd: 0.0,
+        saved_usd: 0.0,
+        error: None,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+    };
+    let run_id = if let Some(invocation_key_hash) = idempotency_key_hash {
+        let mapping = store::NewWorkflowRunIdempotency {
+            org_id: org,
+            workflow_id: def.id,
+            invocation_key_hash,
+            workflow_version: version,
+            input_hash,
+            request_options_hash,
+        };
+        match store::create_or_reuse_idempotent_run(pool, &mapping, &run_record)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    workflow_id = %id,
+                    error = %error,
+                    "workflow idempotency claim/create failed; refusing execution"
+                );
+                ApiError::ServiceUnavailable(
+                    "workflow idempotency storage is temporarily unavailable; retry".into(),
+                )
+            })? {
+            store::CreateOrReuseWorkflowRun::Created => run_record.id,
+            store::CreateOrReuseWorkflowRun::Existing(existing) => {
+                // A concurrent caller won after our initial lookup. An omitted
+                // version intentionally replays that first accepted version;
+                // an explicit different version is a conflict.
+                validate_workflow_run_idempotency_binding(
+                    &existing,
+                    selector.requested_version(),
+                    &input_hash,
+                    &request_options_hash,
+                )?;
+                return resolve_idempotent_workflow_run(pool, org, id, &existing).await;
+            }
+        }
+    } else {
+        // Backwards-compatible legacy path: no key still creates a fresh run
+        // and retains the existing best-effort journal behavior.
+        store::insert_run(pool, &run_record).await;
+        run_record.id
+    };
 
     // --- Load org secrets once (both sync + streaming paths) -----------------
-    // Empty map when TT_MASTER_KEY is absent — Http nodes without secrets work,
-    // {{secrets.*}} refs just resolve to "".
+    // Empty map when TT_MASTER_KEY is absent — workflows without Http secret
+    // refs still work; referenced secrets fail closed in the engine preflight.
     let secrets = match master_key_from_env() {
         Some(master) => load_secrets(pool, org, &master).await,
         None => std::collections::HashMap::new(),
@@ -638,7 +1144,7 @@ pub async fn create_run(
     // quality-gate spawn uses it to resolve the judge model's credentials.
     let raw_bearer_for_gate = raw_bearer.clone();
 
-    if !body.stream {
+    if !stream {
         // --- Synchronous path ------------------------------------------------
         let executor = GatewayNodeExecutor {
             state: &state,
@@ -651,7 +1157,7 @@ pub async fn create_run(
         };
         let mut journal_entries: Vec<engine::NodeJournalEntry> = Vec::new();
         let cache = engine::FlowDocDistillCache { org_id: org, pool };
-        let result = engine::run_workflow(
+        let result = engine::run_workflow_with_variables(
             &executor,
             &def,
             &inputs,
@@ -659,6 +1165,7 @@ pub async fn create_run(
             |entry| journal_entries.push(entry),
             None,
             &secrets,
+            &variables,
             0,
             &[],
             &cache,
@@ -685,6 +1192,10 @@ pub async fn create_run(
         }
         Ok(Json(CreateRunResponse {
             run_id,
+            workflow_version: version,
+            workflow_environment: release.map(|release| release.environment),
+            release_revision: release.map(|release| release.revision),
+            variables_revision: release.map(|release| release.variables_revision),
             status: status_str.to_string(),
             cost_usd: result.cost_usd,
             baseline_cost_usd: result.baseline_cost_usd,
@@ -707,12 +1218,27 @@ pub async fn create_run(
         // `secrets` was loaded before the branch so both paths share one DB call.
         let owned_state = state.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
-        // P0-8: emit `run.start { run_id }` BEFORE the engine runs, so the
-        // client's Seal-receipt affordance (which gates on run_id) is reachable
-        // during + after the run. The engine itself doesn't know run_id (it's
-        // minted here in the caller); the terminal `run.done` carries the
-        // totals. `let _ =` because a closed client socket is not a run failure.
-        let _ = tx.send(WfEvent::RunStart { run_id });
+        // P0-8: emit authoritative id/version/release provenance BEFORE the
+        // engine runs, so the client can validate the accepted execution target
+        // and wire up Seal-receipt before `run.done`. The nested release keeps
+        // environment+revision paired. `let _ =` because a closed client socket
+        // is not a run failure.
+        let workflow_release = release.map(|release| WorkflowRunStartRelease {
+            environment: match release.environment {
+                WorkflowExecutionEnvironment::Development => {
+                    WorkflowRunStartEnvironment::Development
+                }
+                WorkflowExecutionEnvironment::Staging => WorkflowRunStartEnvironment::Staging,
+                WorkflowExecutionEnvironment::Production => WorkflowRunStartEnvironment::Production,
+            },
+            revision: release.revision,
+            variables_revision: release.variables_revision,
+        });
+        let _ = tx.send(WfEvent::RunStart {
+            run_id,
+            workflow_version: version,
+            workflow_release,
+        });
         tokio::spawn(async move {
             let executor = GatewayNodeExecutor {
                 state: &owned_state,
@@ -737,7 +1263,7 @@ pub async fn create_run(
                 Some(c) => c,
                 None => &no_cache,
             };
-            let result = engine::run_workflow(
+            let result = engine::run_workflow_with_variables(
                 &executor,
                 &def,
                 &inputs,
@@ -745,6 +1271,7 @@ pub async fn create_run(
                 |entry| journal_entries.push(entry),
                 Some(&tx),
                 &secrets,
+                &variables,
                 0,
                 &[],
                 cache,
@@ -836,26 +1363,84 @@ fn last_user_message_text(req: &tt_shared::ChatCompletionRequest) -> serde_json:
     serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null)
 }
 
-/// Resolve identity + load + validate a workflow definition for a route detour.
-/// Shared by detour + shadow. Returns `(def, version)`.
+/// Resolve identity plus the exact accepted definition/configuration snapshot
+/// for a route detour. Shared by detour + shadow. An omitted environment keeps
+/// the legacy latest-definition behavior; an explicit environment resolves its
+/// current immutable release and variables before validation or provider work.
 async fn load_route_workflow(
     state: &AppState,
     ctx: &tt_shared::RequestContext,
     cfg: &tt_routing::RouteWorkflow,
-) -> ApiResult<(workflow::types::WorkflowDefinition, i32)> {
+) -> ApiResult<LoadedRouteWorkflow> {
     let pool = db_pool(state)?;
     let workflow_id = cfg.workflow_id.parse::<Uuid>().map_err(|_| {
         ApiError::InvalidRequest(format!("invalid workflow_id: {}", cfg.workflow_id))
     })?;
-    let (def, version) = store::get_definition(pool, ctx.org_id, workflow_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {workflow_id}")))?;
+    let selector = workflow_execution_selector(
+        None,
+        cfg.environment.map(WorkflowExecutionEnvironment::from),
+        None,
+        None,
+    )?;
+    let (definition, version, release, variables) =
+        resolve_workflow_execution_definition(pool, ctx.org_id, workflow_id, selector).await?;
     {
         let registry = state.registry.clone();
-        validate::validate(&def, &|m| registry.resolve(m).is_some())
+        validate::validate_for_execution(&definition, &|m| registry.resolve(m).is_some())
             .map_err(|errors| ApiError::InvalidRequest(errors.join("; ")))?;
     }
-    Ok((def, version))
+    Ok(LoadedRouteWorkflow {
+        definition,
+        version,
+        release,
+        variables,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_route_workflow_run(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    org_id: Uuid,
+    definition: &workflow::types::WorkflowDefinition,
+    version: i32,
+    release: Option<ResolvedWorkflowRelease>,
+    inputs: &serde_json::Value,
+    max_cost_usd: Option<f64>,
+) -> ApiResult<()> {
+    let record = WorkflowRunRecord {
+        id: run_id,
+        workflow_id: definition.id,
+        version,
+        org_id,
+        release: release.map(|release| WorkflowRunReleaseProvenance {
+            environment: release.environment.as_store(),
+            revision: release.revision,
+            variables_revision: release.variables_revision,
+        }),
+        status: "running".to_string(),
+        inputs: Some(inputs.clone()),
+        cost_usd: 0.0,
+        max_cost_usd,
+        baseline_cost_usd: 0.0,
+        saved_usd: 0.0,
+        error: None,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+    };
+    store::insert_run_required(pool, &record)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                %run_id,
+                workflow_id = %definition.id,
+                %error,
+                "route workflow run provenance insert failed; refusing dispatch"
+            );
+            ApiError::ServiceUnavailable(
+                "workflow run provenance is temporarily unavailable".into(),
+            )
+        })
 }
 
 /// Run a route-detour workflow in DETOUR mode: the workflow's final synthesized
@@ -868,7 +1453,13 @@ pub(crate) async fn complete_workflow(
     prep: Prepared,
     cfg: tt_routing::RouteWorkflow,
 ) -> ApiResult<CompletionOutcome> {
-    let (def, _version) = load_route_workflow(state, ctx, &cfg).await?;
+    let loaded = load_route_workflow(state, ctx, &cfg).await?;
+    let LoadedRouteWorkflow {
+        definition: def,
+        version,
+        release,
+        variables,
+    } = loaded;
     let pool = db_pool(state)?;
 
     // Inputs = the last user message text (the workflow's trigger node echoes
@@ -876,21 +1467,33 @@ pub(crate) async fn complete_workflow(
     // `{{trigger}}`).
     let inputs = last_user_message_text(&prep.req);
 
-    // Over-cap rejection BEFORE any spend: a workflow whose projection exceeds
-    // the route's `max_cost_usd` (or the workflow's own budget when the route
-    // caps None) is a 400, never a billed row.
+    // Budget admission happens before any run record or provider dispatch. A
+    // capped route must have explicitly output-bounded direct intelligence
+    // nodes with input-only prompts. The executor later serializes capped
+    // intelligence nodes and reserves their directional estimates, but a
+    // started node's routed provider work can still settle above that estimate.
     let run_max_cost = cfg.max_cost_usd.or(def.budget.max_cost_usd);
-    if let Some(cap) = run_max_cost {
-        let est = estimate::estimate_workflow(&def, &inputs);
-        if est.projected_cost_usd > cap {
-            return Err(ApiError::InvalidRequest(format!(
-                "workflow projects ${:.4}, exceeds route cap ${:.4}",
-                est.projected_cost_usd, cap
-            )));
-        }
-    }
+    admit_workflow_budget_before_dispatch_with_variables(
+        WorkflowBudgetAdmissionPath::Detour,
+        &def,
+        &inputs,
+        &variables,
+        run_max_cost,
+    )
+    .map_err(ApiError::InvalidRequest)?;
 
     let run_id = Uuid::new_v4();
+    insert_route_workflow_run(
+        pool,
+        run_id,
+        ctx.org_id,
+        &def,
+        version,
+        release,
+        &inputs,
+        run_max_cost,
+    )
+    .await?;
     let secrets = match master_key_from_env() {
         Some(master) => load_secrets(pool, ctx.org_id, &master).await,
         None => std::collections::HashMap::new(),
@@ -909,7 +1512,7 @@ pub(crate) async fn complete_workflow(
         org_id: ctx.org_id,
         pool,
     };
-    let result = engine::run_workflow(
+    let result = engine::run_workflow_with_variables(
         &executor,
         &def,
         &inputs,
@@ -917,6 +1520,7 @@ pub(crate) async fn complete_workflow(
         |entry| journal.push(entry),
         None,
         &secrets,
+        &variables,
         0,
         &[],
         &cache,
@@ -1016,13 +1620,38 @@ pub(crate) async fn run_workflow_shadow(
     prep: &Prepared,
     cfg: &tt_routing::RouteWorkflow,
 ) -> Result<(), String> {
-    let (def, _version) = load_route_workflow(state, ctx, cfg)
+    let loaded = load_route_workflow(state, ctx, cfg)
         .await
         .map_err(|e| format!("load: {e}"))?;
+    let LoadedRouteWorkflow {
+        definition: def,
+        version,
+        release,
+        variables,
+    } = loaded;
     let pool = db_pool(state).map_err(|e| format!("pool: {e}"))?;
     let inputs = last_user_message_text(&prep.req);
     let run_max_cost = cfg.max_cost_usd.or(def.budget.max_cost_usd);
+    admit_workflow_budget_before_dispatch_with_variables(
+        WorkflowBudgetAdmissionPath::Shadow,
+        &def,
+        &inputs,
+        &variables,
+        run_max_cost,
+    )?;
     let run_id = Uuid::new_v4();
+    insert_route_workflow_run(
+        pool,
+        run_id,
+        ctx.org_id,
+        &def,
+        version,
+        release,
+        &inputs,
+        run_max_cost,
+    )
+    .await
+    .map_err(|e| format!("journal: {e}"))?;
     let secrets = match master_key_from_env() {
         Some(master) => load_secrets(pool, ctx.org_id, &master).await,
         None => std::collections::HashMap::new(),
@@ -1041,7 +1670,7 @@ pub(crate) async fn run_workflow_shadow(
         org_id: ctx.org_id,
         pool,
     };
-    let result = engine::run_workflow(
+    let result = engine::run_workflow_with_variables(
         &executor,
         &def,
         &inputs,
@@ -1049,6 +1678,7 @@ pub(crate) async fn run_workflow_shadow(
         |entry| journal.push(entry),
         None,
         &secrets,
+        &variables,
         0,
         &[],
         &cache,
@@ -1066,96 +1696,54 @@ pub(crate) async fn run_workflow_shadow(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// GET /v1/workflows/:id/runs + GET /v1/workflows/runs/:run_id (WF-6)
-// ---------------------------------------------------------------------------
-// The run rows are persisted by `create_run`/`persist_run_results`
-// (`workflow_runs` + `workflow_node_runs`); this exposes them over HTTP so a run
-// that spent real dollars doesn't vanish on navigation. Org-scoped: a run is
-// only ever returned to its owning org (`require_org` + the SQL's org_id filter).
-
-/// A single workflow run row as returned to API clients. Mirrors
-/// [`store::WorkflowRunRecord`] minus the org_id (never echoed) + with the
-/// timestamps as RFC 3339 (JSON-friendly).
-#[derive(Debug, Serialize)]
-pub struct WorkflowRunView {
-    pub id: Uuid,
-    pub workflow_id: Uuid,
-    pub version: i32,
-    /// `"running"` / `"completed"` / `"failed"`.
-    pub status: String,
-    pub inputs: Option<serde_json::Value>,
-    pub cost_usd: f64,
-    pub max_cost_usd: Option<f64>,
-    pub baseline_cost_usd: f64,
-    pub saved_usd: f64,
-    pub error: Option<String>,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-impl WorkflowRunView {
-    fn from_record(r: store::WorkflowRunRecord) -> Self {
-        Self {
-            id: r.id,
-            workflow_id: r.workflow_id,
-            version: r.version,
-            status: r.status,
-            inputs: r.inputs,
-            cost_usd: r.cost_usd,
-            max_cost_usd: r.max_cost_usd,
-            baseline_cost_usd: r.baseline_cost_usd,
-            saved_usd: r.saved_usd,
-            error: r.error,
-            started_at: r.started_at,
-            finished_at: r.finished_at,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListWorkflowRunsResponse {
-    pub object: &'static str,
-    pub data: Vec<WorkflowRunView>,
-}
-
-/// `GET /v1/workflows/:id/runs` — list recent runs of a workflow, scoped to the
-/// caller's org. The workflow id is validated as org-owned the same way
-/// `create_run` does (store::get_definition returns None for a foreign-org id).
-pub async fn list_workflow_runs(
+/// `GET /v1/workflows/secrets` — return a bounded, deterministic inventory of
+/// safe metadata for the caller's org. Values, ciphertext, hashes, lengths,
+/// and key material are never returned. Successful responses are no-store.
+pub async fn list_workflow_secrets(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<ListWorkflowRunsResponse>> {
+) -> ApiResult<Response> {
     let org = require_org(ctx)?;
     let pool = db_pool(&state)?;
-    // Defense-in-depth: confirm the workflow exists + is org-scoped before
-    // listing its runs (a foreign org id → 404, not an empty list that might
-    // imply the workflow exists).
-    if store::get_definition(pool, org, id).await.is_none() {
-        return Err(ApiError::NotFound(format!("no workflow with id {id}")));
-    }
-    let runs = store::list_runs(pool, org, 50).await;
-    let data = runs.into_iter().map(WorkflowRunView::from_record).collect();
-    Ok(Json(ListWorkflowRunsResponse {
+    let mut rows = list_secret_rows(pool, org, (WORKFLOW_SECRET_INVENTORY_LIMIT + 1) as i64)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%org, %error, "workflow secret inventory read failed");
+            ApiError::ServiceUnavailable(
+                "workflow secret inventory is temporarily unavailable".into(),
+            )
+        })?;
+    let truncated = rows.len() > WORKFLOW_SECRET_INVENTORY_LIMIT;
+    rows.truncate(WORKFLOW_SECRET_INVENTORY_LIMIT);
+
+    let master = master_key_from_env();
+    let data = rows
+        .into_iter()
+        .map(|row| {
+            let state = match master.as_ref() {
+                Some(master) if row.is_decryptable(master, org) => WorkflowSecretState::Ready,
+                Some(_) => WorkflowSecretState::Unusable,
+                None => WorkflowSecretState::Unavailable,
+            };
+            WorkflowSecretView {
+                name: row.name,
+                state,
+                created_at: row.created_at,
+                rotated_at: row.rotated_at,
+            }
+        })
+        .collect();
+
+    let mut response = Json(ListWorkflowSecretsResponse {
         object: "list",
         data,
-    }))
-}
-
-/// `GET /v1/workflows/runs/:run_id` — fetch a single run by id (org-scoped via
-/// the SQL's `WHERE id AND org_id`, so a foreign-org run id → 404).
-pub async fn get_workflow_run(
-    State(state): State<AppState>,
-    ctx: Option<Extension<ApiKeyContext>>,
-    Path(run_id): Path<Uuid>,
-) -> ApiResult<Json<WorkflowRunView>> {
-    let org = require_org(ctx)?;
-    let pool = db_pool(&state)?;
-    let run = store::get_run(pool, run_id, org)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("no workflow run with id {run_id}")))?;
-    Ok(Json(WorkflowRunView::from_record(run)))
+        truncated,
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    Ok(response)
 }
 
 /// `POST /v1/workflows/secrets` — encrypt and upsert a named secret for the
@@ -1163,6 +1751,7 @@ pub async fn get_workflow_run(
 ///
 /// * `name` must match `^[A-Z0-9_]{1,64}$` (the charset used by
 ///   `{{secrets.NAME}}` template references in Http nodes) → 400 otherwise.
+/// * `value` must contain 1–65,536 UTF-8 bytes → 400 otherwise.
 /// * Returns 503 when `TT_MASTER_KEY` is absent (secret storage not configured).
 /// * Returns 204 on success. **The value is never echoed in any response or log.**
 pub async fn set_workflow_secret(
@@ -1177,6 +1766,11 @@ pub async fn set_workflow_secret(
              (uppercase letters, digits, and underscore only)"
                 .into(),
         ));
+    }
+    if body.value.is_empty() || body.value.len() > MAX_WORKFLOW_SECRET_VALUE_BYTES {
+        return Err(ApiError::InvalidRequest(format!(
+            "secret value must contain 1–{MAX_WORKFLOW_SECRET_VALUE_BYTES} UTF-8 bytes"
+        )));
     }
     let master = master_key_from_env().ok_or_else(|| {
         ApiError::ServiceUnavailable("secret storage not configured (TT_MASTER_KEY absent)".into())
@@ -1195,6 +1789,32 @@ pub async fn set_workflow_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `DELETE /v1/workflows/secrets/:name` — idempotently remove one encrypted
+/// secret for the caller's org. A master key is not required to delete the
+/// ciphertext. Stored workflow versions are not rewritten: any retained
+/// reference fails the bounded whole-tree preflight before the next run's root
+/// definition executes a node.
+pub async fn delete_workflow_secret(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    let org = require_org(ctx)?;
+    if !is_valid_secret_name(&name) {
+        return Err(ApiError::InvalidRequest(
+            "secret name must match ^[A-Z0-9_]{1,64}$ \
+             (uppercase letters, digits, and underscore only)"
+                .into(),
+        ));
+    }
+    let pool = db_pool(&state)?;
+    delete_secret(pool, org, &name).await.map_err(|error| {
+        tracing::error!(%org, %error, "workflow secret DELETE failed");
+        ApiError::Internal("failed to delete workflow secret".into())
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1203,7 +1823,10 @@ pub async fn set_workflow_secret(
 mod tests {
     use super::*;
     use crate::registry::ProviderRegistry;
-    use crate::workflow::types::{BudgetPolicy, Edge, Node, NodeKind};
+    use crate::workflow::activation::WorkflowExecutionSelector;
+    use crate::workflow::types::{
+        BudgetPolicy, Edge, ModelSelection, Node, NodeKind, WorkflowDefinition, WorkflowTrigger,
+    };
     use axum::extract::State;
     use tt_auth::ApiKeyContext;
 
@@ -1230,6 +1853,7 @@ mod tests {
         CreateWorkflowRequest {
             id: None,
             version: None,
+            expected_latest_version: None,
             name: "cyclic".to_string(),
             nodes: vec![
                 Node {
@@ -1276,6 +1900,7 @@ mod tests {
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
             metadata: serde_json::Value::Null,
+            triggers: vec![],
         }
     }
 
@@ -1284,6 +1909,7 @@ mod tests {
         CreateWorkflowRequest {
             id: None,
             version: None,
+            expected_latest_version: None,
             name: "valid".to_string(),
             nodes: vec![
                 Node {
@@ -1304,6 +1930,295 @@ mod tests {
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
             metadata: serde_json::Value::Null,
+            triggers: vec![],
+        }
+    }
+
+    fn budget_admission_def(max_output_tokens: Option<u32>, prompt: &str) -> WorkflowDefinition {
+        WorkflowDefinition {
+            triggers: vec![],
+            id: Uuid::nil(),
+            version: 1,
+            name: "budget-admission".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "m".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "gpt-4o-mini".into(),
+                        },
+                        prompt: prompt.into(),
+                        max_output_tokens,
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "m".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "m".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// Mirrors each production call site's order: no record/executor/provider
+    /// action is reachable until the shared admission gate returns `Ok`.
+    fn assert_rejected_before_dispatch(
+        path: WorkflowBudgetAdmissionPath,
+        def: &WorkflowDefinition,
+    ) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let executions = AtomicUsize::new(0);
+        let result = (|| -> Result<(), String> {
+            admit_workflow_budget_before_dispatch_with_variables(
+                path,
+                def,
+                &serde_json::json!("input"),
+                &BTreeMap::new(),
+                Some(1.0),
+            )?;
+            executions.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })();
+
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "a rejected budget admission must execute zero provider/workflow actions"
+        );
+        result.expect_err("fixture must be rejected before dispatch")
+    }
+
+    // ------------------------------------------------------------------
+    // Create/update wire contract — trigger preservation + strict envelope
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn create_request_preserves_schedule_and_webhook_triggers() {
+        let id = Uuid::new_v4();
+        let body: CreateWorkflowRequest = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "version": 7,
+            "expected_latest_version": 6,
+            "name": "triggered workflow",
+            "nodes": [
+                { "id": "trigger", "type": "trigger" },
+                { "id": "out", "type": "output" }
+            ],
+            "edges": [{ "from": "trigger", "to": "out" }],
+            "triggers": [
+                { "type": "schedule", "interval": "6h" },
+                { "type": "webhook", "token_id": "billing_sync_1" }
+            ]
+        }))
+        .expect("the canonical create/update trigger payload deserializes");
+
+        assert_eq!(body.expected_latest_version, Some(6));
+        let def = body.into_definition();
+        assert_eq!(def.id, id);
+        assert_eq!(def.version, 7);
+        assert_eq!(
+            def.triggers,
+            vec![
+                WorkflowTrigger::Schedule {
+                    interval: "6h".to_string(),
+                    environment: None,
+                },
+                WorkflowTrigger::Webhook {
+                    token_id: "billing_sync_1".to_string(),
+                    environment: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn create_request_defaults_missing_triggers_to_human_run_only() {
+        let body: CreateWorkflowRequest = serde_json::from_value(serde_json::json!({
+            "name": "manual workflow",
+            "nodes": [
+                { "id": "trigger", "type": "trigger" },
+                { "id": "out", "type": "output" }
+            ],
+            "edges": [{ "from": "trigger", "to": "out" }]
+        }))
+        .expect("older clients without triggers remain compatible");
+
+        assert!(body.into_definition().triggers.is_empty());
+    }
+
+    #[test]
+    fn create_request_rejects_unknown_top_level_fields() {
+        let error = serde_json::from_value::<CreateWorkflowRequest>(serde_json::json!({
+            "name": "typo guard",
+            "nodes": [
+                { "id": "trigger", "type": "trigger" },
+                { "id": "out", "type": "output" }
+            ],
+            "edges": [{ "from": "trigger", "to": "out" }],
+            "trigers": [{ "type": "schedule", "interval": "6h" }]
+        }))
+        .expect_err("a misspelled top-level field must not be silently discarded")
+        .to_string();
+
+        assert!(
+            error.contains("unknown field `trigers`"),
+            "unexpected serde error: {error}"
+        );
+    }
+
+    #[test]
+    fn optimistic_write_precondition_accepts_persistable_versions_only() {
+        assert_eq!(expected_latest_workflow_version(None).unwrap(), None);
+        assert_eq!(expected_latest_workflow_version(Some(0)).unwrap(), Some(0));
+        assert_eq!(
+            expected_latest_workflow_version(Some(i32::MAX as u32)).unwrap(),
+            Some(i32::MAX)
+        );
+        assert!(matches!(
+            expected_latest_workflow_version(Some(i32::MAX as u32 + 1)),
+            Err(ApiError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn estimate_request_accepts_exact_version_and_legacy_alias() {
+        let exact: EstimateRequest = serde_json::from_value(serde_json::json!({
+            "inputs": { "topic": "safe" },
+            "workflow_version": 7
+        }))
+        .expect("exact estimate request");
+        assert_eq!(exact.workflow_version, Some(7));
+        assert_eq!(exact.workflow_environment, None);
+
+        let legacy: EstimateRequest = serde_json::from_value(serde_json::json!({
+            "version": 6
+        }))
+        .expect("legacy estimate version alias");
+        assert_eq!(legacy.workflow_version, Some(6));
+
+        let released: EstimateRequest = serde_json::from_value(serde_json::json!({
+            "inputs": {},
+            "workflow_environment": "production"
+        }))
+        .expect("environment estimate selector");
+        assert_eq!(released.workflow_version, None);
+        assert_eq!(
+            released.workflow_environment,
+            Some(WorkflowExecutionEnvironment::Production)
+        );
+        assert!(
+            serde_json::from_value::<EstimateRequest>(serde_json::json!({
+                "workflow_environment": "preview"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_execution_selectors_are_closed_and_mutually_exclusive() {
+        for environment in [
+            WorkflowExecutionEnvironment::Development,
+            WorkflowExecutionEnvironment::Staging,
+            WorkflowExecutionEnvironment::Production,
+        ] {
+            assert_eq!(
+                workflow_execution_selector(None, Some(environment), None, None).unwrap(),
+                WorkflowExecutionSelector::CurrentEnvironment(environment)
+            );
+            assert_eq!(
+                WorkflowExecutionEnvironment::from_store(environment.as_store()),
+                environment
+            );
+        }
+        assert_eq!(
+            workflow_execution_selector(Some(4), None, None, None).unwrap(),
+            WorkflowExecutionSelector::Version(4)
+        );
+        assert_eq!(
+            workflow_execution_selector(
+                Some(4),
+                Some(WorkflowExecutionEnvironment::Production),
+                Some(7),
+                Some(0),
+            )
+            .unwrap(),
+            WorkflowExecutionSelector::FrozenRelease {
+                workflow_version: 4,
+                environment: WorkflowExecutionEnvironment::Production,
+                release_revision: 7,
+                variables_revision: 0,
+            }
+        );
+        assert!(matches!(
+            workflow_execution_selector(
+                Some(4),
+                Some(WorkflowExecutionEnvironment::Production),
+                None,
+                None,
+            ),
+            Err(ApiError::InvalidRequest(message))
+                if message.contains("complete")
+        ));
+        assert!(workflow_execution_selector(None, None, Some(1), Some(0)).is_err());
+        assert!(workflow_execution_selector(
+            Some(4),
+            Some(WorkflowExecutionEnvironment::Production),
+            Some(0),
+            Some(0),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn direct_detour_and_shadow_reject_missing_output_caps_before_execution() {
+        let def = budget_admission_def(None, "Summarize {{input}}");
+        for path in [
+            WorkflowBudgetAdmissionPath::Direct,
+            WorkflowBudgetAdmissionPath::Detour,
+            WorkflowBudgetAdmissionPath::Shadow,
+        ] {
+            let error = assert_rejected_before_dispatch(path, &def);
+            assert!(
+                error.contains("requires explicit positive max_output_tokens"),
+                "unexpected admission error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_detour_and_shadow_reject_upstream_refs_before_execution() {
+        let def = budget_admission_def(Some(64), "Summarize {{previous_node}}");
+        for path in [
+            WorkflowBudgetAdmissionPath::Direct,
+            WorkflowBudgetAdmissionPath::Detour,
+            WorkflowBudgetAdmissionPath::Shadow,
+        ] {
+            let error = assert_rejected_before_dispatch(path, &def);
+            assert!(
+                error.contains("supports only {{input}} and accepted {{variables.NAME}}"),
+                "unexpected admission error: {error}"
+            );
         }
     }
 
@@ -1380,6 +2295,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_rejects_a_sub_hour_schedule_before_the_db_guard() {
+        let org = Uuid::new_v4();
+        let mut def = valid_def();
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "30m".to_string(),
+            environment: None,
+        }];
+
+        let result = create(State(test_state()), real_org_ctx(org), Json(def)).await;
+        match result {
+            Err(ApiError::InvalidRequest(msg)) => {
+                assert!(msg.contains("1-hour minimum"), "unexpected error: {msg}");
+                assert!(
+                    msg.contains("approximate hourly sweep"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected InvalidRequest(sub-hour schedule), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn create_valid_def_no_pool_returns_503() {
         // Valid definition → passes validation but no db_pool → ServiceUnavailable.
         let org = Uuid::new_v4();
@@ -1424,6 +2361,8 @@ mod tests {
     async fn estimate_anon_returns_unauthorized() {
         let body = EstimateRequest {
             inputs: serde_json::Value::Null,
+            workflow_version: None,
+            workflow_environment: None,
         };
         let result = estimate(State(test_state()), None, Path(Uuid::nil()), Json(body)).await;
         assert!(
@@ -1478,6 +2417,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn set_workflow_secret_rejects_empty_and_oversize_values_before_key_lookup() {
+        let org = Uuid::new_v4();
+        for value in [
+            String::new(),
+            "x".repeat(MAX_WORKFLOW_SECRET_VALUE_BYTES + 1),
+        ] {
+            let body = SetWorkflowSecretRequest {
+                name: "MY_KEY".into(),
+                value,
+            };
+            let result =
+                set_workflow_secret(State(test_state()), real_org_ctx(org), Json(body)).await;
+            assert!(
+                matches!(result, Err(ApiError::InvalidRequest(_))),
+                "expected InvalidRequest for invalid value size, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_workflow_secrets_anon_returns_unauthorized() {
+        let result = list_workflow_secrets(State(test_state()), None).await;
+        assert!(
+            matches!(result, Err(ApiError::Unauthorized)),
+            "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_workflow_secret_anon_returns_unauthorized() {
+        let result =
+            delete_workflow_secret(State(test_state()), None, Path("MY_KEY".to_string())).await;
+        assert!(
+            matches!(result, Err(ApiError::Unauthorized)),
+            "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_workflow_secret_rejects_bad_name_before_db_lookup() {
+        let result = delete_workflow_secret(
+            State(test_state()),
+            real_org_ctx(Uuid::new_v4()),
+            Path("bad-name".to_string()),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::InvalidRequest(_))),
+            "expected InvalidRequest, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_secret_inventory_serializes_only_safe_metadata() {
+        let view = WorkflowSecretView {
+            name: "MY_KEY".into(),
+            state: WorkflowSecretState::Ready,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            rotated_at: None,
+        };
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["name"], "MY_KEY");
+        assert_eq!(json["state"], "ready");
+        assert!(json.get("created_at").is_some());
+        assert!(json.get("rotated_at").is_some());
+        for forbidden in [
+            "value",
+            "secret",
+            "secret_enc",
+            "ciphertext",
+            "hash",
+            "length",
+        ] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "unexpected field {forbidden}"
+            );
+        }
+    }
+
     /// With a valid name but no TT_MASTER_KEY the handler returns 503.
     #[tokio::test]
     async fn set_workflow_secret_no_master_key_returns_503() {
@@ -1503,6 +2523,10 @@ mod tests {
     async fn create_run_anon_returns_unauthorized() {
         let body = CreateRunRequest {
             inputs: serde_json::Value::Null,
+            workflow_version: None,
+            workflow_environment: None,
+            release_revision: None,
+            variables_revision: None,
             max_cost_usd: None,
             stream: false,
         };

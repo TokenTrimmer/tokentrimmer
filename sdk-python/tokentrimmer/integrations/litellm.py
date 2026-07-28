@@ -17,9 +17,10 @@ How the logger gets the headers
 -------------------------------
 
 LiteLLM only exposes the raw upstream (gateway) response headers when you opt in
-with ``litellm.return_response_headers = True``. With it set, on a successful
-call LiteLLM attaches them to the response object in two places, **both** of
-which this logger reads in :meth:`~TokenTrimmerLiteLLMLogger.log_success_event`:
+with ``litellm.return_response_headers = True``. With it set, this logger reads
+the headers from LiteLLM's synchronous post-API metadata before ``completion``
+returns, then de-duplicates the later background success event. The success
+response also carries them in two places:
 
 * ``response._response_headers`` — the raw headers, un-prefixed
   (``x-tokentrimmer-cost-usd`` etc.); and
@@ -47,7 +48,9 @@ Wire it up like::
 
 :meth:`TokenTrimmerLiteLLMLogger.install` sets
 ``litellm.return_response_headers = True`` and appends the logger to
-``litellm.callbacks`` for you.
+``litellm.callbacks`` for you. Async LiteLLM success logging remains governed by
+LiteLLM's asynchronous callback lifecycle; the deterministic immediate
+checkpoint described below applies to synchronous ``completion`` calls.
 
 Budget stop — how it differs from LangChain
 -------------------------------------------
@@ -73,6 +76,7 @@ is raised.
 from __future__ import annotations
 
 import logging
+from threading import Lock
 from typing import Any, Dict, List, Mapping, Optional
 
 try:
@@ -145,15 +149,23 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
         #: ``True`` once the accumulated cost has crossed ``max_cost_usd``.
         self.budget_exceeded: bool = False
         self._budget_error: Optional[BudgetExceeded] = None
+        # LiteLLM runs sync success callbacks on a background executor. The
+        # synchronous post-API hook records response headers before completion()
+        # returns, while the later success hook supplies the final response and
+        # token counts. Keep cost accumulation exactly once per LiteLLM call.
+        self._state_lock = Lock()
+        self._recorded_call_ids: set[str] = set()
 
     def reset(self) -> None:
         """Zero the accumulated totals + budget state to drive another run."""
-        self.total_cost_usd = 0.0
-        self.total_saved_usd = 0.0
-        self.total_baseline_usd = 0.0
-        self.attributed_calls = 0
-        self.budget_exceeded = False
-        self._budget_error = None
+        with self._state_lock:
+            self.total_cost_usd = 0.0
+            self.total_saved_usd = 0.0
+            self.total_baseline_usd = 0.0
+            self.attributed_calls = 0
+            self.budget_exceeded = False
+            self._budget_error = None
+            self._recorded_call_ids.clear()
 
     def raise_if_exceeded(self) -> None:
         """Raise :class:`BudgetExceeded` if the run has crossed its budget.
@@ -180,7 +192,7 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
         the optional budget breach. A response with no TokenTrimmer headers is a
         no-op.
         """
-        self._record(response_obj)
+        self._record(response_obj, kwargs=kwargs)
 
     async def async_log_success_event(
         self, kwargs: Any, response_obj: Any, start_time: Any, end_time: Any
@@ -192,12 +204,36 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
         current OTel span may differ, so span recording is best-effort there —
         the cost/savings totals still accumulate.
         """
-        self._record(response_obj)
+        self._record(response_obj, kwargs=kwargs)
+
+    def log_post_api_call(
+        self, kwargs: Any, response_obj: Any, start_time: Any, end_time: Any
+    ) -> None:
+        """Synchronously account for a completed provider response when possible.
+
+        LiteLLM intentionally submits synchronous success callbacks to a
+        background executor. Its OpenAI-compatible provider path places the raw
+        response headers in ``kwargs["response_headers"]`` before invoking this
+        documented post-API hook, so using that copy makes an immediate
+        ``raise_if_exceeded()`` checkpoint deterministic. Providers without that
+        header copy continue through the ordinary success hook.
+        """
+        headers = (
+            kwargs.get("response_headers") if isinstance(kwargs, Mapping) else None
+        )
+        if isinstance(headers, Mapping):
+            self._record(None, kwargs=kwargs, post_call_headers=headers)
 
     # -- internals ------------------------------------------------------------
 
-    def _record(self, response_obj: Any) -> None:
-        headers = _extract_tt_headers(response_obj)
+    def _record(
+        self,
+        response_obj: Any,
+        *,
+        kwargs: Any = None,
+        post_call_headers: Any = None,
+    ) -> None:
+        headers = _extract_tt_headers(response_obj, post_call_headers=post_call_headers)
         if headers is None:
             # No cost headers on this response (e.g. return_response_headers not
             # set, or a self-hosted gateway without pricing). Degrade quietly —
@@ -213,31 +249,47 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
         if self.record_spans and attrs:
             record_on_current_span(attrs)
 
-        if meta.cost_usd is not None:
-            self.total_cost_usd += meta.cost_usd
-        if meta.saved_usd is not None:
-            self.total_saved_usd += meta.saved_usd
-        if meta.baseline_cost_usd is not None:
-            self.total_baseline_usd += meta.baseline_cost_usd
-        self.attributed_calls += 1
+        call_id = kwargs.get("litellm_call_id") if isinstance(kwargs, Mapping) else None
+        if not isinstance(call_id, str) or not call_id:
+            call_id = None
 
-        self._logger.debug(
-            "tokentrimmer litellm success: cost=%s saved=%s route=%s cache=%s "
-            "(run total cost=$%.6f saved=$%.6f)",
-            meta.cost_usd,
-            meta.saved_usd,
-            meta.route,
-            meta.cache,
-            self.total_cost_usd,
-            self.total_saved_usd,
-        )
+        with self._state_lock:
+            first_attribution = (
+                call_id is None or call_id not in self._recorded_call_ids
+            )
+            if call_id is not None and first_attribution:
+                self._recorded_call_ids.add(call_id)
+            if first_attribution:
+                if meta.cost_usd is not None:
+                    self.total_cost_usd += meta.cost_usd
+                if meta.saved_usd is not None:
+                    self.total_saved_usd += meta.saved_usd
+                if meta.baseline_cost_usd is not None:
+                    self.total_baseline_usd += meta.baseline_cost_usd
+                self.attributed_calls += 1
 
-        if self.max_cost_usd is not None and self.total_cost_usd > self.max_cost_usd:
-            # LiteLLM swallows exceptions raised from this callback, so record the
-            # breach for the caller's raise_if_exceeded() checkpoint instead of
-            # raising here (which LiteLLM would only log, not propagate).
-            self.budget_exceeded = True
-            self._budget_error = BudgetExceeded(self.total_cost_usd, self.max_cost_usd)
+                if (
+                    self.max_cost_usd is not None
+                    and self.total_cost_usd > self.max_cost_usd
+                ):
+                    # LiteLLM swallows exceptions raised from this callback, so
+                    # record the breach for the caller's checkpoint instead.
+                    self.budget_exceeded = True
+                    self._budget_error = BudgetExceeded(
+                        self.total_cost_usd, self.max_cost_usd
+                    )
+
+        if first_attribution:
+            self._logger.debug(
+                "tokentrimmer litellm success: cost=%s saved=%s route=%s cache=%s "
+                "(run total cost=$%.6f saved=$%.6f)",
+                meta.cost_usd,
+                meta.saved_usd,
+                meta.route,
+                meta.cache,
+                self.total_cost_usd,
+                self.total_saved_usd,
+            )
 
     @classmethod
     def install(
@@ -273,7 +325,9 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
 # --- helpers ----------------------------------------------------------------
 
 
-def _extract_tt_headers(response_obj: Any) -> Optional[Dict[str, str]]:
+def _extract_tt_headers(
+    response_obj: Any, *, post_call_headers: Any = None
+) -> Optional[Dict[str, str]]:
     """Recover the ``x-tokentrimmer-*`` headers from a LiteLLM response, if present.
 
     ``return_response_headers = True`` surfaces the raw gateway headers on the
@@ -285,6 +339,9 @@ def _extract_tt_headers(response_obj: Any) -> Optional[Dict[str, str]]:
     "no cost data".
     """
     candidates: List[Any] = []
+
+    if isinstance(post_call_headers, Mapping):
+        candidates.append(post_call_headers)
 
     response_headers = getattr(response_obj, "_response_headers", None)
     if isinstance(response_headers, Mapping):

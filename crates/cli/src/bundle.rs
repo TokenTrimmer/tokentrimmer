@@ -23,78 +23,26 @@
 
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-
+pub use tt_plan_core::{BundleAttestation, SavingsBundle, BUNDLE_SCHEMA_VERSION};
 use tt_plan_core::{PlanInput, PlanResult};
 use tt_telemetry::audit::AuditEntry;
 
-/// Current bundle schema version. Bumped only on a breaking shape change; a
-/// verifier refuses a bundle whose `schema_version` it does not understand
-/// rather than silently mis-reading it.
-pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
-
-/// A self-contained, offline-reproducible savings bundle.
-///
-/// Everything `verify-bundle` needs is here: it never touches the network or a
-/// database. Serialized as versioned JSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SavingsBundle {
-    /// Schema version — see [`BUNDLE_SCHEMA_VERSION`].
-    pub schema_version: u32,
-    /// The `tt` version that produced the bundle (informational; not part of
-    /// the reproduction check).
-    pub tool_version: String,
-    /// RFC 3339 timestamp the bundle was produced (informational; explicitly
-    /// NOT part of the reproduction check — replay reads none of it).
-    pub created_at: String,
-    /// The complete replay input: historical rows, the proposed routes, the
-    /// **catalog/pricing snapshot** (`plan_input.pricing`), the non-route
-    /// config, the **RNG seed** (`plan_input.seed`), and the bootstrap
-    /// iteration count. This is EXACTLY what [`tt_plan_core::replay`] consumes,
-    /// so the reproduction is bit-for-bit.
-    pub plan_input: PlanInput,
-    /// The expected replay output. `verify-bundle` recomputes the result from
-    /// `plan_input` and asserts it matches this, field-for-field.
-    pub expected_result: PlanResult,
-    /// Optional signed attestation reference: an Ed25519 hash-chained audit
-    /// export (the same shape `tt audit verify` consumes). When present,
-    /// `verify-bundle` checks its signatures + hash chain OFFLINE.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attestation: Option<BundleAttestation>,
-}
-
-/// A bundled, self-verifying attestation reference — the signed hash-chained
-/// audit entries plus the public key they were signed with, so the signature
-/// can be checked with no external key lookup.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BundleAttestation {
-    /// Hex-encoded Ed25519 verifying (public) key the entries were signed with.
-    pub verifying_key: String,
-    /// The signed, hash-chained audit entries (`plan.applied`, etc.).
-    pub entries: Vec<AuditEntry>,
-}
-
-impl SavingsBundle {
-    /// Assemble a bundle from a replay `plan_input`, the `result` it produced,
-    /// and an optional attestation reference.
-    ///
-    /// The caller is responsible for having run `replay(plan_input.clone())`
-    /// to obtain `result` — this constructor does not re-run the replay, it
-    /// just records both sides so `verify-bundle` can cross-check them later.
-    #[must_use]
-    pub fn new(
-        plan_input: PlanInput,
-        result: PlanResult,
-        attestation: Option<BundleAttestation>,
-    ) -> Self {
-        Self {
-            schema_version: BUNDLE_SCHEMA_VERSION,
-            tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            plan_input,
-            expected_result: result,
-            attestation,
-        }
+/// Assemble a bundle from the exact replay input/result pair produced by this
+/// CLI. The timestamp and CLI version are informational and excluded from the
+/// reproduction comparison.
+#[must_use]
+pub fn new_bundle(
+    plan_input: PlanInput,
+    result: PlanResult,
+    attestation: Option<BundleAttestation>,
+) -> SavingsBundle {
+    SavingsBundle {
+        schema_version: BUNDLE_SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        plan_input,
+        expected_result: result,
+        attestation,
     }
 }
 
@@ -440,6 +388,7 @@ mod tests {
             ts: Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap(),
             provider: "anthropic".into(),
             model: "claude-3-5-sonnet".into(),
+            requested_model: Some("claude-3-5-sonnet".into()),
             input_tokens: 1000,
             output_tokens: 100,
             cached_tokens: 0,
@@ -487,6 +436,7 @@ mod tests {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                ..Default::default()
             },
         };
         let mut pricing = HashMap::new();
@@ -519,7 +469,7 @@ mod tests {
     fn sample_bundle() -> SavingsBundle {
         let input = sample_input();
         let result = tt_plan_core::replay(input.clone()).expect("replay");
-        SavingsBundle::new(input, result, None)
+        new_bundle(input, result, None)
     }
 
     #[test]
@@ -548,6 +498,25 @@ mod tests {
         let reloaded: SavingsBundle = serde_json::from_str(&json).unwrap();
         let report = verify_bundle(&reloaded).expect("verify");
         assert!(report.passed, "serialize→deserialize must not break replay");
+    }
+
+    #[test]
+    fn generated_bundle_vector_verifies_with_the_real_cli_path() {
+        let bundle: SavingsBundle = serde_json::from_str(include_str!(
+            "../../../docs/receipt-spec/savings-bundle-v1.golden.json"
+        ))
+        .expect("generated bundle vector must deserialize");
+        let report = verify_bundle(&bundle).expect("generated bundle vector must be runnable");
+        assert!(report.passed, "generated bundle vector must replay exactly");
+
+        let mut forged = bundle;
+        forged.expected_result.aggregates.projected_savings_usd += 0.000_001;
+        assert!(
+            !verify_bundle(&forged)
+                .expect("forged bundle remains runnable")
+                .passed,
+            "a forged expected result must fail deterministic replay"
+        );
     }
 
     #[test]

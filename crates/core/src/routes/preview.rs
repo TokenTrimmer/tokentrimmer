@@ -6,15 +6,22 @@
 //! ## Panel dry-run (Task 7)
 //!
 //! When `X-TokenTrimmer-Panel` is present, append a `panel` object to the
-//! response with per-member + arbiter cost estimates computed from the panel
-//! config.  **No provider is ever dispatched** — this endpoint remains
-//! side-effect-free.
+//! response with per-member + arbiter cost estimates computed from Fusion's
+//! shared static dispatch plan. **No provider is ever dispatched** — this
+//! endpoint remains side-effect-free.
 //!
 //! The panel estimate uses `AppState.registry` for model→provider resolution
 //! and per-provider pricing, while the base preview (`tt_preview::preview`)
 //! uses its own internal pricing catalog.  The two are deliberately decoupled
 //! so the preview can work without the AppState registry (the existing behavior
 //! for non-panel requests is byte-identical to before).
+//!
+//! `panel.within_budget` is therefore an indicative comparison within this
+//! dry-run only. It shares the static member-choice and arbiter-fan-in cost
+//! shape used by admission, but it is not Fusion admission, a
+//! credential/provider-health or latency check, a reservation, or a runtime
+//! spending ceiling; the additive `estimate_evidence` object makes that
+//! boundary machine-readable.
 //!
 //! ### tt_extras.panel
 //! `PreviewRequest` now accepts a `tt_extras` map. When `tt_extras.panel` is
@@ -26,8 +33,11 @@ use serde_json::json;
 use tt_shared::messages::parse_panel_extras;
 
 use crate::{
-    routes::chat::{cost_limit_from_header, estimate_cost_usd},
-    routes::panel::{panel_from_header, PanelConfig, PanelDefaults},
+    routes::chat::cost_limit_from_header,
+    routes::panel::{
+        estimate_panel_cost_breakdown, panel_from_header, PanelAdmissionEstimate, PanelConfig,
+        PanelDefaults,
+    },
     state::AppState,
 };
 use tt_preview::PreviewRequest;
@@ -77,49 +87,35 @@ pub async fn post_preview(
         let input_tokens = base["current"]["input_tokens_estimated"]
             .as_u64()
             .unwrap_or(0) as u32;
-        let max_tokens = req.max_tokens;
+        // Reuse Fusion's exact static dispatch-cost shape. This keeps preview
+        // side-effect-free while accounting for `max_completion_tokens`
+        // precedence, every requested member choice, and the known
+        // Synthesize/Best-of-N arbiter fan-in/fixed output plan. The input
+        // count remains the existing local preview estimate — live ingress may
+        // select a different source tokenizer after routing/pinning, which is
+        // why this remains preview-only rather than an admission result.
+        let cost_breakdown = estimate_panel_cost_breakdown(
+            &state,
+            &cfg,
+            PanelAdmissionEstimate {
+                input_tokens,
+                max_tokens: req.max_tokens,
+                max_completion_tokens: req.max_completion_tokens,
+                n: req.n,
+            },
+        );
+        let member_estimates = cost_breakdown.member_costs;
+        let arbiter_estimate = cost_breakdown.arbiter_cost;
+        let total_estimated_cost_usd = cost_breakdown.total_cost_usd;
 
-        // Cost-limit ceiling from header (for within_budget).
-        let ceiling = cost_limit_from_header(&headers);
+        // Mirror static admission's precedence: a valid request header wins;
+        // otherwise a resolved panel body budget is the comparison ceiling.
+        // This still does not run the admission gate or prove that live
+        // credentials, provider state, or dispatch will match the preview.
+        let ceiling = cost_limit_from_header(&headers).or(cfg.max_cost_usd);
 
-        // Per-member cost estimates (None if model is unknown/unpriced in registry).
-        let member_estimates: Vec<Option<f64>> = cfg
-            .members
-            .iter()
-            .map(|m| {
-                let provider = state.registry.resolve(&m.model)?;
-                let pricing = provider.pricing(&m.model)?;
-                Some(
-                    estimate_cost_usd(&pricing, input_tokens, max_tokens)
-                        * provider.fee_multiplier(),
-                )
-            })
-            .collect();
-
-        // Arbiter cost estimate.
-        let arbiter_estimate: Option<f64> = {
-            state
-                .registry
-                .resolve(&cfg.arbiter_model.model)
-                .and_then(|p| {
-                    p.pricing(&cfg.arbiter_model.model).map(|pricing| {
-                        estimate_cost_usd(&pricing, input_tokens, max_tokens) * p.fee_multiplier()
-                    })
-                })
-        };
-
-        // Total: fail-closed — None if ANY leg (member or arbiter) is unpriceable.
-        let any_null = member_estimates.iter().any(|e| e.is_none()) || arbiter_estimate.is_none();
-        let total_estimated_cost_usd: Option<f64> = if any_null {
-            None
-        } else {
-            let sum: f64 = member_estimates.iter().filter_map(|e| *e).sum::<f64>()
-                + arbiter_estimate.unwrap_or(0.0);
-            Some(sum)
-        };
-
-        // within_budget: None when no ceiling supplied; false when total is None
-        // (fail-closed) or when total exceeds ceiling.
+        // within_budget: None when no ceiling supplied; false when the known
+        // static plan is incomplete/unpriceable or exceeds that ceiling.
         let within_budget: Option<bool> = ceiling.map(|c| {
             total_estimated_cost_usd.map(|t| t <= c).unwrap_or(false) // unpriceable ⇒ false (fail-closed)
         });
@@ -159,6 +155,11 @@ pub async fn post_preview(
             },
             "total_estimated_cost_usd": total_estimated_cost_usd,
             "within_budget": within_budget,
+            "estimate_evidence": {
+                "scope": "preview_only",
+                "plan": "shared_static_cost_shape",
+                "reason": "This catalog-only dry-run reuses Fusion's static member-choice and arbiter-fan-in cost shape, but does not execute Fusion admission. Its input estimate may differ from a routed or pinned live source tokenizer. within_budget is not a credential, provider-health, or latency check; it is not a cost reservation, runtime spend ceiling, or execution guarantee."
+            },
         });
 
         // Merge the panel object into the base response at the top level.

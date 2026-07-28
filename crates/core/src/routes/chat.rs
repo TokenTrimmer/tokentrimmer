@@ -75,14 +75,15 @@ pub(crate) fn estimate_cost_usd(
         / 1_000_000.0
 }
 
-/// Parse `X-TokenTrimmer-Cost-Limit-Usd` (a positive USD ceiling), if present
-/// and well-formed. Malformed / non-positive values are ignored (no limit).
+/// Parse `X-TokenTrimmer-Cost-Limit-Usd` (a finite, positive USD ceiling), if
+/// present and well-formed. Malformed, non-finite, or non-positive values are
+/// ignored (no limit).
 pub(crate) fn cost_limit_from_header(headers: &HeaderMap) -> Option<f64> {
     headers
         .get("x-tokentrimmer-cost-limit-usd")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
+        .filter(|v| v.is_finite() && *v > 0.0)
 }
 
 /// `X-TokenTrimmer-Provider` — an exact provider id to pin for this request
@@ -211,6 +212,22 @@ pub(crate) fn enforce_cost_limit(
     Ok(())
 }
 
+/// Preserve the public 402 cost-limit envelope when the failover dispatcher
+/// exhausts a chain because a known-priced candidate exceeds an applicable
+/// request ceiling. Provider failures retain the existing upstream mapping.
+fn map_failover_error(error: crate::failover::FailoverError) -> ApiError {
+    match error {
+        crate::failover::FailoverError::Provider(error) => ApiError::from(error),
+        crate::failover::FailoverError::CostLimitExceeded {
+            estimated_usd,
+            ceiling_usd,
+        } => ApiError::CostLimitExceeded {
+            estimated_usd,
+            ceiling_usd,
+        },
+    }
+}
+
 /// TTL for negative-cache entries (deterministic 4xx errors).
 ///
 /// Short by design: a client error cached for too long would prevent legitimate
@@ -259,7 +276,7 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
     use tt_shared::ProviderError;
     match err {
         // Our own 400 validation before even hitting the provider.
-        ApiError::InvalidRequest(_) => true,
+        ApiError::InvalidRequest(_) | ApiError::RouteValidation { .. } => true,
         // Provider returned a deterministic 4xx (but NOT 429).
         ApiError::Provider(pe) => match pe {
             ProviderError::InvalidRequest(_) => true,
@@ -286,6 +303,7 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         // Config-dependent (org may add the credential / raise the ceiling) —
         // must not negative-cache.
         | ApiError::MissingProviderCredential { .. }
+        | ApiError::PanelCredentialPreflight { .. }
         | ApiError::CostLimitExceeded { .. }
         | ApiError::RateLimited { .. }
         | ApiError::RequestTimeout { .. }
@@ -308,11 +326,13 @@ fn error_status_code(err: &ApiError) -> u16 {
     use tt_shared::ProviderError;
     let status: StatusCode = match err {
         ApiError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        ApiError::RouteValidation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
         ApiError::PaymentRequired => StatusCode::PAYMENT_REQUIRED,
         ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
         ApiError::ModelNotFound { .. } => StatusCode::NOT_FOUND,
         ApiError::MissingProviderCredential { .. } => StatusCode::BAD_REQUEST,
+        ApiError::PanelCredentialPreflight { .. } => StatusCode::BAD_REQUEST,
         ApiError::CostLimitExceeded { .. } => StatusCode::PAYMENT_REQUIRED,
         ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
         ApiError::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
@@ -584,8 +604,10 @@ async fn try_l1_hit(
     tracker: Option<&tokio_util::task::TaskTracker>,
     request_log_writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
     trace_id: Uuid,
+    requested_model: &str,
     request_started: Instant,
     matched_route_id: Option<Uuid>,
+    matched_route_version_id: Option<i64>,
     route_paused: bool,
     retrieval_tokens_saved: i64,
     route_matched_name: Option<&str>,
@@ -604,10 +626,14 @@ async fn try_l1_hit(
                     request_log_for_l1_hit(
                         &entry,
                         ctx,
+                        requested_model,
                         trace_id,
                         request_started,
-                        matched_route_id,
-                        route_paused,
+                        RouteLogAttribution {
+                            route_id: matched_route_id,
+                            route_version_id: matched_route_version_id,
+                            paused: route_paused,
+                        },
                         retrieval_tokens_saved,
                     ),
                 );
@@ -711,8 +737,10 @@ async fn try_l2_hit(
     current_pricing: Option<&ModelPricing>,
     request_log_writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
     trace_id: Uuid,
+    requested_model: &str,
     request_started: Instant,
     matched_route_id: Option<Uuid>,
+    matched_route_version_id: Option<i64>,
     route_paused: bool,
     retrieval_tokens_saved: i64,
     route_matched_name: Option<&str>,
@@ -846,9 +874,11 @@ async fn try_l2_hit(
                 request_log_for_l2_hit(
                     &entry,
                     ctx,
+                    requested_model,
                     trace_id,
                     request_started,
                     matched_route_id,
+                    matched_route_version_id,
                     route_paused,
                     baseline_cost_usd,
                     retrieval_tokens_saved,
@@ -900,6 +930,10 @@ pub(crate) struct Prepared {
     pub route_matched_name: Option<String>,
     /// Matched route id for the `request_logs` row.
     pub matched_route_id: Option<Uuid>,
+    /// Immutable `route_versions.id` captured with the matched route during
+    /// the cached runtime refresh. NULL is honest for unrouted / legacy-ledger
+    /// requests; this is never derived from a mutable route revision.
+    pub matched_route_version_id: Option<i64>,
     /// Paused-route passthrough marker.
     pub route_paused: bool,
     /// Originally-requested model (pre-routing) — `gen_ai.request.model`.
@@ -919,12 +953,13 @@ pub(crate) struct Prepared {
     pub diff_plan: Option<crate::shaping::diff::DiffPlan>,
     /// Aggregated request-pass effects threaded into the cost computation.
     pub pass_effects: PassEffects,
-    /// Document Lane D4c-v2: the pre-routing distillation seam's bookkeeping (raw
-    /// image tokens the distilled-away image parts would have spent vs the
-    /// distilled text tokens they now spend). All-zero when the route did not opt
-    /// in / the sidecar is disabled / nothing distilled → `complete_once` prices
-    /// it via D0's `document_projection::project` (Gemini guard + fail-open to $0)
-    /// into the isolated `doc_vision_saved_est_usd` counterfactual.
+    /// Document Lane D4c-v2: the post-route-match, pre-provider-rebind
+    /// distillation seam's bookkeeping (raw image tokens the distilled-away image
+    /// parts would have spent vs the distilled text tokens they now spend).
+    /// All-zero when the route did not opt in / the sidecar is disabled / an
+    /// incomplete transaction preserved raw media → `complete_once` prices it via
+    /// D0's `document_projection::project` (Gemini guard + fail-open to $0) into
+    /// the isolated `doc_vision_saved_est_usd` counterfactual.
     pub doc_distill_booking: crate::document_lane::seam::DistillBookkeeping,
     /// Content-aware compression flywheel label (P1a): the dominant content kind
     /// the content_compress backend compacted (`json`/`csv`/`log`), or `None`
@@ -959,6 +994,12 @@ pub(crate) struct Prepared {
     pub failover_candidates: Vec<String>,
     /// Per-provider credentials for the failover candidate set.
     pub failover_creds: std::collections::HashMap<String, ProviderCredentials>,
+    /// Applicable route/header cost ceilings for each failover candidate. The
+    /// route keeps its historical match-time input estimate; the header
+    /// re-estimates the full final prompt with each resolved candidate's
+    /// provider tokenizer. `None` means neither ceiling applies; unknown
+    /// candidate pricing remains permissive.
+    pub failover_cost_check: Option<crate::failover::CandidateCostCheck>,
     /// Route-derived fallback chain (its `is_empty()` selects single vs failover
     /// dispatch — the pipeline reads `route_fallbacks.is_empty()` verbatim).
     pub route_fallbacks: Vec<String>,
@@ -989,7 +1030,7 @@ pub(crate) struct Prepared {
     pub judge_source_provider: Option<std::sync::Arc<dyn tt_shared::Provider>>,
     pub judge_source_ctx: Option<RequestContext>,
     pub judge_original_req: Option<ChatCompletionRequest>,
-    /// Resolved deep-research panel config when the request opted in via the
+    /// Resolved Fusion panel config when the request opted in via the
     /// `X-TokenTrimmer-Panel` header (Phase 1). `None` for every default-path
     /// request — the off-by-default invariant: an absent panel header leaves the
     /// single-model path wire-identical (the only added work is parsing one
@@ -997,6 +1038,11 @@ pub(crate) struct Prepared {
     /// `Some`, [`complete_once`] branches to [`panel::complete_panel`] BEFORE any
     /// cache / single-flight check (panels are non-deterministic and bypass both).
     pub panel: Option<panel::PanelConfig>,
+    /// Opaque proof that `panel` passed Fusion's static admission gate. This
+    /// travels with the prepared request so both buffered and streaming fan-out
+    /// revalidate the exact work immediately before any upstream dispatch.
+    /// `None` whenever `panel` is `None`.
+    pub panel_admission: Option<panel::PanelAdmission>,
     /// Per-provider credentials for the panel member set, keyed by **provider
     /// id** (spec §6.4 step 4). Resolved in [`prepare`] alongside `panel` using
     /// the same store-then-bearer-fallback pattern as the failover pre-resolution
@@ -1043,7 +1089,7 @@ pub(crate) struct CompletionHeaders {
     pub provider: std::sync::Arc<dyn tt_shared::Provider>,
     /// Pre-dispatch + dispatch warning tokens (comma-joined into the header).
     pub warnings: Vec<String>,
-    /// Deep-research panel attribution object to merge into the serialized
+    /// Fusion panel attribution object to merge into the serialized
     /// response body as `tokentrimmer.panel` (Phase 1). `None` on every
     /// non-panel dispatch — the handler then serializes the typed response
     /// byte-identically (off-by-default). `Some(value)` ONLY on the
@@ -1102,9 +1148,113 @@ pub(crate) fn attribute_run(row: &mut RequestLogRow, ctx: &tt_shared::RequestCon
 pub(crate) async fn complete_once(
     state: &AppState,
     ctx: &RequestContext,
-    mut prep: Prepared,
+    prep: Prepared,
 ) -> ApiResult<CompletionOutcome> {
-    // Deep-research panel branch (Phase 1) — FIRST, before any cache /
+    let retry = RetryPolicy::default();
+    complete_once_with_retry_policy(state, ctx, prep, &retry).await
+}
+
+/// Execute one capped workflow turn after the shared route/action preparation.
+///
+/// A numeric workflow reservation covers one priceable provider turn. Route
+/// rewrites remain available, but work that can add an unreserved upstream leg
+/// is removed: retries, failover, shadow/panel/workflow fan-out, quality judging,
+/// and diff re-emission. The final routed/shaped request is re-priced against
+/// the node's effective remaining cap before the one allowed attempt.
+pub(crate) async fn complete_once_budgeted_workflow(
+    state: &AppState,
+    ctx: &RequestContext,
+    mut prep: Prepared,
+    max_cost_usd: f64,
+) -> ApiResult<CompletionOutcome> {
+    prep.panel = None;
+    prep.panel_admission = None;
+    prep.panel_creds.clear();
+    prep.workflow = None;
+    prep.route_shadow_model = None;
+    prep.route_fallbacks.clear();
+    prep.failover_candidates.clear();
+    prep.failover_creds.clear();
+    prep.failover_cost_check = None;
+    prep.judge_source_provider = None;
+    prep.judge_source_ctx = None;
+    prep.judge_original_req = None;
+    if let Some(plan) = prep.diff_plan.take() {
+        crate::shaping::diff::unapply_diff_request(&mut prep.req, &plan);
+    }
+    prep.warnings
+        .push("workflow_budget_single_dispatch".to_string());
+
+    admit_budgeted_workflow_dispatch(&prep.req, max_cost_usd)?;
+
+    let retry = RetryPolicy::default().capped(1);
+    complete_once_with_retry_policy(state, ctx, prep, &retry).await
+}
+
+fn admit_budgeted_workflow_dispatch(
+    req: &ChatCompletionRequest,
+    max_cost_usd: f64,
+) -> ApiResult<()> {
+    let routed_estimate = crate::routes::agent_run_budget::estimate_next_turn_cost(
+        &req.model,
+        &req.messages,
+        req.max_tokens,
+    )
+    .filter(|estimate| estimate.is_finite() && *estimate >= 0.0)
+    .ok_or_else(|| {
+        ApiError::InvalidRequest(
+            "workflow budget dispatch could not price the final routed request".into(),
+        )
+    })?;
+    if crate::routes::agent_run_budget::would_exceed(0.0, Some(routed_estimate), Some(max_cost_usd))
+    {
+        return Err(ApiError::InvalidRequest(
+            "workflow budget dispatch rejected the final routed request before provider work"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod workflow_budget_dispatch_tests {
+    use super::*;
+
+    fn request(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
+            messages: vec![Message::User {
+                content: MessageContent::Text("hello".into()),
+                name: None,
+            }],
+            max_tokens: Some(64),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn final_routed_request_must_be_priceable_and_fit_the_effective_cap() {
+        let known = request("gpt-4o-mini");
+        let estimate = crate::routes::agent_run_budget::estimate_next_turn_cost(
+            &known.model,
+            &known.messages,
+            known.max_tokens,
+        )
+        .expect("catalog model");
+
+        assert!(admit_budgeted_workflow_dispatch(&known, estimate).is_ok());
+        assert!(admit_budgeted_workflow_dispatch(&known, estimate / 2.0).is_err());
+        assert!(admit_budgeted_workflow_dispatch(&request("unknown-model"), 1.0).is_err());
+    }
+}
+
+async fn complete_once_with_retry_policy(
+    state: &AppState,
+    ctx: &RequestContext,
+    mut prep: Prepared,
+    retry_policy: &RetryPolicy,
+) -> ApiResult<CompletionOutcome> {
+    // Fusion panel branch — FIRST, before any cache /
     // single-flight check. Panels are non-deterministic (two same-model legs
     // must not coalesce) and bill as ONE aggregate row, so they bypass L1/L2 +
     // single-flight entirely (spec §6.5, invariant §2.1.5). `take()` leaves
@@ -1122,13 +1272,17 @@ pub(crate) async fn complete_once(
     // by design — workflows.rs:1063) for the same reason.
     if prep.skip_shadow {
         prep.panel = None;
+        prep.panel_admission = None;
         prep.route_shadow_model = None;
         prep.workflow = None;
         prep.warnings
             .push("budget-breach: shadow/panel/workflow routes skipped (PauseShadow)".to_string());
     }
     if let Some(cfg) = prep.panel.take() {
-        return panel::complete_panel(state, ctx, prep, cfg).await;
+        let admission = prep.panel_admission.take().ok_or_else(|| {
+            ApiError::Internal("panel configuration missing its admission proof".to_string())
+        })?;
+        return panel::complete_panel(state, ctx, prep, cfg, admission).await;
     }
     // Workflow-detour branch (CO-1) — before cache / single-flight, for the
     // same reason as the panel branch: a workflow is non-deterministic (a
@@ -1171,6 +1325,7 @@ pub(crate) async fn complete_once(
         skip_l2,
         route_matched_name,
         matched_route_id,
+        matched_route_version_id,
         route_paused,
         requested_model,
         requested_pricing,
@@ -1194,6 +1349,7 @@ pub(crate) async fn complete_once(
         route_shadow_model,
         failover_candidates,
         failover_creds,
+        failover_cost_check,
         route_fallbacks,
         mut warnings,
         request_timeout,
@@ -1211,6 +1367,8 @@ pub(crate) async fn complete_once(
         // Already `take`n into the panel branch above (and `None` for the
         // single-model path that reaches here); bind to `_` to stay exhaustive.
         panel: _,
+        // Panel-only; the single-model path never reads it.
+        panel_admission: _,
         // Panel-only; the single-model path never reads it.
         panel_creds: _,
         // Already `take`n into the workflow branch above (and `None` otherwise).
@@ -1244,8 +1402,10 @@ pub(crate) async fn complete_once(
                 state.telemetry_tracker.as_ref(),
                 state.request_log_writer.as_ref(),
                 trace_id,
+                &requested_model,
                 request_started,
                 matched_route_id,
+                matched_route_version_id,
                 route_paused,
                 retrieval_telemetry.tokens_saved,
                 route_matched_name.as_deref(),
@@ -1289,8 +1449,10 @@ pub(crate) async fn complete_once(
                 current_pricing.as_ref(),
                 state.request_log_writer.as_ref(),
                 trace_id,
+                &requested_model,
                 request_started,
                 matched_route_id,
+                matched_route_version_id,
                 route_paused,
                 retrieval_telemetry.tokens_saved,
                 route_matched_name.as_deref(),
@@ -1354,10 +1516,14 @@ pub(crate) async fn complete_once(
                                             request_log_for_l1_hit(
                                                 &entry,
                                                 ctx,
+                                                &requested_model,
                                                 trace_id,
                                                 request_started,
-                                                matched_route_id,
-                                                route_paused,
+                                                RouteLogAttribution {
+                                                    route_id: matched_route_id,
+                                                    route_version_id: matched_route_version_id,
+                                                    paused: route_paused,
+                                                },
                                                 retrieval_telemetry.tokens_saved,
                                             ),
                                         );
@@ -1418,10 +1584,8 @@ pub(crate) async fn complete_once(
     let primary_dispatch = with_request_timeout(request_timeout, async {
         if route_fallbacks.is_empty() {
             let __started = std::time::Instant::now();
-            let __dispatch = with_retry(&RetryPolicy::default(), || {
-                provider.chat_completion(req.clone(), ctx)
-            })
-            .await;
+            let __dispatch =
+                with_retry(retry_policy, || provider.chat_completion(req.clone(), ctx)).await;
             let __elapsed = __started.elapsed();
             crate::metrics::record_provider_latency(provider.id(), "chat", __elapsed);
             // Feed the rolling p95 window (the live signal behind the
@@ -1447,7 +1611,7 @@ pub(crate) async fn complete_once(
             crate::failover::dispatch_with_failover(
                 &state.registry,
                 &state.breaker,
-                &RetryPolicy::default(),
+                retry_policy,
                 &failover_candidates,
                 &req,
                 ctx,
@@ -1457,9 +1621,10 @@ pub(crate) async fn complete_once(
                     required: &cap_required,
                     estimated_tokens: cap_est_tokens,
                 }),
+                failover_cost_check,
             )
             .await
-            .map_err(ApiError::from)
+            .map_err(map_failover_error)
         }
     });
 
@@ -1688,7 +1853,7 @@ pub(crate) async fn complete_once(
                 // Single provider, no failover chain — the chain already
                 // chose this provider for the patch dispatch.
                 let reemit = with_request_timeout(request_timeout, async {
-                    with_retry(&RetryPolicy::default(), || {
+                    with_retry(retry_policy, || {
                         provider.chat_completion(reemit_req.clone(), ctx)
                     })
                     .await
@@ -1775,7 +1940,7 @@ pub(crate) async fn complete_once(
         shape_effects,
     );
     // Document Lane D4c-v2: price the isolated vision-avoided saving from the
-    // pre-routing seam's bookkeeping (raw image tokens the distilled-away image
+    // post-match seam's bookkeeping (raw image tokens the distilled-away image
     // parts WOULD have spent vs the distilled text tokens they now spend) via
     // D0's `document_projection::project`, at the served model's input rate.
     // `project` applies the Gemini direction guard ($0 for Gemini — page-images
@@ -1784,7 +1949,10 @@ pub(crate) async fn complete_once(
     // no-image path), or a $0 projection → the field stays at its compute_cost_full
     // default of 0.0. NEVER folded into cost_usd/baseline/tt_saved_usd (it is a
     // counterfactual the request never sent — not invoice-reconcilable).
-    if doc_distill_booking.distilled_parts > 0 {
+    // A fallback may serve a different model than the one used to distill the
+    // request. Its image/text token formulas can differ, so fail open to $0
+    // rather than price a counterfactual with the wrong model's rate.
+    if doc_distill_booking.distilled_parts > 0 && response.model == req.model {
         if let Some(p) = pricing.as_ref() {
             let proj = tt_preview::document_projection::project(
                 doc_distill_booking.raw_image_tokens,
@@ -1972,6 +2140,10 @@ pub(crate) async fn complete_once(
         api_key_id: ctx.api_key_id,
         ts: Utc::now(),
         provider: provider_id.clone(),
+        // Preserve the exact matcher input separately from the final served
+        // model so historical `model_in` evidence never has to infer it from
+        // routing/failover output.
+        requested_model: Some(requested_model.clone()),
         model: model_used.clone(),
         input_tokens: response.usage.prompt_tokens as i32,
         output_tokens: response.usage.completion_tokens as i32,
@@ -1982,9 +2154,16 @@ pub(crate) async fn complete_once(
         // Fee-applied, matching the header/span figure — keeps the
         // row-derived TT headline equal to `tt_saved_usd()`.
         cache_bust_penalty_usd: cost_breakdown.cache_bust_penalty_usd,
+        // Persist every cost-breakdown component surfaced by the response so
+        // the dashboard/reporting plane never has to infer a zero from a
+        // missing column. `summarizer_tax_usd` remains a tax, not saving.
+        flex_saved_usd: cost_breakdown.flex_saved_usd,
+        doc_compaction_saved_usd: cost_breakdown.doc_compaction_saved_usd,
+        summarizer_tax_usd: cost_breakdown.summarizer_tax_usd,
         cached: false,
         cache_layer: None,
         route_id: matched_route_id,
+        route_version_id: matched_route_version_id,
         latency_ms: request_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
         upstream_latency_ms: None,
         status: 200,
@@ -2037,7 +2216,7 @@ pub(crate) async fn complete_once(
         compression_tokens_removed: pass_effects.compression_tokens_removed as i64,
         // Document Lane D4c-v2: ISOLATED, ESTIMATED vision-avoided saving (own
         // column, migration 0032; never folded into cost/baseline/saved). Priced
-        // from the pre-routing seam's DistillBooking via D0's
+        // from the post-match seam's DistillBooking via D0's
         // document_projection::project (Gemini guard + fail-open); $0 when the
         // route did not opt in / the sidecar is disabled / nothing distilled.
         doc_vision_saved_est_usd: cost_breakdown.doc_vision_saved_est_usd,
@@ -2412,14 +2591,21 @@ pub async fn handler(
         // flows through as a single-model stream instead.
         if prep.skip_shadow {
             prep.panel = None;
+            prep.panel_admission = None;
         }
         if let Some(cfg) = prep.panel.take() {
+            let admission = prep.panel_admission.take().ok_or_else(|| {
+                ApiError::Internal("panel configuration missing its admission proof".to_string())
+            })?;
             // `complete_panel_streaming` returns `Result<Response, ApiError>`;
             // `ApiError` is `IntoResponse`, so a fail-closed error (quorum-unmet
             // 502, arbiter-establishment failure) becomes a proper non-200
             // response — and, critically, returns BEFORE any stream is opened
             // (no 200, no request_logs row).
-            return crate::routes::panel::complete_panel_streaming(&state, &ctx, prep, cfg).await;
+            return crate::routes::panel::complete_panel_streaming(
+                &state, &ctx, prep, cfg, admission,
+            )
+            .await;
         }
         return handle_streaming(&state, &ctx, prep).await;
     }
@@ -2537,6 +2723,175 @@ pub async fn handler(
     }
 }
 
+/// The non-direct response owner that makes a route format switch inapplicable.
+///
+/// A Fusion panel and a workflow detour bypass the direct completion tail where
+/// a switch is validated, advertised, and assigned its isolated estimate. The
+/// request must therefore stay in its caller-requested structured form before
+/// either owner fans it out or consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatSwitchResponseOwner {
+    FusionPanel,
+    WorkflowDetour,
+}
+
+impl FormatSwitchResponseOwner {
+    const fn skip_reason(self) -> &'static str {
+        match self {
+            Self::FusionPanel => "panel",
+            Self::WorkflowDetour => "workflow",
+        }
+    }
+}
+
+/// Result of deciding and, only when safe, applying a route format switch.
+///
+/// Keeping mutation in this one helper makes the composition contract
+/// testable: every skipped outcome leaves the request byte-identical and has
+/// no plan that a response-owning branch could later advertise or book.
+enum RouteFormatSwitchPreparation {
+    NotRequested,
+    Applied(crate::shaping::format_switch::FormatSwitchPlan),
+    Skipped(&'static str),
+}
+
+/// Apply an eligible route format switch, unless another response owner takes
+/// the request first.
+///
+/// Streaming intentionally bypasses the owner guard so the established
+/// `format_switch_skipped:streaming` planner token remains the first reason.
+/// Likewise, a shadow workflow is passed as no owner: its direct response
+/// still follows the normal format-switch contract.
+fn prepare_route_format_switch(
+    req: &mut ChatCompletionRequest,
+    route_format_switch: Option<&str>,
+    response_owner: Option<FormatSwitchResponseOwner>,
+    diff_applies: bool,
+) -> RouteFormatSwitchPreparation {
+    let Some(requested) = route_format_switch else {
+        return RouteFormatSwitchPreparation::NotRequested;
+    };
+
+    if !req.stream {
+        if let Some(owner) = response_owner {
+            return RouteFormatSwitchPreparation::Skipped(owner.skip_reason());
+        }
+    }
+    if diff_applies {
+        return RouteFormatSwitchPreparation::Skipped("conflict");
+    }
+
+    match crate::shaping::format_switch::plan_format_switch(req, Some(requested)) {
+        Some(crate::shaping::ShapeDecision::Apply(plan)) => {
+            crate::shaping::format_switch::apply_format_switch_request(req, &plan);
+            RouteFormatSwitchPreparation::Applied(plan)
+        }
+        Some(crate::shaping::ShapeDecision::Skip(reason)) => {
+            RouteFormatSwitchPreparation::Skipped(reason)
+        }
+        // `requested` is Some above, so the planner cannot return None. Keep
+        // the default explicitly fail-open if that invariant ever changes.
+        None => RouteFormatSwitchPreparation::NotRequested,
+    }
+}
+
+/// The response owner that bypasses the direct-completion tail for request
+/// transformations that rely on that tail to reconstruct or account for their
+/// result.
+///
+/// A selected Fusion panel owns both streaming and non-streaming responses.
+/// A workflow only owns a non-streaming response: streaming workflow detours
+/// deliberately fall through to the direct streaming path. `skip_shadow`
+/// likewise deliberately drops either detour and preserves the direct path.
+fn non_direct_response_owner(
+    panel_selected: bool,
+    workflow: Option<&tt_routing::RouteWorkflow>,
+    request_stream: bool,
+    skip_shadow: bool,
+) -> Option<&'static str> {
+    if skip_shadow {
+        return None;
+    }
+    if panel_selected {
+        return Some("panel");
+    }
+    if !request_stream && workflow.is_some_and(|cfg| cfg.mode.as_deref() != Some("shadow")) {
+        return Some("workflow");
+    }
+    None
+}
+
+/// Restore a raw-media request to the caller-selected dispatch path when the
+/// optional Document Lane transaction cannot safely support the route rewrite.
+///
+/// The route remains attributed, but no target-model rewrite, route/header
+/// fallback, or shadow dispatch may carry an unconverted document/image into a
+/// text-oriented path. Keeping this in one helper makes the rollback complete
+/// and preserves the original request bytes except for later independent safety
+/// transforms such as redaction.
+fn rollback_document_lane_route_rewrite(
+    req: &mut ChatCompletionRequest,
+    requested_model: &str,
+    model_was_rewritten: &mut bool,
+    route_fallbacks: &mut Vec<String>,
+    route_shadow_model: &mut Option<String>,
+) {
+    req.model = requested_model.to_string();
+    *model_was_rewritten = false;
+    route_fallbacks.clear();
+    *route_shadow_model = None;
+}
+
+/// Result of deciding and, only when safe, applying a route diff.
+///
+/// Keeping the raw mutation inside this owner-aware helper prevents a panel or
+/// workflow detour from inheriting the patch-only prompt / dropped response
+/// contract that only the direct completion tail knows how to reconstruct.
+enum RouteDiffPreparation {
+    NotRequested,
+    Applied(crate::shaping::diff::DiffPlan),
+    Skipped(&'static str),
+}
+
+/// Apply an eligible route diff unless another response owner takes the
+/// request first.
+///
+/// The planner retains precedence for streaming so existing
+/// `diff_skipped:streaming` observability remains unchanged. A shadow workflow
+/// is passed as no owner because its caller-visible response is still direct.
+fn prepare_route_diff(
+    req: &mut ChatCompletionRequest,
+    requested: bool,
+    response_owner: Option<&'static str>,
+) -> RouteDiffPreparation {
+    if !requested {
+        return RouteDiffPreparation::NotRequested;
+    }
+    if !req.stream {
+        if let Some(owner) = response_owner {
+            return RouteDiffPreparation::Skipped(owner);
+        }
+    }
+
+    match crate::shaping::diff::plan_diff(req, true) {
+        Some(crate::shaping::ShapeDecision::Apply(plan)) => {
+            // No pre-mutation clone is kept: the fail-closed re-emit is
+            // derived from the DISPATCHED request at the failure site
+            // (`unapply_diff_request` — drop the instruction, restore the
+            // plan's response_format) so it inherits every dispatch-path
+            // normalization. A pre-pipeline clone would bypass the redaction
+            // guardrail on a redact+diff route and dispatch un-flexed bytes
+            // that `compute_cost_full` prices at flex rates.
+            crate::shaping::diff::apply_diff_request(req, &plan);
+            RouteDiffPreparation::Applied(plan)
+        }
+        Some(crate::shaping::ShapeDecision::Skip(reason)) => RouteDiffPreparation::Skipped(reason),
+        // `requested` is true above, so the planner cannot return None. Keep
+        // the default explicitly fail-open if that invariant ever changes.
+        None => RouteDiffPreparation::NotRequested,
+    }
+}
+
 /// Run the shared per-request setup for a chat completion and bundle the result
 /// into a [`Prepared`] for the streaming arm / [`complete_once`] / the
 /// server-side agent loop.
@@ -2606,6 +2961,10 @@ pub(crate) async fn prepare(
     };
     let route_match = apply_routing(state, ctx, req, forced_route.as_deref()).await?;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
+    // This is the immutable ledger ID captured with the runtime route cache
+    // refresh. It is nullable by design; never fall back to a mutable route
+    // revision when a legacy/skewed ledger cannot provide an identity.
+    let matched_route_version_id = route_match.as_ref().and_then(|m| m.route_version_id);
     // The matched route is sticky-PAUSED: apply_routing suppressed the rewrite
     // and every cost lever (req.model is untouched). Captured before
     // `route_match` is consumed; drives the warnings token + metric +
@@ -2674,13 +3033,13 @@ pub(crate) async fn prepare(
     // request-pass pipeline never runs and the request is byte-for-byte
     // unchanged.
     let route_doc_compaction = route_match.as_ref().is_some_and(|m| m.doc_compaction);
-    // A matched route opting into the Document Lane pre-routing distillation
-    // seam (`RouteAction::document_lane`, D4c). When true the gateway distills
-    // inline document/image content parts to text BEFORE `SplitRequest::compute`
-    // (so the cache-stable prefix + L1/L2 keys derive from the distilled request
-    // + routing can downgrade to a text model). When false (the default) the
-    // seam never runs — zero behavior change. Fail-open when the sidecar is
-    // disabled (`TT_DOC_SIDECAR_URL` unset) or errors.
+    // A matched route opting into the Document Lane distillation seam
+    // (`RouteAction::document_lane`, D4c). It runs after the route/canary choice
+    // (the opt-in and candidate target are now known) but before target-provider
+    // rebind, pinning, panel admission, failover, and cache preparation. Only a
+    // complete all-media conversion retains the target rewrite; otherwise raw
+    // media and the caller model are restored. When false (the default), the
+    // seam never runs — zero behavior change.
     let route_document_lane = route_match.as_ref().is_some_and(|m| m.document_lane);
     // A matched route opting into the content-aware compression pass
     // (`RouteAction::content_compress`, P1a). When false (the default — no route
@@ -2733,7 +3092,7 @@ pub(crate) async fn prepare(
     // revert to the originally-requested model when the split assigns this
     // request to the control arm.
     let route_traffic_pct = route_match.as_ref().and_then(|m| m.traffic_pct);
-    let route_shadow_model = route_match.as_ref().and_then(|m| m.shadow_model.clone());
+    let mut route_shadow_model = route_match.as_ref().and_then(|m| m.shadow_model.clone());
     let route_target_model = route_match.as_ref().map(|m| m.target_model.clone());
     // Per-request cost ceiling (V3d-2b) + the token estimate, captured before
     // `route_match` is consumed below.
@@ -2744,6 +3103,13 @@ pub(crate) async fn prepare(
         .unwrap_or(0);
     // Ordered fallback model ids from the matched route (empty = no failover).
     let mut route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
+    // An incomplete/suppressed Document Lane conversion restores the original
+    // model and must also suppress any later header fallback override. Otherwise
+    // raw media could still reach a text fallback after the route chain itself
+    // was cleared.
+    let mut document_lane_blocks_fallbacks = false;
+    let mut document_lane_warning: Option<&'static str> = None;
+    let mut doc_distill_booking = crate::document_lane::seam::DistillBookkeeping::default();
 
     // ── Canary traffic split (#454) ──────────────────────────────────────────
     //
@@ -2833,6 +3199,72 @@ pub(crate) async fn prepare(
         }
     }
 
+    // Document Lane D4c — after route/canary selection but before any
+    // target-provider rebind, provider pin, panel admission, or failover/cache
+    // setup. A complete transaction can safely keep the target rewrite because
+    // every lane-targeted media part is now text. A disabled/failed/partial
+    // sidecar transaction instead restores the raw request's caller model and
+    // drops route/header fallbacks and shadow work, so raw media cannot leak to a
+    // text target. Fusion panels and non-shadow workflow detours own their own
+    // response/model compositions; they receive the raw request and explicitly
+    // suppress this direct-path optimization rather than inheriting its booking.
+    if route_document_lane && crate::document_lane::seam::request_has_lane_targeted_parts(req) {
+        let owner = non_direct_response_owner(
+            panel::panel_from_header(headers).is_some() || route_panel.is_some(),
+            route_workflow.as_ref(),
+            req.stream,
+            skip_shadow,
+        );
+        if let Some(owner) = owner {
+            document_lane_warning = Some(owner);
+            document_lane_blocks_fallbacks = true;
+            rollback_document_lane_route_rewrite(
+                req,
+                &requested_model,
+                &mut model_was_rewritten,
+                &mut route_fallbacks,
+                &mut route_shadow_model,
+            );
+        } else {
+            let harness = crate::document_lane::seam::DistillHarness::from_env();
+            let distill_model = req.model.clone();
+            match crate::document_lane::seam::distill_request_parts_with_outcome(
+                &harness,
+                &distill_model,
+                req,
+            )
+            .await
+            {
+                crate::document_lane::seam::RequestDistillOutcome::Complete { booking } => {
+                    tracing::info!(
+                        target: "tokentrimmer.document_lane",
+                        distilled_parts = booking.distilled_parts,
+                        raw_image_tokens = booking.raw_image_tokens,
+                        distilled_text_tokens = booking.distilled_text_tokens,
+                        "document-lane seam distilled every media part to text"
+                    );
+                    doc_distill_booking = booking;
+                }
+                crate::document_lane::seam::RequestDistillOutcome::Incomplete => {
+                    document_lane_warning = Some("incomplete");
+                    document_lane_blocks_fallbacks = true;
+                    rollback_document_lane_route_rewrite(
+                        req,
+                        &requested_model,
+                        &mut model_was_rewritten,
+                        &mut route_fallbacks,
+                        &mut route_shadow_model,
+                    );
+                }
+                crate::document_lane::seam::RequestDistillOutcome::NoEligibleParts => {
+                    // The predicate above already proved otherwise. Preserve a
+                    // fail-open no-op if a future request representation makes
+                    // the scan and transaction disagree.
+                }
+            }
+        }
+    }
+
     if model_was_rewritten {
         // Provider may change when a route crosses providers (V3d-1); the
         // registry is the source of truth.
@@ -2853,20 +3285,6 @@ pub(crate) async fn prepare(
                     return Err(ApiError::MissingProviderCredential {
                         provider: provider.id().to_string(),
                     })
-                }
-            }
-        }
-        // Per-request cost ceiling (V3d-2b): reject when the rerouted model's
-        // estimated cost still exceeds the route's max_cost_usd. Permissive when
-        // pricing is unknown (can't prove an exceedance).
-        if let Some(ceiling) = route_max_cost_usd {
-            if let Some(pr) = provider.pricing(&req.model) {
-                let routed_cost = estimate_cost_usd(&pr, route_input_tokens, req.max_tokens);
-                if routed_cost > ceiling {
-                    return Err(ApiError::CostLimitExceeded {
-                        estimated_usd: routed_cost,
-                        ceiling_usd: ceiling,
-                    });
                 }
             }
         }
@@ -2894,29 +3312,65 @@ pub(crate) async fn prepare(
         // path re-resolves the primary candidate by model id and so cannot honor a
         // pinned primary provider. The pin wins (single-provider dispatch).
         route_fallbacks.clear();
-    } else if let Some(chain) = fallback_override_from_header(headers) {
-        // `X-TokenTrimmer-Fallback` overrides the route-derived chain (no pin).
-        route_fallbacks = chain;
+    } else if !document_lane_blocks_fallbacks {
+        if let Some(chain) = fallback_override_from_header(headers) {
+            // `X-TokenTrimmer-Fallback` overrides the route-derived chain (no pin).
+            route_fallbacks = chain;
+        }
     }
 
-    // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header.
-    // Applies to every request (routed or not), priced on the final model.
-    // Estimate input tokens from the ENTIRE prompt (system + all turns), matching
-    // the streaming/failover paths — counting only the last user message would
-    // undercount multi-turn / large-system-prompt requests and let an over-limit
-    // request slip past the cap.
-    {
-        let combined = tt_shared::message_text_for_estimation(req);
-        let cl_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
+    // Cost ceilings are evaluated only after an explicit provider pin has
+    // settled the actual primary provider. The route ceiling retains its
+    // existing rewrite-only scope (including active modifier-only routes),
+    // while the header applies to every request. The route keeps its original
+    // match-time input estimate; the header prices the whole final prompt.
+    let header_cost_limit = cost_limit_from_header(headers);
+    let combined = tt_shared::message_text_for_estimation(req);
+    let header_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
+    let primary_pricing = provider.pricing(&req.model);
+    if model_was_rewritten {
         enforce_cost_limit(
-            cost_limit_from_header(headers),
-            provider.pricing(&req.model).as_ref(),
-            cl_input_tokens,
+            route_max_cost_usd,
+            primary_pricing.as_ref(),
+            route_input_tokens,
             req.max_tokens,
         )?;
     }
+    enforce_cost_limit(
+        header_cost_limit,
+        primary_pricing.as_ref(),
+        header_input_tokens,
+        req.max_tokens,
+    )?;
 
-    // Deep-research panel resolution + fail-closed budget gate (Phase 1, spec
+    // The primary is now admitted before any cache lookup. When a chain is
+    // configured, carry the same independent constraints into its candidates.
+    // The route constraint keeps its historical match estimate; the header
+    // constraint is re-estimated from the final prompt for each candidate's
+    // tokenizer before it can obtain credentials, enter a breaker trial, or
+    // make an upstream call.
+    let route_failover_cost = if model_was_rewritten {
+        route_max_cost_usd.map(|ceiling_usd| crate::failover::RouteCostConstraint {
+            ceiling_usd,
+            input_tokens: route_input_tokens,
+            max_tokens: req.max_tokens,
+        })
+    } else {
+        None
+    };
+    let header_failover_cost =
+        header_cost_limit.map(|ceiling_usd| crate::failover::HeaderCostConstraint {
+            ceiling_usd,
+            max_tokens: req.max_tokens,
+        });
+    let failover_cost_check = (!route_fallbacks.is_empty()
+        && (route_failover_cost.is_some() || header_failover_cost.is_some()))
+    .then_some(crate::failover::CandidateCostCheck {
+        route: route_failover_cost,
+        header: header_failover_cost,
+    });
+
+    // Fusion panel resolution + fail-closed budget gate (spec
     // §6.4 steps 1-3). Runs HERE, before `Prepared` is built and before any
     // dispatch, so an over-budget / unpriceable / kill-switched panel 4xx/402s
     // with ZERO upstream calls. Off-by-default: an absent `X-TokenTrimmer-Panel`
@@ -2937,7 +3391,7 @@ pub(crate) async fn prepare(
         Some(strategy) => Some(PanelTrigger::Header(strategy)),
         None => route_panel.map(PanelTrigger::Route),
     };
-    let (panel, panel_creds) = if let Some(trigger) = panel_trigger {
+    let (panel, panel_admission, panel_creds) = if let Some(trigger) = panel_trigger {
         // Kill-switch: an explicit panel request on a panel-disabled gateway is a
         // hard 403, never a silent fallback to single-model billing (spec §6.5).
         if !state.panel_enabled {
@@ -3001,29 +3455,31 @@ pub(crate) async fn prepare(
         match cfg {
             // Defensive skip (route strategy unparseable): no panel, no gates,
             // no creds — the request continues on the single-model path.
-            None => (None, std::collections::HashMap::new()),
+            None => (None, None, std::collections::HashMap::new()),
             Some(cfg) => {
-                // Fail-closed budget gate: sums fee-aware estimates over (N members +
-                // arbiter); any unpriceable member or a missing budget ⇒ 402 before any
-                // dispatch. Uses the SAME whole-prompt input-token estimate the
-                // single-model cost ceiling above uses, on the post-routing request.
-                let combined = tt_shared::message_text_for_estimation(req);
-                let panel_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
-                panel::panel_budget_gate(
+                // Fail-closed budget gate: prices the known static Fusion shape
+                // (member fan-out plus strategy-specific arbiter fan-in/output),
+                // including max_completion_tokens when it overrides max_tokens.
+                // Any unpriceable member or a missing budget ⇒ 402 before any
+                // dispatch. This remains an admission estimate, not a runtime
+                // reservation or spending ceiling.
+                let admission = panel::admit_panel_request_with_tokenizer_provider(
                     state,
                     &cfg,
-                    panel_input_tokens,
-                    req.max_tokens,
+                    req,
+                    provider.id(),
                     cost_limit_from_header(headers),
                 )?;
                 // Per-member-provider credential pre-resolution (spec §6.4 step 4),
                 // keyed by provider id. Mirrors the failover pre-resolution pattern
                 // (distinct providers, first-seen order, resolve each once): the
                 // raw-Bearer fallback is allowed ONLY for the source provider (the bearer
-                // IS its key); cross-provider members with no stored org credential are
-                // simply absent here and `run_panel` records them as `skipped_no_cred`
-                // (never dispatched, never billed). The arbiter provider is included so
-                // arbitration can dispatch on a member-distinct provider.
+                // IS its key); cross-provider members with no stored org credential stay
+                // absent. The following request-local preflight rejects an impossible
+                // quorum or missing LLM-arbiter credential before dispatch; only extra
+                // members beyond that feasible quorum can later be `skipped_no_cred`.
+                // The arbiter provider is included so arbitration can dispatch on a
+                // member-distinct provider.
                 let mut provider_ids: Vec<String> = Vec::new();
                 for m in cfg
                     .members
@@ -3048,11 +3504,16 @@ pub(crate) async fn prepare(
                         creds.insert(pid, c);
                     }
                 }
-                (Some(cfg), creds)
+                // This is a credential-map feasibility fence, not a provider-health,
+                // credential-validity, reservation, or runtime-readiness probe. It runs
+                // before `Prepared` exists, so an impossible panel opens no upstream
+                // request and creates no panel result/log row.
+                panel::validate_panel_credential_preflight(state, &cfg, &creds)?;
+                (Some(cfg), Some(admission), creds)
             }
         }
     } else {
-        (None, std::collections::HashMap::new())
+        (None, None, std::collections::HashMap::new())
     };
 
     // Normalize the request for the routed provider and collect any pre-dispatch
@@ -3073,6 +3534,9 @@ pub(crate) async fn prepare(
         let name = route_matched_name.as_deref().unwrap_or("unknown");
         warnings.push(format!("route_paused:{name}"));
     }
+    if let Some(reason) = document_lane_warning {
+        warnings.push(format!("document_lane_not_applied:{reason}"));
+    }
 
     // ── Request-side output shaping (research Phase 3.3 + 3.4) ──────────────
     //
@@ -3080,53 +3544,59 @@ pub(crate) async fn prepare(
     // erase the json_schema shape the csv planner reads; once a switch/diff
     // applies, response_format is None and the downgrade no-ops) and before
     // cache-key derivation (the mutated request hashes to its own L1 key).
-    // Both planners gate on `req.stream` internally, so the streaming branch
-    // below is untouched by construction. format_switch × diff is
-    // config-rejected at route creation (`validate_output_shaping`);
-    // defensively, if both somehow apply, diff wins and the switch is skipped
-    // with the `conflict` token.
-    let diff_decision = crate::shaping::diff::plan_diff(req, route_diff);
-    let format_switch_requested =
-        if matches!(diff_decision, Some(crate::shaping::ShapeDecision::Apply(_)))
-            && route_format_switch.is_some()
-        {
-            warnings.push("format_switch_skipped:conflict".to_string());
-            crate::metrics::record_format_switch_skip("conflict");
-            None
-        } else {
-            route_format_switch.as_deref()
-        };
+    // The diff and format planners gate on `req.stream` internally, so their
+    // streaming behavior remains planner-owned. A resolved, non-shadow Fusion
+    // panel or workflow detour owns the final response instead of the direct
+    // dispatch, so transformations that rely on the direct response tail must
+    // not mutate the request for an output path that cannot validate,
+    // reconstruct, advertise, or book them. This applies equally to route- and
+    // header-selected panels because both resolve to `panel` above.
+    // `skip_shadow` means complete_once deliberately drops those owners and
+    // takes the direct path, so it remains eligible. Finally,
+    // format_switch × diff is config-rejected at route creation
+    // (`validate_output_shaping`); defensively, if both somehow apply, diff
+    // wins and the switch is skipped with the `conflict` token.
+    let response_owner = non_direct_response_owner(
+        panel.is_some(),
+        route_workflow.as_ref(),
+        req.stream,
+        skip_shadow,
+    );
+    let diff_preparation = prepare_route_diff(req, route_diff, response_owner);
+    let format_switch_owner = if !skip_shadow && panel.is_some() {
+        Some(FormatSwitchResponseOwner::FusionPanel)
+    } else if !skip_shadow
+        && route_workflow
+            .as_ref()
+            .is_some_and(|cfg| cfg.mode.as_deref() != Some("shadow"))
+    {
+        Some(FormatSwitchResponseOwner::WorkflowDetour)
+    } else {
+        None
+    };
+    let diff_applies = matches!(&diff_preparation, RouteDiffPreparation::Applied(_));
     let mut format_switch_plan: Option<crate::shaping::format_switch::FormatSwitchPlan> = None;
-    match crate::shaping::format_switch::plan_format_switch(req, format_switch_requested) {
-        Some(crate::shaping::ShapeDecision::Apply(p)) => {
-            crate::shaping::format_switch::apply_format_switch_request(req, &p);
-            format_switch_plan = Some(p);
-        }
-        Some(crate::shaping::ShapeDecision::Skip(r)) => {
+    match prepare_route_format_switch(
+        req,
+        route_format_switch.as_deref(),
+        format_switch_owner,
+        diff_applies,
+    ) {
+        RouteFormatSwitchPreparation::Applied(p) => format_switch_plan = Some(p),
+        RouteFormatSwitchPreparation::Skipped(r) => {
             warnings.push(format!("format_switch_skipped:{r}"));
             crate::metrics::record_format_switch_skip(r);
         }
-        None => {}
+        RouteFormatSwitchPreparation::NotRequested => {}
     }
     let mut diff_plan: Option<crate::shaping::diff::DiffPlan> = None;
-    match diff_decision {
-        Some(crate::shaping::ShapeDecision::Apply(p)) => {
-            // No pre-mutation clone is kept: the fail-closed re-emit is
-            // derived from the DISPATCHED request at the failure site
-            // (`unapply_diff_request` — drop the instruction, restore the
-            // plan's response_format) so it inherits every dispatch-path
-            // normalization. A pre-pipeline clone would bypass the
-            // redaction guardrail on a redact+diff route and dispatch
-            // un-flexed bytes that `compute_cost_full` prices at flex
-            // rates.
-            crate::shaping::diff::apply_diff_request(req, &p);
-            diff_plan = Some(p);
+    match diff_preparation {
+        RouteDiffPreparation::Applied(plan) => diff_plan = Some(plan),
+        RouteDiffPreparation::Skipped(reason) => {
+            warnings.push(format!("diff_skipped:{reason}"));
+            crate::metrics::record_diff("skipped", reason);
         }
-        Some(crate::shaping::ShapeDecision::Skip(r)) => {
-            warnings.push(format!("diff_skipped:{r}"));
-            crate::metrics::record_diff("skipped", r);
-        }
-        None => {}
+        RouteDiffPreparation::NotRequested => {}
     }
 
     maybe_downgrade_response_format(req, provider.as_ref(), &mut warnings);
@@ -3138,7 +3608,19 @@ pub(crate) async fn prepare(
     // `flex_not_applied:<model>` warning is surfaced. `flex_applied` drives the
     // cost computation below so savings attribute to the `flex` source. Evaluated
     // against the FINAL served provider/model (post-routing/pin/failover-primary).
-    let flex_applied = maybe_apply_flex(req, route_flex, provider.as_ref(), &mut warnings);
+    //
+    // A selected Fusion panel clones this base request into each independently
+    // priced member leg. Flex is intentionally a single-dispatch tier: applying
+    // the primary model's eligibility to every member would forward
+    // `service_tier="flex"` without a per-leg eligibility/accounting contract.
+    // Suppress the route-originated opt-in whenever an actual panel was admitted;
+    // the panel aggregate consequently makes no Flex billing claim either.
+    let flex_applied = if route_flex && panel.is_some() {
+        warnings.push("flex_not_applied:panel".to_string());
+        false
+    } else {
+        maybe_apply_flex(req, route_flex, provider.as_ref(), &mut warnings)
+    };
 
     // Advisory batch-eligibility marker (route action, research Phase 2.1):
     // never mutates the request or detours dispatch — the gateway is
@@ -3163,7 +3645,13 @@ pub(crate) async fn prepare(
     // suffix is deterministic-on-ingress, so no provider prompt-cache bust is
     // booked (redaction precedent). `minify_applied` drives the per-response
     // ESTIMATE (non-streaming only), the metric, and judge eligibility.
-    let minify_applied = maybe_minify_json(req, route_minify, provider.as_ref(), &mut warnings);
+    let minify_applied = prepare_route_minify_json(
+        req,
+        route_minify,
+        provider.as_ref(),
+        response_owner,
+        &mut warnings,
+    );
 
     // Class-gated reasoning-token cap (route action, research Phase 3.2):
     // lowers OpenAI-style `reasoning_effort` / Anthropic-style thinking
@@ -3213,40 +3701,6 @@ pub(crate) async fn prepare(
     // them on the all-volatile (pre-split) path.
     let pass_model = req.model.clone();
     let pass_pricing = provider.pricing(&pass_model);
-    // Document Lane D4c — the pre-routing distillation seam. When the matched
-    // route opted in (`route_document_lane`), distill inline document/image
-    // content parts to text BEFORE the pass pipeline, so the cache-stable prefix
-    // + L1/L2 keys derive from the DISTILLED request + routing can downgrade to
-    // a text model. Fail-open: sidecar disabled / error → the request stays
-    // verbatim (no distillation, no downgrade — byte-identical to the no-document-
-    // lane path). When `route_document_lane` is false (the default), the seam
-    // early-returns with zero work. The seam returns the `DistillBookkeeping`
-    // (raw-image-tokens vs distilled-text-tokens, D4c-v2); the isolated
-    // `doc_vision_saved_est_usd` saving is priced from it below, after
-    // `compute_cost_full` builds the breakdown (D0's `document_projection::project`,
-    // served-model input rate, Gemini guard — fail-open to $0 when no pricing /
-    // nothing distilled).
-    let mut doc_distill_booking = crate::document_lane::seam::DistillBookkeeping::default();
-    if route_document_lane {
-        let harness = crate::document_lane::seam::DistillHarness::from_env();
-        doc_distill_booking =
-            crate::document_lane::seam::distill_request_parts(&harness, &pass_model, req).await;
-        if doc_distill_booking.distilled_parts > 0 {
-            tracing::info!(
-                target: "tokentrimmer.document_lane",
-                distilled_parts = doc_distill_booking.distilled_parts,
-                raw_image_tokens = doc_distill_booking.raw_image_tokens,
-                distilled_text_tokens = doc_distill_booking.distilled_text_tokens,
-                "document-lane seam distilled document/image parts to text"
-            );
-            // The downgrade is the route's `target_model` rewrite (apply_routing
-            // already set req.model to the text model); the seam's job is to
-            // swap the image/document parts for text so the text model receives
-            // processable input — done above. No capability-flag re-flip is
-            // needed (the `has_documents` condition matched pre-routing; the
-            // rewrite is the downgrade — see #307).
-        }
-    }
     let pass_cx = crate::passes::PassContext {
         provider_id: provider.id(),
         model: &pass_model,
@@ -3562,9 +4016,13 @@ pub(crate) async fn prepare(
     };
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
-    // provider in the candidate set. The raw-Bearer fallback is allowed only for
-    // the source provider (the bearer is its key); cross-provider candidates with
-    // no stored credential are skipped during dispatch.
+    // candidate provider that is not already known to exceed a request ceiling.
+    // The ordered model list stays intact so the dispatcher can record the
+    // precise cost rejection, but an over-ceiling cross-provider fallback must
+    // not trigger a needless credential-store lookup. The raw-Bearer fallback
+    // is allowed only for the source provider (the bearer is its key);
+    // cross-provider candidates with no stored credential are skipped during
+    // dispatch.
     let (failover_candidates, failover_creds): (
         Vec<String>,
         std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
@@ -3575,10 +4033,18 @@ pub(crate) async fn prepare(
             .chain(route_fallbacks.iter().cloned())
             .collect();
         // Distinct candidate providers, first-seen order — resolve each one's
-        // credential once.
+        // credential once. Known-priced candidates that fail the route/header
+        // admission check remain in `candidates` for dispatch-time diagnostics,
+        // but are deliberately omitted here so their credentials are never read.
         let mut provider_ids: Vec<String> = Vec::new();
         for m in &candidates {
             if let Some(p) = state.registry.resolve(m) {
+                if failover_cost_check
+                    .and_then(|cost_check| cost_check.violation_for(p.as_ref(), m, req))
+                    .is_some()
+                {
+                    continue;
+                }
                 let pid = p.id().to_string();
                 if !provider_ids.contains(&pid) {
                     provider_ids.push(pid);
@@ -3712,6 +4178,7 @@ pub(crate) async fn prepare(
         skip_l2,
         route_matched_name,
         matched_route_id,
+        matched_route_version_id,
         route_paused,
         requested_model,
         requested_pricing,
@@ -3732,6 +4199,7 @@ pub(crate) async fn prepare(
         route_shadow_model,
         failover_candidates,
         failover_creds,
+        failover_cost_check,
         route_fallbacks,
         warnings,
         request_timeout,
@@ -3744,6 +4212,7 @@ pub(crate) async fn prepare(
         judge_original_req,
         pre_compression_request_json,
         panel,
+        panel_admission,
         panel_creds,
         workflow: route_workflow,
     })
@@ -3771,6 +4240,7 @@ async fn handle_streaming(
         skip_l2: _,
         route_matched_name,
         matched_route_id,
+        matched_route_version_id,
         route_paused,
         requested_model,
         requested_pricing,
@@ -3799,6 +4269,7 @@ async fn handle_streaming(
         route_shadow_model: _,
         failover_candidates,
         failover_creds,
+        failover_cost_check,
         route_fallbacks,
         warnings,
         request_timeout,
@@ -3815,6 +4286,7 @@ async fn handle_streaming(
         // non-streaming; the buffered arbiter answer is returned). This is `None`
         // by construction here.
         panel: _,
+        panel_admission: _,
         panel_creds: _,
         // `handle_streaming` is only reached after the handler's streaming guard
         // has already `take`n any `workflow` config (warned + dropped for the
@@ -3845,10 +4317,14 @@ async fn handle_streaming(
                             request_log_for_l1_hit(
                                 &entry,
                                 ctx,
+                                &requested_model,
                                 trace_id,
                                 request_started,
-                                matched_route_id,
-                                route_paused,
+                                RouteLogAttribution {
+                                    route_id: matched_route_id,
+                                    route_version_id: matched_route_version_id,
+                                    paused: route_paused,
+                                },
                                 retrieval_telemetry.tokens_saved,
                             ),
                         );
@@ -3865,25 +4341,7 @@ async fn handle_streaming(
                         } else {
                             entry.baseline_cost_usd
                         };
-                        let hit_cost = CostBreakdown {
-                            cost_usd: 0.0,
-                            baseline_cost_usd,
-                            provider_cache_saved_usd: 0.0,
-                            flex_saved_usd: 0.0,
-                            compression_saved_usd: 0.0,
-                            doc_compaction_saved_usd: 0.0,
-                            cache_bust_penalty_usd: 0.0,
-                            summarizer_tax_usd: 0.0,
-                            batch_forgone_usd: 0.0,
-                            minify_saved_est_usd: 0.0,
-                            diff_saved_usd: 0.0,
-                            format_switch_saved_est_usd: 0.0,
-                            diff_failed_cost_usd: 0.0,
-                            // Document Lane vision-avoided saving (D4c sets it).
-                            doc_vision_saved_est_usd: 0.0,
-                            // Cache hit → no dispatch → no content_compress.
-                            content_compress_saved_est_usd: 0.0,
-                        };
+                        let hit_cost = l1_cache_hit_cost_breakdown(baseline_cost_usd);
                         record_request_span_attributes(
                             &entry.response.model,
                             &entry.response.model,
@@ -3900,23 +4358,42 @@ async fn handle_streaming(
                             None,
                             None,
                         );
+                        // Only an envelope-written baseline may become a
+                        // terminal cache cost receipt. A legacy raw response
+                        // remains safely replayable, but its synthetic
+                        // telemetry baseline is not promoted into client-facing
+                        // savings evidence.
+                        let cache_attribution = l1_cache_stream_attribution(&entry);
+                        let cached_model = entry.response.model.clone();
                         let fake = sse::fake_stream_from_response(entry.response);
-                        // L1 hit already logged above; no need for a second row.
+                        // L1 hit already logged above; no need for a second row
+                        // or a live-stream DropGuard. The cache-specific stream
+                        // queues its verified terminal usage receipt before
+                        // `[DONE]` only after the fake stream reaches clean EOF.
                         let mut resp = with_route_matched(
-                            sse::stream_response(fake, &provider, trace_id, None),
+                            sse::cache_hit_stream_response(
+                                fake,
+                                &provider,
+                                trace_id,
+                                cache_attribution,
+                            ),
                             route_matched_name.as_deref(),
                         );
+                        attach_l1_cache_stream_headers(
+                            resp.headers_mut(),
+                            trace_id,
+                            &cached_model,
+                            cache_attribution,
+                        );
                         // P0-1/P0-3: settle the served request as a cache hit.
-                        // This fake-stream path passes `None` log_ctx to
-                        // `stream_response`, which takes the simple-passthrough
-                        // branch with no DropGuard — so the streamed-dispatch
-                        // settle at `sse.rs` NEVER runs here. Settle inline (as
-                        // the non-streaming CacheHit arm does) so the served
-                        // counter advances (the COGS guard) while the billed
-                        // monthly counter does NOT — a streaming cache hit does
-                        // not consume an included request. Without this, a free
-                        // tenant using `stream:true` could serve unbounded cache
-                        // hits and never trip the served ceiling.
+                        // This fake-stream path has no DropGuard, so the
+                        // streamed-dispatch settle at `sse.rs` NEVER runs here.
+                        // Settle inline (as the non-streaming CacheHit arm does)
+                        // so the served counter advances (the COGS guard) while
+                        // the billed monthly counter does NOT — a streaming cache
+                        // hit does not consume an included request. Without this,
+                        // a free tenant using `stream:true` could serve unbounded
+                        // cache hits and never trip the served ceiling.
                         state
                             .spend_sink()
                             .settle(ctx.org_id, ctx.api_key_id, true, Utc::now());
@@ -3983,9 +4460,10 @@ async fn handle_streaming(
                         required: &cap_required,
                         estimated_tokens: cap_est_tokens,
                     }),
+                    failover_cost_check,
                 )
                 .await
-                .map_err(ApiError::from)
+                .map_err(map_failover_error)
             }
         })
         .await;
@@ -4130,6 +4608,7 @@ async fn handle_streaming(
                 api_key_id: ctx.api_key_id,
                 trace_id,
                 provider_id: provider.id().to_string(),
+                requested_model: requested_model.clone(),
                 model: served_model.clone(),
                 input_tokens: estimated_input_tokens,
                 cached_tokens: 0,
@@ -4145,6 +4624,7 @@ async fn handle_streaming(
                     provider.pricing(&served_model)
                 },
                 route_id: matched_route_id,
+                route_version_id: matched_route_version_id,
                 tag: ctx.tag.clone(),
                 request_started,
                 spend_sink: state.spend_sink(),
@@ -4389,6 +4869,32 @@ fn maybe_mark_batch_eligible(
 /// when rewording.
 pub(crate) const MINIFY_JSON_INSTRUCTION: &str =
     "\n\nWhen responding with JSON, emit it minified: no indentation, no newlines, and no spaces between JSON tokens.";
+
+/// Apply the minify route action only when the direct completion path owns the
+/// caller-visible response.
+///
+/// A Fusion panel fans out the prepared request (including a header-selected
+/// panel), while a non-shadow workflow consumes it for its own result. Neither
+/// path has the direct tail's minify validation or accounting contract, so a
+/// requested action becomes an explicit no-op rather than silently steering
+/// those internal prompts. Streaming panels are still response owners; a
+/// streaming workflow is not, because that detour falls through to direct
+/// streaming. `response_owner` encodes those distinctions.
+fn prepare_route_minify_json(
+    req: &mut ChatCompletionRequest,
+    requested: bool,
+    provider: &dyn tt_shared::Provider,
+    response_owner: Option<&'static str>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if requested {
+        if let Some(owner) = response_owner {
+            warnings.push(format!("minify_skipped:{owner}"));
+            return false;
+        }
+    }
+    maybe_minify_json(req, requested, provider, warnings)
+}
 
 /// Apply the minify-JSON route action: append [`MINIFY_JSON_INSTRUCTION`] to
 /// the LAST system message (inserting one at index 0 when the request has
@@ -4735,6 +5241,63 @@ fn attach_warning_tokens(headers: &mut axum::http::HeaderMap, tokens: &[String])
     }
 }
 
+/// The cost shape of a served L1 hit. This is deliberately separate from the
+/// cached entry's original miss cost: the request being served now made no
+/// provider dispatch, so its realized cost is zero and its entire priced
+/// envelope baseline is the TokenTrimmer-attributed saving.
+fn l1_cache_hit_cost_breakdown(baseline_cost_usd: f64) -> CostBreakdown {
+    CostBreakdown {
+        cost_usd: 0.0,
+        baseline_cost_usd,
+        ..Default::default()
+    }
+}
+
+/// A streaming cache receipt is only possible for an envelope that carries the
+/// insertion-time baseline. Do not turn a legacy raw response's token counts
+/// into a claimed dollar saving by re-pricing them at stream time.
+fn l1_cache_stream_attribution(entry: &L1Entry) -> Option<sse::CacheStreamAttribution> {
+    if entry.is_legacy_format() {
+        return None;
+    }
+    let usage = &entry.response.usage;
+    sse::CacheStreamAttribution::l1(
+        entry.baseline_cost_usd,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cached_tokens,
+    )
+}
+
+/// The fake-stream response is assembled in `sse.rs`, but cache provenance is
+/// owned by the chat route. Always identify a served L1 hit as `cache`; emit
+/// dollar headers only when the same stored envelope baseline also backs the
+/// terminal usage receipt.
+fn attach_l1_cache_stream_headers(
+    headers: &mut axum::http::HeaderMap,
+    trace_id: Uuid,
+    model_used: &str,
+    attribution: Option<sse::CacheStreamAttribution>,
+) {
+    if let Some(attribution) = attribution {
+        let cost = l1_cache_hit_cost_breakdown(attribution.baseline_cost_usd());
+        attach_cost_headers(headers, trace_id, "cache", model_used, &cost);
+    } else {
+        if let Ok(v) = trace_id.to_string().parse() {
+            headers.insert("x-tokentrimmer-trace-id", v);
+        }
+        if let Ok(v) = "cache".parse() {
+            headers.insert("x-tokentrimmer-provider", v);
+        }
+        if let Ok(v) = model_used.parse() {
+            headers.insert("x-tokentrimmer-model-used", v);
+        }
+    }
+    if let Ok(v) = "hit-l1".parse() {
+        headers.insert("x-tokentrimmer-cache", v);
+    }
+}
+
 /// Build the response for an L1 cache hit.
 ///
 /// Cost is always 0 on a hit. Baseline is taken from the envelope (set at
@@ -4756,26 +5319,7 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
     // A TT cache hit never reaches the provider — the full baseline is
     // TT-attributed (saved == baseline) and there is no provider-side
     // cache discount.
-    let cost = CostBreakdown {
-        cost_usd: 0.0,
-        baseline_cost_usd,
-        provider_cache_saved_usd: 0.0,
-        flex_saved_usd: 0.0,
-        compression_saved_usd: 0.0,
-        doc_compaction_saved_usd: 0.0,
-        cache_bust_penalty_usd: 0.0,
-        summarizer_tax_usd: 0.0,
-        batch_forgone_usd: 0.0,
-        minify_saved_est_usd: 0.0,
-        diff_saved_usd: 0.0,
-        format_switch_saved_est_usd: 0.0,
-        diff_failed_cost_usd: 0.0,
-        // Document Lane vision-avoided saving — the seam that sets a non-zero
-        // value is D4c; a cache hit / non-seam path always books 0.
-        doc_vision_saved_est_usd: 0.0,
-        // Cache hit → no dispatch → no content_compress.
-        content_compress_saved_est_usd: 0.0,
-    };
+    let cost = l1_cache_hit_cost_breakdown(baseline_cost_usd);
     attach_cost_headers(
         http_response.headers_mut(),
         trace_id,
@@ -5188,7 +5732,7 @@ pub(crate) struct CostBreakdown {
     /// when no diff failed.
     pub diff_failed_cost_usd: f64,
     /// ESTIMATED vision-avoided saving from the Document Lane seam (D4): when the
-    /// pre-routing distillation seam swaps an image/document part for distilled
+    /// post-route-match distillation seam swaps an image/document part for distilled
     /// TEXT, the request that actually dispatched never contained the image, so
     /// this saving is a COUNTERFACTUAL (the raw image tokens that WOULD have been
     /// billed minus the distilled text tokens, priced at the input rate; $0 for
@@ -5234,12 +5778,14 @@ impl CostBreakdown {
     /// `flex_saved_usd` isolates the flex component for the methodology
     /// breakdown).
     pub fn tt_saved_usd(&self) -> f64 {
-        (self.baseline_cost_usd
-            - self.cost_usd
-            - self.provider_cache_saved_usd
-            - self.cache_bust_penalty_usd
-            - self.summarizer_tax_usd)
-            .max(0.0)
+        tt_shared::estimate_request_delta_v1(tt_shared::RequestDeltaInput {
+            baseline_cost_usd: Some(self.baseline_cost_usd),
+            cost_usd: Some(self.cost_usd),
+            provider_cache_saved_usd: Some(self.provider_cache_saved_usd),
+            cache_bust_penalty_usd: Some(self.cache_bust_penalty_usd),
+            summarizer_tax_usd: Some(self.summarizer_tax_usd),
+        })
+        .map_or(0.0, |estimate| estimate.positive_request_delta_usd)
     }
 }
 
@@ -5634,7 +6180,7 @@ pub(crate) fn compute_cost_full(
         diff_saved_usd: diff_saved_usd * fee_multiplier,
         format_switch_saved_est_usd: shape.format_switch_saved_est_usd * fee_multiplier,
         diff_failed_cost_usd: shape.diff_failed_cost_usd * fee_multiplier,
-        // Document Lane (D4a): always 0 — the pre-routing distillation seam that
+        // Document Lane (D4a): always 0 — the post-match distillation seam that
         // books a non-zero vision-avoided saving on this isolated field is D4c.
         // Isolated: NOT folded into cost_usd/baseline_cost_usd above.
         doc_vision_saved_est_usd: 0.0,
@@ -6654,13 +7200,20 @@ fn maybe_spawn_l2_hit_judge(
 /// stored in the envelope (e.g. `"openai"`) is preserved so the
 /// dashboard's per-provider breakdowns include cache hits; the cache
 /// label only surfaces via the `cache_layer` column.
+#[derive(Debug, Clone, Copy)]
+struct RouteLogAttribution {
+    route_id: Option<Uuid>,
+    route_version_id: Option<i64>,
+    paused: bool,
+}
+
 fn request_log_for_l1_hit(
     entry: &L1Entry,
     ctx: &RequestContext,
+    requested_model: &str,
     trace_id: Uuid,
     request_started: Instant,
-    route_id: Option<Uuid>,
-    route_paused: bool,
+    route: RouteLogAttribution,
     retrieval_tokens_saved: i64,
 ) -> RequestLogRow {
     let baseline = if entry.is_legacy_format() {
@@ -6681,6 +7234,7 @@ fn request_log_for_l1_hit(
         api_key_id: ctx.api_key_id,
         ts: Utc::now(),
         provider: provider_id,
+        requested_model: Some(requested_model.to_owned()),
         model: entry.response.model.clone(),
         input_tokens: entry.response.usage.prompt_tokens as i32,
         output_tokens: entry.response.usage.completion_tokens as i32,
@@ -6691,9 +7245,13 @@ fn request_log_for_l1_hit(
         // upstream prompt cache exists to bust.
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: true,
         cache_layer: Some("l1".into()),
-        route_id,
+        route_id: route.route_id,
+        route_version_id: route.route_version_id,
         latency_ms: clamp_latency_ms(request_started),
         upstream_latency_ms: None,
         status: 200,
@@ -6718,7 +7276,7 @@ fn request_log_for_l1_hit(
         // could not have saved anything on a request that never billed.
         batch_eligible: false,
         batch_forgone_usd: 0.0,
-        route_paused,
+        route_paused: route.paused,
         // TT cache hit — nothing dispatched, nothing minify-estimated.
         minify_saved_est_usd: 0.0,
         // TT cache hit — the serve performed no shaping dispatch; the
@@ -6758,9 +7316,11 @@ fn request_log_for_l1_hit(
 fn request_log_for_l2_hit(
     entry: &CacheEntry,
     ctx: &RequestContext,
+    requested_model: &str,
     trace_id: Uuid,
     request_started: Instant,
     route_id: Option<Uuid>,
+    route_version_id: Option<i64>,
     route_paused: bool,
     baseline_cost_usd: f64,
     retrieval_tokens_saved: i64,
@@ -6773,6 +7333,7 @@ fn request_log_for_l2_hit(
         api_key_id: ctx.api_key_id,
         ts: Utc::now(),
         provider: "cache".into(),
+        requested_model: Some(requested_model.to_owned()),
         model: entry.model.clone(),
         input_tokens: entry.input_tokens as i32,
         output_tokens: entry.output_tokens as i32,
@@ -6783,9 +7344,13 @@ fn request_log_for_l2_hit(
         // upstream prompt cache exists to bust.
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: true,
         cache_layer: Some("l2".into()),
         route_id,
+        route_version_id,
         latency_ms: clamp_latency_ms(request_started),
         upstream_latency_ms: None,
         status: 200,
@@ -6872,6 +7437,9 @@ pub(crate) fn opt_tokens_i32(v: Option<u64>) -> Option<i32> {
 /// declared no failover targets.
 pub(crate) struct RouteMatch {
     pub(crate) route_id: Uuid,
+    /// Immutable `public.route_versions.id` captured in the same cached runtime
+    /// route refresh as this definition. Never a mutable route revision.
+    pub(crate) route_version_id: Option<i64>,
     pub(crate) route_name: String,
     /// The matched route is sticky-PAUSED (quality regression / manual pause):
     /// the rewrite was suppressed and every cost lever below is disabled —
@@ -6910,12 +7478,13 @@ pub(crate) struct RouteMatch {
     /// content_compress request-pass pipeline before dispatch; off by default
     /// (no pass runs otherwise). A COST lever: suppressed on a paused route.
     pub(crate) content_compress: bool,
-    /// The matched route opted into the Document Lane pre-routing distillation
+    /// The matched route opted into the Document Lane post-match distillation
     /// seam (`RouteAction::document_lane`, Document Lane D4c). When true the
-    /// gateway distills image/document content parts to text BEFORE routing
-    /// (so the route can downgrade to a text model) + books the isolated
-    /// `doc_vision_saved_est_usd`. A COST lever: suppressed on a paused route.
-    /// Off by default (no distillation runs otherwise).
+    /// gateway converts every eligible media part before target-provider setup;
+    /// an incomplete transaction restores the caller model and raw request, and
+    /// a complete transaction may keep the text-model downgrade + book the
+    /// isolated `doc_vision_saved_est_usd`. A COST lever: suppressed on a paused
+    /// route. Off by default (no distillation runs otherwise).
     pub(crate) document_lane: bool,
     /// The matched route opted into the request-redaction guardrail
     /// (`RouteAction::redact`). When true the gateway redacts PII/secrets from
@@ -6975,7 +7544,7 @@ pub(crate) struct RouteMatch {
     /// planner is never constructed on the un-opted path, so that path is
     /// byte-identical (off by default, load-bearing).
     pub(crate) agentic_budget: Option<tt_routing::AgenticBudget>,
-    /// The matched route's opt-in **deep-research panel** trigger
+    /// The matched route's opt-in **Fusion panel** trigger
     /// (`RouteAction::panel`). `Some(_)` makes a matched request fan out across
     /// the panel members + arbiter — but only when the caller did NOT send an
     /// explicit `X-TokenTrimmer-Panel` header (the header wins; the route is the
@@ -6996,6 +7565,57 @@ pub(crate) struct RouteMatch {
     /// a warning (the workflow detour is a non-streaming aggregate, like
     /// `panel`'s Phase-1 non-streaming arm).
     pub(crate) workflow: Option<tt_routing::RouteWorkflow>,
+}
+
+/// Post-selection boundary reached by the live gateway routing seam.
+///
+/// This deliberately stops before canary assignment and the downstream action
+/// pipeline. It is operational explanation, not an assertion that every
+/// configured action executed.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RouteApplicationOutcome {
+    NoMatch,
+    ForcedRouteNotFound,
+    CapabilitySuppressed,
+    Paused,
+    AcceptedForActionPipeline,
+}
+
+#[derive(serde::Serialize)]
+struct RouteApplicationTrace<'a> {
+    application_outcome: RouteApplicationOutcome,
+    decision: &'a tt_routing::RouteDecisionTrace,
+}
+
+/// Emit the value-free live trace only at debug level. This is intentionally
+/// not request-log persistence, a customer API, or a complete action trace.
+/// Keeping the organization identifier outside the serialized payload also
+/// makes the payload itself safe to inspect for accidental request values.
+fn record_route_application_trace(
+    org_id: Uuid,
+    outcome: RouteApplicationOutcome,
+    decision: &tt_routing::RouteDecisionTrace,
+) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let trace = RouteApplicationTrace {
+        application_outcome: outcome,
+        decision,
+    };
+    match serde_json::to_string(&trace) {
+        Ok(trace) => tracing::debug!(
+            %org_id,
+            route_application_trace = %trace,
+            "route application trace"
+        ),
+        Err(error) => tracing::debug!(
+            %org_id,
+            %error,
+            "route application trace serialization failed"
+        ),
+    }
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -7074,12 +7694,12 @@ pub(crate) async fn apply_routing(
         state.latency_tracker.p95(provider_id, &req.model)
     };
 
-    // `m` is `&Route` (inferred from the engine accessors below) regardless of arm.
-    let m = match forced_route {
-        Some(name) => engine
-            .find_by_name(name)
-            .ok_or_else(|| ApiError::InvalidRequest(format!("unknown route: {name}")))?,
-        None => match engine.evaluate_with_signals(
+    // Forced routing has its own trace mode: it does not evaluate conditions or
+    // imply that condition/priority selected the named route. Normal routing
+    // prepares one snapshot and uses the canonical traced matcher directly.
+    let evaluation = match forced_route {
+        Some(name) => engine.evaluate_forced_route_with_trace(name),
+        None => engine.evaluate_with_signals_and_trace(
             req,
             ctx,
             input_tokens,
@@ -7091,11 +7711,28 @@ pub(crate) async fn apply_routing(
             // already built for token estimation above.
             engine.uses_reasoning_class()
                 && crate::reasoning_class::classify(&combined.to_lowercase()).is_some(),
-        ) {
-            Some(r) => r,
-            None => return Ok(None),
-        },
+        ),
     };
+    let tt_routing::RoutingEvaluation {
+        matched_route,
+        trace,
+    } = evaluation;
+    let Some(m) = matched_route else {
+        if let Some(name) = forced_route {
+            record_route_application_trace(
+                ctx.org_id,
+                RouteApplicationOutcome::ForcedRouteNotFound,
+                &trace,
+            );
+            return Err(ApiError::InvalidRequest(format!("unknown route: {name}")));
+        }
+        record_route_application_trace(ctx.org_id, RouteApplicationOutcome::NoMatch, &trace);
+        return Ok(None);
+    };
+    // The cached engine preserves the ledger ID that the store captured in the
+    // same database snapshot as `m`. Missing ledger provenance stays NULL; a
+    // route revision is intentionally not a substitute.
+    let route_version_id = engine.route_version_id(m.id);
     // Sticky pause (research Phase 2.3): a paused route still MATCHES — the
     // request attributes to it (route_id stamped, warnings token, request_logs
     // marker) — but the rewrite and every other COST lever are suppressed, so
@@ -7107,8 +7744,9 @@ pub(crate) async fn apply_routing(
     // quality gate wins). `req.model` is untouched → `is_downgrade` is false →
     // no judge samples on a paused route → its verdict window freezes → the
     // pause is naturally sticky (plus the durable route_pauses row) until an
-    // explicit POST /v1/routes/:id/resume.
+    // explicit POST /v1/routes/:id/resume?expected_revision=N.
     if m.paused {
+        record_route_application_trace(ctx.org_id, RouteApplicationOutcome::Paused, &trace);
         tracing::info!(
             org_id = %ctx.org_id,
             route_id = %m.id,
@@ -7123,6 +7761,7 @@ pub(crate) async fn apply_routing(
         return Ok(Some(RouteMatch {
             batch: false,
             route_id: m.id,
+            route_version_id,
             route_name: m.name.clone(),
             paused: true,
             // ALL cost levers off (fail-safe expensive direction):
@@ -7145,7 +7784,7 @@ pub(crate) async fn apply_routing(
             // elision / routing for savings) — suppressed on a paused route,
             // exactly like compress/flex/format_switch above.
             agentic_budget: None,
-            // The deep-research panel is a COST lever (it fans out across N
+            // The Fusion panel is a COST lever (it fans out across N
             // members + an arbiter) — suppressed on a paused route, so a paused
             // panel route flows to the originally-requested single model.
             panel: None,
@@ -7212,6 +7851,11 @@ pub(crate) async fn apply_routing(
                 reasons = ?reasons,
                 "route_skipped_capability: rewrite target lacks required capabilities, passing through unchanged"
             );
+            record_route_application_trace(
+                ctx.org_id,
+                RouteApplicationOutcome::CapabilitySuppressed,
+                &trace,
+            );
             // Do not rewrite req.model — return None so the request
             // continues with the original model.
             return Ok(None);
@@ -7236,8 +7880,14 @@ pub(crate) async fn apply_routing(
         fallbacks = ?fallbacks,
         "routing rewrite"
     );
+    record_route_application_trace(
+        ctx.org_id,
+        RouteApplicationOutcome::AcceptedForActionPipeline,
+        &trace,
+    );
     Ok(Some(RouteMatch {
         route_id,
+        route_version_id,
         route_name,
         paused: false,
         fallbacks,
@@ -7276,10 +7926,73 @@ mod cache_header_tests {
     use super::*;
     use axum::http::HeaderMap;
 
+    fn l1_entry(version: u32, baseline_cost_usd: f64) -> L1Entry {
+        L1Entry {
+            response: ChatCompletionResponse {
+                id: "chatcmpl-cache-test".into(),
+                object: "chat.completion".into(),
+                created: 1,
+                model: "gpt-4o-mini".into(),
+                choices: vec![],
+                usage: Usage {
+                    prompt_tokens: 5,
+                    completion_tokens: 4,
+                    total_tokens: 9,
+                    cached_tokens: 1,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            },
+            baseline_cost_usd,
+            cost_usd: 0.003,
+            provider_id: "openai".into(),
+            version,
+        }
+    }
+
     fn hv(v: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("x-tokentrimmer-cache", v.parse().unwrap());
         h
+    }
+
+    fn request_context() -> RequestContext {
+        RequestContext {
+            trace_id: Uuid::nil(),
+            org_id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            credentials: ProviderCredentials {
+                api_key: SecretString::new("test"),
+                base_url: None,
+                extra_headers: vec![],
+            },
+            tag: None,
+            deadline: None,
+            run_id: None,
+            node_id: None,
+        }
+    }
+
+    #[test]
+    fn l1_hit_log_preserves_matched_immutable_route_version() {
+        let ctx = request_context();
+        let route_id = Uuid::now_v7();
+        let row = request_log_for_l1_hit(
+            &l1_entry(1, 0.0045),
+            &ctx,
+            "caller-model",
+            Uuid::now_v7(),
+            Instant::now(),
+            RouteLogAttribution {
+                route_id: Some(route_id),
+                route_version_id: Some(9_876_543_210),
+                paused: false,
+            },
+            0,
+        );
+        assert_eq!(row.route_id, Some(route_id));
+        assert_eq!(row.route_version_id, Some(9_876_543_210));
+        assert_eq!(row.requested_model.as_deref(), Some("caller-model"));
     }
 
     #[test]
@@ -7303,6 +8016,101 @@ mod cache_header_tests {
         );
         assert_eq!(cache_override_from_header(&hv("   ")).unwrap(), None);
         assert!(cache_override_from_header(&hv("nope")).is_err());
+    }
+
+    #[test]
+    fn streaming_l1_receipt_uses_only_a_priced_envelope_baseline() {
+        let priced = l1_entry(1, 0.0045);
+        let attribution = l1_cache_stream_attribution(&priced).expect("priced envelope");
+        assert_eq!(attribution.baseline_cost_usd(), 0.0045);
+
+        // Pre-envelope values have no stored counterfactual. Their historical
+        // synthetic baseline remains telemetry-only and must not become a
+        // terminal savings receipt.
+        assert!(l1_cache_stream_attribution(&l1_entry(0, 0.0045)).is_none());
+        assert!(l1_cache_stream_attribution(&l1_entry(1, -0.0045)).is_none());
+    }
+
+    #[test]
+    fn streaming_l1_headers_match_the_verified_cache_receipt() {
+        let entry = l1_entry(1, 0.0045);
+        let receipt = l1_cache_stream_attribution(&entry);
+        let mut headers = HeaderMap::new();
+        attach_l1_cache_stream_headers(&mut headers, Uuid::nil(), &entry.response.model, receipt);
+
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("hit-l1")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-provider")
+                .and_then(|v| v.to_str().ok()),
+            Some("cache")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-cost-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.000000")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-baseline-cost-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.004500")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-saved-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.004500")
+        );
+
+        let legacy = l1_entry(0, 0.0045);
+        let mut legacy_headers = HeaderMap::new();
+        attach_l1_cache_stream_headers(
+            &mut legacy_headers,
+            Uuid::nil(),
+            &legacy.response.model,
+            l1_cache_stream_attribution(&legacy),
+        );
+        assert_eq!(
+            legacy_headers
+                .get("x-tokentrimmer-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("hit-l1")
+        );
+        assert!(
+            legacy_headers.get("x-tokentrimmer-saved-usd").is_none(),
+            "legacy synthetic baseline must not be surfaced as confirmed savings"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cost_limit_header_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn with_cost_limit(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tokentrimmer-cost-limit-usd", value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn cost_limit_requires_a_finite_positive_number() {
+        assert_eq!(cost_limit_from_header(&with_cost_limit("0.25")), Some(0.25));
+        for invalid in ["0", "-1", "NaN", "inf", "-inf", "not-a-number"] {
+            assert_eq!(
+                cost_limit_from_header(&with_cost_limit(invalid)),
+                None,
+                "{invalid:?} must not turn a request budget into an unbounded limit"
+            );
+        }
     }
 }
 
@@ -7789,6 +8597,42 @@ mod l2_baseline_tests {
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn l2_hit_log_preserves_matched_immutable_route_version() {
+        let ctx = RequestContext {
+            trace_id: Uuid::nil(),
+            org_id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            credentials: ProviderCredentials {
+                api_key: SecretString::new("test"),
+                base_url: None,
+                extra_headers: vec![],
+            },
+            tag: None,
+            deadline: None,
+            run_id: None,
+            node_id: None,
+        };
+        let route_id = Uuid::now_v7();
+        let row = request_log_for_l2_hit(
+            &entry(Some(0.0123)),
+            &ctx,
+            "caller-model",
+            Uuid::now_v7(),
+            Instant::now(),
+            Some(route_id),
+            Some(9_876_543_210),
+            false,
+            0.0123,
+            0,
+            0.97,
+            L2VerifyDecision::Confident,
+        );
+        assert_eq!(row.route_id, Some(route_id));
+        assert_eq!(row.route_version_id, Some(9_876_543_210));
+        assert_eq!(row.requested_model.as_deref(), Some("caller-model"));
     }
 
     /// The row's stored catalog baseline is authoritative — current pricing
@@ -9369,6 +10213,51 @@ mod output_shaping_tests {
         }
     }
 
+    /// A flat non-strict schema that would normally make the CSV switch
+    /// eligible. Composition tests use it to prove an owner guard, rather than
+    /// a schema gate, left the request untouched.
+    fn csv_switch_request() -> ChatCompletionRequest {
+        let mut req = req_with_messages(vec![sys("Return the inventory."), user("list items")]);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".into(),
+            json_schema: Some(serde_json::json!({
+                "name": "items",
+                "strict": false,
+                "schema": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "qty": {"type": "integer"}
+                        },
+                        "required": ["name", "qty"]
+                    }
+                }
+            })),
+        });
+        req
+    }
+
+    /// A request that is otherwise eligible for the diff patch contract.
+    fn diff_ready_request() -> ChatCompletionRequest {
+        let mut req = req_with_messages(vec![sys("Edit precisely."), user("revise this")]);
+        req.tt_extras.insert(
+            crate::shaping::diff::TT_EXTRA_DIFF_PRIOR.to_string(),
+            serde_json::json!("x".repeat(crate::shaping::diff::MIN_PRIOR_CHARS + 1)),
+        );
+        req
+    }
+
+    fn workflow_config(mode: Option<&str>) -> tt_routing::RouteWorkflow {
+        tt_routing::RouteWorkflow {
+            workflow_id: "00000000-0000-0000-0000-000000000001".into(),
+            max_cost_usd: None,
+            environment: None,
+            mode: mode.map(str::to_string),
+        }
+    }
+
     fn assistant_text_response(texts: &[&str]) -> ChatCompletionResponse {
         ChatCompletionResponse {
             id: "r".into(),
@@ -9955,6 +10844,206 @@ mod output_shaping_tests {
         ));
         assert!(w.is_empty());
     }
+
+    /// A workflow detour replaces the direct completion before its
+    /// response-side format-switch validator, token, and estimate machinery
+    /// can run. The guard must therefore leave the caller schema and prompt
+    /// byte-identical and yield no plan that could become an output claim.
+    #[test]
+    fn workflow_detour_skips_format_switch_without_mutation_or_output_plan() {
+        let mut req = csv_switch_request();
+        let before = serde_json::to_string(&req).unwrap();
+
+        let outcome = prepare_route_format_switch(
+            &mut req,
+            Some("csv"),
+            Some(FormatSwitchResponseOwner::WorkflowDetour),
+            false,
+        );
+
+        assert!(matches!(
+            outcome,
+            RouteFormatSwitchPreparation::Skipped("workflow")
+        ));
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            before,
+            "workflow detour must retain response_format and add no switch instruction"
+        );
+    }
+
+    /// Shadow workflows keep the direct response path, so they retain the
+    /// established opt-in format-switch behavior.
+    #[test]
+    fn shadow_workflow_keeps_direct_format_switch_behavior() {
+        let mut req = csv_switch_request();
+
+        let outcome = prepare_route_format_switch(&mut req, Some("csv"), None, false);
+
+        assert!(matches!(
+            outcome,
+            RouteFormatSwitchPreparation::Applied(ref plan) if plan.label == "csv"
+        ));
+        assert!(
+            req.response_format.is_none(),
+            "direct switch drops the schema"
+        );
+        assert!(
+            serde_json::to_string(&req)
+                .unwrap()
+                .contains("Respond ONLY with CSV data"),
+            "direct switch appends its deterministic instruction"
+        );
+    }
+
+    /// Streaming remains planner-owned: an otherwise real panel must preserve
+    /// the existing `streaming` reason rather than changing observability to a
+    /// response-owner reason.
+    #[test]
+    fn panel_streaming_keeps_existing_format_switch_streaming_reason() {
+        let mut req = csv_switch_request();
+        req.stream = true;
+        let before = serde_json::to_string(&req).unwrap();
+
+        let outcome = prepare_route_format_switch(
+            &mut req,
+            Some("csv"),
+            Some(FormatSwitchResponseOwner::FusionPanel),
+            false,
+        );
+
+        assert!(matches!(
+            outcome,
+            RouteFormatSwitchPreparation::Skipped("streaming")
+        ));
+        assert_eq!(serde_json::to_string(&req).unwrap(), before);
+    }
+
+    #[test]
+    fn response_owner_gate_keeps_only_real_direct_paths_eligible() {
+        let detour = workflow_config(None);
+        let shadow = workflow_config(Some("shadow"));
+
+        assert_eq!(
+            non_direct_response_owner(true, None, false, false),
+            Some("panel"),
+            "a non-streaming Fusion panel owns its response"
+        );
+        assert_eq!(
+            non_direct_response_owner(true, None, true, false),
+            Some("panel"),
+            "a streaming Fusion panel still owns its response"
+        );
+        assert_eq!(
+            non_direct_response_owner(false, Some(&detour), false, false),
+            Some("workflow"),
+            "a non-shadow workflow replaces the direct non-streaming response"
+        );
+        assert_eq!(
+            non_direct_response_owner(false, Some(&detour), true, false),
+            None,
+            "streaming workflow detours fall through to direct streaming"
+        );
+        assert_eq!(
+            non_direct_response_owner(false, Some(&shadow), false, false),
+            None,
+            "shadow workflow results are not caller-visible"
+        );
+        assert_eq!(
+            non_direct_response_owner(true, None, false, true),
+            None,
+            "skip_shadow deliberately takes the direct path"
+        );
+    }
+
+    #[test]
+    fn response_owners_skip_minify_without_mutating_internal_prompts() {
+        let provider = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+
+        for owner in ["panel", "workflow"] {
+            let mut req = req_with_messages(vec![sys("Keep the original prompt."), user("hi")]);
+            let before = serde_json::to_string(&req).unwrap();
+            let mut warnings = Vec::new();
+            let applied =
+                prepare_route_minify_json(&mut req, true, &provider, Some(owner), &mut warnings);
+
+            assert!(
+                !applied,
+                "{owner} must not inherit direct-response minify steering"
+            );
+            assert_eq!(
+                serde_json::to_string(&req).unwrap(),
+                before,
+                "{owner} request must remain byte-identical"
+            );
+            assert_eq!(warnings, vec![format!("minify_skipped:{owner}")]);
+        }
+
+        let mut direct = req_with_messages(vec![sys("Direct response."), user("hi")]);
+        let mut warnings = Vec::new();
+        assert!(prepare_route_minify_json(
+            &mut direct,
+            true,
+            &provider,
+            None,
+            &mut warnings,
+        ));
+        assert_eq!(warnings, vec!["output_minified".to_string()]);
+        assert!(direct.messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::System {
+                    content: MessageContent::Text(text),
+                } if text.contains(MINIFY_JSON_INSTRUCTION)
+            )
+        }));
+    }
+
+    #[test]
+    fn response_owners_skip_diff_without_dropping_the_caller_contract() {
+        for owner in ["panel", "workflow"] {
+            let mut req = diff_ready_request();
+            let before = serde_json::to_string(&req).unwrap();
+
+            let outcome = prepare_route_diff(&mut req, true, Some(owner));
+
+            assert!(matches!(outcome, RouteDiffPreparation::Skipped(reason) if reason == owner));
+            assert_eq!(
+                serde_json::to_string(&req).unwrap(),
+                before,
+                "{owner} must retain diff_prior and avoid the patch instruction"
+            );
+        }
+
+        let mut direct = diff_ready_request();
+        let outcome = prepare_route_diff(&mut direct, true, None);
+        assert!(matches!(outcome, RouteDiffPreparation::Applied(_)));
+        assert!(
+            !direct
+                .tt_extras
+                .contains_key(crate::shaping::diff::TT_EXTRA_DIFF_PRIOR),
+            "the direct patch dispatch consumes the explicit prior"
+        );
+        assert!(matches!(
+            direct.messages.last(),
+            Some(Message::System {
+                content: MessageContent::Text(text),
+            }) if text == crate::shaping::diff::DIFF_INSTRUCTION
+        ));
+
+        let mut streaming_panel = diff_ready_request();
+        streaming_panel.stream = true;
+        let before = serde_json::to_string(&streaming_panel).unwrap();
+        let outcome = prepare_route_diff(&mut streaming_panel, true, Some("panel"));
+        assert!(matches!(
+            outcome,
+            RouteDiffPreparation::Skipped("streaming")
+        ));
+        assert_eq!(serde_json::to_string(&streaming_panel).unwrap(), before);
+    }
 }
 
 // REL-3: detached telemetry writes are drained via a TaskTracker so a
@@ -9975,6 +11064,7 @@ mod telemetry_drain_tests {
             api_key_id: Uuid::nil(),
             ts: Utc::now(),
             provider: "openai".into(),
+            requested_model: None,
             model: "gpt-4o".into(),
             input_tokens: 10,
             output_tokens: 5,
@@ -9983,9 +11073,13 @@ mod telemetry_drain_tests {
             baseline_cost_usd: 0.001,
             provider_cache_saved_usd: 0.0,
             cache_bust_penalty_usd: 0.0,
+            flex_saved_usd: 0.0,
+            doc_compaction_saved_usd: 0.0,
+            summarizer_tax_usd: 0.0,
             cached: false,
             cache_layer: None,
             route_id: None,
+            route_version_id: None,
             latency_ms: 50,
             upstream_latency_ms: None,
             status: 200,

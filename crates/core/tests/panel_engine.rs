@@ -52,15 +52,24 @@ use serde_json::{json, Value};
 use tokio_util::task::TaskTracker;
 use tower::util::ServiceExt;
 
+use tt_auth::{
+    keys::{issue, Environment},
+    InMemoryKeyStore, InMemoryProviderCredentialStore,
+};
 use tt_cache::embed::MockEmbedder;
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
+    context::{ProviderCredentials, SecretString},
     messages::{Choice, Message, MessageContent},
     pricing::Capability,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
-use tt_telemetry::request_logs::InMemoryRequestLogWriter;
+use tt_telemetry::{
+    audit::{Actor, InMemoryAuditWriter},
+    request_logs::InMemoryRequestLogWriter,
+};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Shared helpers (mirrors panel_dispatch.rs)
@@ -80,6 +89,29 @@ async fn drain_rows(
     tracker.close();
     tracker.wait().await;
     writer.rows()
+}
+
+fn upstream_credential(api_key: &str) -> ProviderCredentials {
+    ProviderCredentials {
+        api_key: SecretString::new(api_key.to_string()),
+        base_url: None,
+        extra_headers: Vec::new(),
+    }
+}
+
+async fn issue_live_key(store: &InMemoryKeyStore, org: Uuid) -> String {
+    let audit = InMemoryAuditWriter::new();
+    issue(
+        store,
+        &audit,
+        org,
+        "panel-preflight",
+        Environment::Live,
+        Actor::System,
+    )
+    .await
+    .expect("issue test live key")
+    .plaintext
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +326,117 @@ fn app_two_providers() -> (
 }
 
 // ============================================================================
+// Credential preflight: a verified org can have enough member credentials but
+// no credential for the distinct LLM arbiter. Both buffered and streaming
+// requests must return a deterministic 400 before any provider call or
+// request-log write; the source TokenTrimmer bearer must never reach vendor-c.
+// ============================================================================
+
+#[tokio::test]
+async fn missing_verified_org_arbiter_credential_fails_before_buffered_or_streaming_dispatch() {
+    let calls_a = Arc::new(AtomicUsize::new(0));
+    let calls_b = Arc::new(AtomicUsize::new(0));
+    let calls_c = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountedMock::new(
+        "vendor-a",
+        "model-a",
+        Arc::clone(&calls_a),
+    )));
+    registry.register(Arc::new(CountedMock::new(
+        "vendor-b",
+        "model-b",
+        Arc::clone(&calls_b),
+    )));
+    registry.register(Arc::new(CountedMock::new(
+        "vendor-c",
+        "model-arb",
+        Arc::clone(&calls_c),
+    )));
+
+    let org = Uuid::now_v7();
+    let key_store = Arc::new(InMemoryKeyStore::new());
+    let bearer = issue_live_key(key_store.as_ref(), org).await;
+    let credential_store = Arc::new(InMemoryProviderCredentialStore::new());
+    credential_store.insert(org, "vendor-a", upstream_credential("vendor-a-key"));
+    credential_store.insert(org, "vendor-b", upstream_credential("vendor-b-key"));
+    // Intentionally omit vendor-c. The live TokenTrimmer bearer is not an
+    // upstream vendor-c key and must not be forwarded as one.
+
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let tracker = TaskTracker::new();
+    let app = build_router(
+        AppState::new(registry)
+            .with_panel_enabled(true)
+            .with_key_store(key_store)
+            .with_credential_store(credential_store)
+            .with_request_log_writer(writer.clone())
+            .with_telemetry_tracker(tracker.clone()),
+    );
+
+    for stream in [false, true] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("x-tokentrimmer-panel", "synthesize")
+            .header("x-tokentrimmer-cost-limit-usd", "10.0")
+            .body(Body::from(
+                json!({
+                    "model": "model-a",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "deep question" }],
+                    "stream": stream,
+                    "tt_extras": {
+                        "panel": {
+                            "members": ["model-a", "model-b"],
+                            "arbiter_model": "model-arb",
+                            "quorum": 2
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("build panel request");
+
+        let response = app.clone().oneshot(req).await.expect("route response");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "missing arbiter credential must fail before {} dispatch",
+            if stream { "streaming" } else { "buffered" }
+        );
+        let body = body_json(response).await;
+        assert_eq!(
+            body["error"]["code"], "panel_credentials_unavailable",
+            "missing arbiter credential must use the stable preflight code, got {body}"
+        );
+    }
+
+    assert_eq!(
+        calls_a.load(Ordering::Relaxed),
+        0,
+        "member vendor-a must not dispatch before credential preflight"
+    );
+    assert_eq!(
+        calls_b.load(Ordering::Relaxed),
+        0,
+        "member vendor-b must not dispatch before credential preflight"
+    );
+    assert_eq!(
+        calls_c.load(Ordering::Relaxed),
+        0,
+        "arbiter vendor-c must never receive the source bearer as a fallback"
+    );
+    let rows = drain_rows(&writer, tracker).await;
+    assert!(
+        rows.is_empty(),
+        "credential-preflight rejects must write no request-log rows"
+    );
+}
+
+// ============================================================================
 // INVARIANT 3 (7.3 fail-closed budget): over-budget ⇒ 402 BEFORE any dispatch.
 //
 // The budget gate in chat.rs fires BEFORE `Prepared` is built and BEFORE any
@@ -321,6 +464,7 @@ async fn fail_closed_budget_returns_402_with_zero_dispatches() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {
@@ -365,6 +509,66 @@ async fn fail_closed_budget_returns_402_with_zero_dispatches() {
     );
 }
 
+/// The body-level `tt_extras.panel.max_cost_usd` ingress must reach the same
+/// pre-dispatch gate as the request header. The returned admission-limit value
+/// distinguishes a parsed body budget from the separate fail-closed
+/// no-budget rejection. One explicit member keeps this ingress test independent
+/// of an ambient `TT_PANEL_MAX_MEMBERS=1`; the fixed Synthesize arbiter output
+/// still makes the `$0.001` body budget over-limit.
+#[tokio::test]
+async fn body_panel_budget_returns_402_with_zero_dispatches() {
+    let (app, writer, tracker, calls) = app_single_provider(false, true);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "deep question" }],
+                "stream": false,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["gpt-4o"],
+                        "arbiter_model": "gpt-4o",
+                        "max_cost_usd": 0.001
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "over-budget body-configured panel must return 402 before dispatch"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["error"]["code"], "cost_limit_exceeded", "got {body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("$0.0010")),
+        "the rejection must report the body-configured admission limit, got {body}"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "the body budget must be enforced before any provider dispatch"
+    );
+    let rows = drain_rows(&writer, tracker).await;
+    assert!(
+        rows.is_empty(),
+        "a body-budget rejection must write no request-log rows"
+    );
+}
+
 // ============================================================================
 // INVARIANT 4 (7.4 quorum unmet): all members fail ⇒ 502 BAD_GATEWAY,
 // no billing row written.
@@ -394,6 +598,7 @@ async fn quorum_unmet_returns_502_with_zero_rows() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {
@@ -503,6 +708,7 @@ async fn happy_path_served_counter_and_panel_legs_metric_present() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {
@@ -659,6 +865,7 @@ async fn multi_provider_panel_dispatches_both_and_bills_one_aggregate_row() {
         .body(Body::from(
             json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {
@@ -760,6 +967,7 @@ async fn unpriceable_member_fails_closed_with_zero_dispatches() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {
@@ -879,6 +1087,7 @@ async fn best_of_n_strategy_returns_200_with_arbiter_body() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "which is best?" }],
                 "stream": false,
                 "tt_extras": {
@@ -924,18 +1133,17 @@ async fn best_of_n_strategy_returns_200_with_arbiter_body() {
 }
 
 // ============================================================================
-// Phase 4 — majority router integration test.
+// Phase 4 — Majority admission must fail closed without embedding pricing.
 //
-// Strategy: `majority`. Two members + MockEmbedder (fixed [1.0, 0.0]).
-// All answers embed identically → cosine == 1.0 >= 0.83 → single cluster of
-// size 2. `winning_cluster_size == 2`.
-// Key assertions: HTTP 200 (NOT 501), `arbiter.strategy == "majority"`,
-// `winning_cluster_size` present.
+// Even though this harness installs a MockEmbedder, PanelConfig has no
+// provider/model pricing contract for that embedding work. A budgeted request
+// must therefore reject before any member dispatch rather than use the unused
+// LLM arbiter field as a misleading cost proxy.
 // ============================================================================
 
 #[tokio::test]
-async fn majority_strategy_returns_200_with_arbiter_body() {
-    let (app, _writer, _tracker, _calls) = app_with_embedder();
+async fn majority_strategy_fails_closed_without_embedding_pricing() {
+    let (app, writer, tracker, calls) = app_with_embedder();
 
     let req = Request::builder()
         .method("POST")
@@ -948,6 +1156,7 @@ async fn majority_strategy_returns_200_with_arbiter_body() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "what is the consensus?" }],
                 "stream": false,
                 "tt_extras": {
@@ -965,30 +1174,24 @@ async fn majority_strategy_returns_200_with_arbiter_body() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "majority panel must return 200 OK (NOT 501)"
+        StatusCode::PAYMENT_REQUIRED,
+        "majority must reject until embedding work has a pricing contract"
     );
-
     let body = body_json(resp).await;
-    let panel = &body["tokentrimmer"]["panel"];
-    assert!(
-        panel.is_object(),
-        "response must carry tokentrimmer.panel, got {body}"
-    );
-
-    let arbiter = &panel["arbiter"];
-    assert!(
-        arbiter.is_object(),
-        "tokentrimmer.panel.arbiter must be an object, got {panel}"
+    assert_eq!(
+        body["error"]["code"], "cost_limit_exceeded",
+        "unpriced embedding admission must use the standard fail-closed error, got {body}"
     );
     assert_eq!(
-        arbiter["strategy"], "majority",
-        "arbiter.strategy must be 'majority', got {arbiter}"
+        calls.load(Ordering::Relaxed),
+        0,
+        "Majority admission must reject before any member dispatch"
     );
-    // Both answers embed identically → one cluster of size 2.
+    let rows = drain_rows(&writer, tracker).await;
     assert_eq!(
-        arbiter["winning_cluster_size"], 2,
-        "winning_cluster_size must be 2 (both answers cluster together), got {arbiter}"
+        rows.len(),
+        0,
+        "rejected Majority request writes no billing row"
     );
 }
 
@@ -1011,6 +1214,7 @@ async fn synthesize_panel_body_still_has_arbiter_object() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "synthesize this" }],
                 "stream": false,
                 "tt_extras": {

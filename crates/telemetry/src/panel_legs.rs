@@ -109,8 +109,27 @@ pub mod postgres {
     use super::*;
     use sqlx::PgPool;
 
-    /// Production writer. INSERTs all rows into `panel_legs` in a single
-    /// multi-row statement (one round-trip per batch).
+    /// Production writer. Inserts all rows in one parent-gated multi-row
+    /// statement (one round-trip per batch).
+    ///
+    /// The standalone public migration deliberately has no database FK to
+    /// `request_logs`. The shared cloud schema adds a separate `NOT VALID`
+    /// cascade FK in cloud migration 0068, but this writer also runs without
+    /// that control-plane migration and it cannot validate historical rows.
+    /// It therefore locks each existing parent `FOR KEY SHARE` before it
+    /// inserts any child. A retention/account-purge `FOR UPDATE` either waits
+    /// for this statement and deletes the just-inserted legs, or wins first and
+    /// makes the parent absent so no child is inserted. That prevents a late
+    /// child from creating a new orphan without turning the response path into
+    /// a cross-writer transaction.
+    ///
+    /// A batch whose parent is still missing (for example, its detached
+    /// request-log write has not committed, or was already purged) is a
+    /// deliberate best-effort drop: it returns `Ok(())` and emits a
+    /// count-only warning rather than storing unowned telemetry. This cannot
+    /// repair legacy orphans or guarantee attribution if the parent writer
+    /// never commits; the shared FK prevents a committed orphan but a
+    /// coordinated parent/child writer plus legacy remediation remain needed.
     #[derive(Clone)]
     pub struct PostgresPanelLegWriter {
         pool: PgPool,
@@ -141,11 +160,12 @@ pub mod postgres {
                 return Ok(());
             }
 
+            let requested = rows.len();
             let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-                "INSERT INTO panel_legs \
+                "WITH input \
                  (request_log_id, leg_index, role, provider, model, \
                   input_tokens, output_tokens, cached_tokens, \
-                  cost_usd, latency_ms, status, error_class) ",
+                  cost_usd, latency_ms, status, error_class) AS (",
             );
 
             qb.push_values(rows, |mut b, r| {
@@ -163,10 +183,45 @@ pub mod postgres {
                     .push_bind(r.error_class); // error_class
             });
 
-            qb.build()
+            // The parent row lock is deliberately inside the same statement as
+            // the insert. `FOR KEY SHARE` conflicts with the `FOR UPDATE` used
+            // by cloud retention/account purge, so either side wins as one
+            // atomic lifecycle decision. Joining the locked IDs also makes a
+            // missing/deleted parent a no-op instead of an orphan leg.
+            qb.push(
+                "), locked_parents AS MATERIALIZED (\
+                    SELECT log.id \
+                    FROM request_logs AS log \
+                    WHERE log.id IN (SELECT DISTINCT request_log_id FROM input) \
+                    FOR KEY SHARE\
+                 ) \
+                 INSERT INTO panel_legs \
+                 (request_log_id, leg_index, role, provider, model, \
+                  input_tokens, output_tokens, cached_tokens, \
+                  cost_usd, latency_ms, status, error_class) \
+                 SELECT input.request_log_id, input.leg_index, input.role, \
+                        input.provider, input.model, input.input_tokens, \
+                        input.output_tokens, input.cached_tokens, input.cost_usd, \
+                        input.latency_ms, input.status, input.error_class \
+                 FROM input \
+                 JOIN locked_parents AS parent \
+                   ON parent.id = input.request_log_id",
+            );
+
+            let inserted = qb
+                .build()
                 .execute(&self.pool)
                 .await
-                .map_err(classify_sqlx_error)?;
+                .map_err(classify_sqlx_error)?
+                .rows_affected();
+            if inserted < requested as u64 {
+                tracing::warn!(
+                    requested,
+                    inserted,
+                    dropped = requested.saturating_sub(inserted as usize),
+                    "panel_legs skipped because request_logs parent was missing or deleted"
+                );
+            }
             Ok(())
         }
     }
@@ -298,6 +353,48 @@ mod tests {
             "push_values closure has {bind_calls} .push_bind( calls but \
              INSERT_COLUMN_COUNT is {INSERT_COLUMN_COUNT} — a mismatch causes \
              a runtime panic for every panel_legs INSERT"
+        );
+    }
+
+    /// The Postgres batch insert must parent-gate every child in the same SQL
+    /// statement. A detached leg arriving after cloud retention/account purge
+    /// has deleted its request log is intentionally dropped rather than
+    /// persisted as an orphan; `write_legs` remains `Ok(())` because this is
+    /// best-effort attribution telemetry and the count-only warning is the
+    /// observable signal. Keep this source contract even with the shared-cloud
+    /// FK: standalone schemas and pre-parent detached writes still rely on it,
+    /// and a transactional parent/child writer remains a separate improvement.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_batch_insert_parent_gates_missing_parent_rows() {
+        let source = include_str!("panel_legs.rs");
+        let input = source
+            .find("WITH input")
+            .expect("batched panel-leg input CTE must exist");
+        let sql = &source[input..];
+        let parents = sql
+            .find("locked_parents AS MATERIALIZED")
+            .expect("input rows must be joined to locked request-log parents");
+        let parent_sql = &sql[parents..];
+        let lock = parent_sql
+            .find("FOR KEY SHARE")
+            .expect("parent gate must lock the request-log parent");
+        let insert = parent_sql
+            .find("INSERT INTO panel_legs")
+            .expect("parent-gated batch must insert panel legs");
+
+        assert!(
+            lock < insert,
+            "the parent lock CTE must precede the panel-leg INSERT"
+        );
+        assert!(
+            sql.contains("JOIN locked_parents AS parent"),
+            "every inserted leg must join an existing locked parent"
+        );
+        assert!(
+            source
+                .contains("panel_legs skipped because request_logs parent was missing or deleted"),
+            "missing-parent drops must be observable without logging tenant identifiers"
         );
     }
 }

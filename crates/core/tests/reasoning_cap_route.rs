@@ -239,6 +239,12 @@ async fn harness(opts: Opts) -> Harness {
             then: opts.then,
         }],
     );
+    let route_revision = routes_backing
+        .get_management_route(org_id, route_id)
+        .await
+        .expect("management read")
+        .and_then(|route| route.revision)
+        .expect("in-memory route revision");
     let routing = Arc::new(CachingRoutingStore::new(
         routes_backing as Arc<dyn RoutingStore>,
     ));
@@ -247,6 +253,7 @@ async fn harness(opts: Opts) -> Harness {
             .pause_route(
                 org_id,
                 route_id,
+                route_revision,
                 NewRoutePause {
                     paused_by: PausedBy::Manual,
                     reason: "test".into(),

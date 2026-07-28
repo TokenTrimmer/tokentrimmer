@@ -7,6 +7,7 @@ pub mod agent;
 pub mod batch;
 pub mod budgets;
 pub mod bundle;
+pub mod capabilities;
 pub mod catalog;
 pub mod chat;
 pub mod compress_corpus;

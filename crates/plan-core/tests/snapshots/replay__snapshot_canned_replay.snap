@@ -57,7 +57,8 @@ expression: result
   ],
   "caveats": [
     "Small sample size (50 requests) — confidence intervals are wide.",
-    "50 rerouted request(s) had no latency history for the target model — their latency is shown unchanged, not projected."
+    "50 rerouted request(s) had no latency history for the target model — their latency is shown unchanged, not projected.",
+    "Historical input-token route predicates use realized provider input_tokens as an APPROXIMATE proxy for the gateway's pre-dispatch estimate; boundary matches can differ."
   ],
   "proposed_routes": [
     {

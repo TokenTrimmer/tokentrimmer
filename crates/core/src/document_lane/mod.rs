@@ -1,4 +1,4 @@
-//! Document Lane — the pre-routing image/document → text distillation seam.
+//! Document Lane — the post-route-match image/document → text distillation seam.
 //!
 //! This module's prose docs wrap across many `//!` continuation lines (the
 //! D4a–D4c slice history), which trips clippy's `doc_lazy_continuation` /
@@ -14,13 +14,15 @@
 //!   gate whose [`should_distill`](DocDistillGate::should_distill) always returns
 //!   `false`. No behavior change.
 //! - **D4b:** the out-of-process OCR/parse sidecar + a fail-open Rust client.
-//! - **D4c:** the pre-routing seam in `prepare()` that (when the org/route opts
-//!   in via `RouteAction::document_lane`) distills image/document parts to text
-//!   so routing's `target_model` rewrite downgrades to a text model, and books
-//!   the isolated `doc_vision_saved_est_usd` counterfactual (D4c-v2: priced from
-//!   the seam's bookkeeping via D0's [`document_projection::project`]). The
-//!   downgrade is the route's `target_model` rewrite, NOT a capability-flag
-//!   re-flip (see #307). The lossy-substitution [`DocDistillGate`] (recall judge
+//! - **D4c:** the post-match seam in `prepare()` that (when the org/route opts
+//!   in via `RouteAction::document_lane`) atomically distills image/document
+//!   parts to text before target-provider setup. A completed transaction may
+//!   retain routing's `target_model` text downgrade and book the isolated
+//!   `doc_vision_saved_est_usd` counterfactual (D4c-v2: priced from the seam's
+//!   bookkeeping via D0's [`document_projection::project`]); an incomplete one
+//!   restores the caller model and raw media. The downgrade is the route's
+//!   `target_model` rewrite, NOT a capability-flag re-flip (see #307). The
+//!   lossy-substitution [`DocDistillGate`] (recall judge
 //!   + the sticky 0.90 auto-pause floor) is STILL the default-CLOSED scaffold —
 //!   lossy spans stay verbatim until that slice; lossless PDF-text layers
 //!   substitute unconditionally + book their saving now.
@@ -29,7 +31,7 @@
 //! default-CLOSED and fails open to the verbatim request. Error blobs are never
 //! distilled. See `docs/superpowers/specs/2026-07-01-document-lane-d4-server-seam-design.md`.
 
-/// D4c — the pre-routing distillation seam (invoked in `prepare()`).
+/// D4c — the post-route-match distillation seam (invoked in `prepare()`).
 pub mod seam;
 /// The fail-open client for the out-of-process `doc-sidecar` OCR/parse service
 /// (D4b). Disabled unless `TT_DOC_SIDECAR_URL` is set; any error/timeout → no

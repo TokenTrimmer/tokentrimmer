@@ -12,6 +12,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct WorkflowDefinition {
     pub id: Uuid,
     pub version: u32,
@@ -66,18 +67,50 @@ pub struct WorkflowDefinition {
 /// `workflow_schedule` sweep + the `/v1/workflows/:id/webhooks/:token` endpoint
 /// are the consumers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowTrigger {
-    /// Fire on a fixed interval. `interval` is a duration string (`"6h"` /
-    /// `"30m"` / `"1d"`) the cloud sweep parses to a `Duration`. No real-cron
-    /// expressions in v1 (no cron crate dep — the cloud sweeps are fixed-
-    /// `Duration` sleeps; mirroring that keeps the cadence discipline uniform).
-    Schedule { interval: String },
-    /// Fire via a signed webhook URL. `token_id` is the public identifier in the
-    /// URL path (`POST /v1/workflows/:id/webhooks/:token_id`); the HMAC secret
-    /// is derived server-side under a `wfwh|{workflow_id}|{token_id}` domain,
-    /// reusing the badge-HMAC key + the `verify_receipt_share_url` idiom.
-    Webhook { token_id: String },
+    /// Fire on a fixed interval. `interval` is a duration string (`"1h"` /
+    /// `"6h"` / `"1d"`) and new definitions must be at least one hour. The
+    /// cloud dispatcher picks due work up on an approximate hourly sweep, not
+    /// at an exact wall-clock time. No real-cron expressions in v1 (no cron
+    /// crate dep — the cloud sweeps are fixed-`Duration` sleeps; mirroring that
+    /// keeps the cadence discipline uniform).
+    Schedule {
+        interval: String,
+        /// Optional immutable release environment resolved when this trigger
+        /// occurrence is durably accepted. Omission preserves the historical
+        /// latest-saved-definition behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<WorkflowTriggerEnvironment>,
+    },
+    /// Fire via a signed webhook URL. `token_id` is the public trigger
+    /// identifier embedded in the v2 capability path
+    /// (`POST /v1/workflows/:id/webhooks/{org_uuid}.{token_id}.{hex_sig}`); the
+    /// HMAC secret is derived server-side under a
+    /// `wfwh2|{org_id}|{workflow_id}|{token_id}` domain. Binding the tenant is
+    /// required because workflow ids are tenant-scoped. This reuses the
+    /// badge-HMAC key + the `verify_receipt_share_url` idiom.
+    Webhook {
+        token_id: String,
+        /// Optional immutable release environment resolved when this trigger
+        /// occurrence is durably accepted. Omission preserves the historical
+        /// latest-saved-definition behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<WorkflowTriggerEnvironment>,
+    },
+}
+
+/// Closed release selector available to automatic workflow triggers. This is
+/// deliberately the same three-value wire vocabulary as direct and route
+/// execution, while remaining in the pure definition model consumed by Cloud.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowTriggerEnvironment {
+    Development,
+    Staging,
+    Production,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +127,7 @@ pub enum WorkflowTrigger {
 ///
 /// NOTE: #[serde(flatten)] + internal tag works only with self-describing formats (JSON); do not serialize with CBOR/MessagePack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct Node {
     pub id: String,
     #[serde(flatten)]
@@ -104,6 +138,7 @@ pub struct Node {
 /// variant-specific fields are inlined into the same JSON object via the
 /// internal-tag mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeKind {
     /// Entry-point node; receives the workflow's external input.
@@ -113,6 +148,11 @@ pub enum NodeKind {
     Model {
         selection: ModelSelection,
         prompt: String,
+        /// Optional per-call output-token ceiling.  Omitted definitions retain
+        /// legacy provider-default behavior; capped workflow admission requires
+        /// this to be explicitly set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_output_tokens: Option<u32>,
         #[serde(default)]
         max_cost_usd: Option<f64>,
     },
@@ -124,6 +164,10 @@ pub enum NodeKind {
         /// Turn cap for the agent loop; None => the engine's default (DEFAULT_MAX_TURNS = 8, matching CreateRunRequest).
         #[serde(default)]
         max_turns: Option<u32>,
+        /// Optional ceiling for each model turn's completion.  It does not
+        /// bound the number of turns; see `max_turns`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_output_tokens: Option<u32>,
         #[serde(default)]
         max_cost_usd: Option<f64>,
         #[serde(default)]
@@ -216,6 +260,7 @@ pub enum NodeKind {
 /// Serialised with a `"type"` discriminant matching the variant name in
 /// snake_case.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelSelection {
     /// A specific model id (e.g. `"claude-3-5-haiku-20241022"`).
@@ -231,6 +276,7 @@ pub enum ModelSelection {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct Edge {
     pub from: String,
     pub to: String,
@@ -244,6 +290,7 @@ pub struct Edge {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct BudgetPolicy {
     /// Hard USD cap for the entire workflow run.
     #[serde(default)]
@@ -256,6 +303,7 @@ pub struct BudgetPolicy {
 /// Action taken when a budget limit is hit.  Only `Stop` is implemented in
 /// W1a; warn/throttle/etc. are deferred.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub enum OnExceed {
     #[default]
     Stop,
@@ -335,6 +383,128 @@ mod tests {
     }
 
     #[test]
+    fn output_cap_is_additive_and_roundtrips_when_present() {
+        let legacy = r#"{"id":"00000000-0000-0000-0000-000000000000","version":1,"name":"t",
+          "nodes":[{"id":"t","type":"trigger"},
+                   {"id":"m","type":"model","selection":{"type":"model","model":"gpt-4o-mini"},"prompt":"{{input}}"},
+                   {"id":"a","type":"agent","selection":{"type":"model","model":"gpt-4o-mini"},"prompt":"{{input}}","tools":[]},
+                   {"id":"o","type":"output"}],
+          "edges":[{"from":"t","to":"m"},{"from":"m","to":"a"},{"from":"a","to":"o"}]}"#;
+        let def: WorkflowDefinition = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            &def.nodes[1].kind,
+            NodeKind::Model {
+                max_output_tokens: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &def.nodes[2].kind,
+            NodeKind::Agent {
+                max_output_tokens: None,
+                ..
+            }
+        ));
+        let legacy_reencoded = serde_json::to_string(&def).unwrap();
+        assert!(
+            !legacy_reencoded.contains("max_output_tokens"),
+            "omitted legacy fields must remain omitted on storage round-trip"
+        );
+
+        let capped = r#"{"id":"00000000-0000-0000-0000-000000000000","version":1,"name":"t",
+          "nodes":[{"id":"t","type":"trigger"},
+                   {"id":"m","type":"model","selection":{"type":"model","model":"gpt-4o-mini"},"prompt":"{{input}}","max_output_tokens":64},
+                   {"id":"o","type":"output"}],
+          "edges":[{"from":"t","to":"m"},{"from":"m","to":"o"}]}"#;
+        let def: WorkflowDefinition = serde_json::from_str(capped).unwrap();
+        assert!(matches!(
+            &def.nodes[1].kind,
+            NodeKind::Model {
+                max_output_tokens: Some(64),
+                ..
+            }
+        ));
+        assert!(
+            serde_json::to_string(&def)
+                .unwrap()
+                .contains("\"max_output_tokens\":64"),
+            "explicit output caps are persisted in definition JSON"
+        );
+    }
+
+    #[test]
+    fn definition_roundtrips_out_of_band_triggers() {
+        // Schedules and signed webhooks are behavior-bearing definition
+        // fields, not editor-only decoration.  Their canonical JSON and the
+        // content hash must survive a deserialize/serialize cycle.
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","version":1,"name":"automated",
+          "nodes":[{"id":"t","type":"trigger"},{"id":"o","type":"output"}],
+          "edges":[{"from":"t","to":"o"}],
+          "triggers":[
+            {"type":"schedule","interval":"6h","environment":"staging"},
+            {"type":"webhook","token_id":"ops_sync_1","environment":"production"}
+          ]}"#;
+        let def: WorkflowDefinition = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            def.triggers,
+            vec![
+                WorkflowTrigger::Schedule {
+                    interval: "6h".to_string(),
+                    environment: Some(WorkflowTriggerEnvironment::Staging),
+                },
+                WorkflowTrigger::Webhook {
+                    token_id: "ops_sync_1".to_string(),
+                    environment: Some(WorkflowTriggerEnvironment::Production),
+                },
+            ]
+        );
+
+        let hash = content_hash(&def);
+        let serialized = serde_json::to_string(&def).unwrap();
+        assert!(serialized.contains("\"triggers\""));
+        assert!(serialized.contains("\"environment\":\"staging\""));
+        let reparsed: WorkflowDefinition = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.triggers, def.triggers);
+        assert_eq!(content_hash(&reparsed), hash);
+
+        let mut human_run_only = def.clone();
+        human_run_only.triggers.clear();
+        assert_ne!(
+            content_hash(&human_run_only),
+            hash,
+            "trigger changes must create a distinct immutable definition version"
+        );
+
+        let legacy_json = r#"{"id":"00000000-0000-0000-0000-000000000000","version":1,"name":"legacy","nodes":[],"edges":[],"triggers":[{"type":"schedule","interval":"1h"}]}"#;
+        let legacy: WorkflowDefinition = serde_json::from_str(legacy_json).unwrap();
+        let legacy_serialized = serde_json::to_value(legacy).unwrap();
+        assert!(legacy_serialized["triggers"][0]
+            .get("environment")
+            .is_none());
+
+        for environment in ["development", "staging", "production"] {
+            let trigger: WorkflowTrigger = serde_json::from_value(serde_json::json!({
+                "type": "webhook",
+                "token_id": "closed",
+                "environment": environment,
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(trigger).unwrap()["environment"],
+                environment
+            );
+        }
+        assert!(
+            serde_json::from_value::<WorkflowTrigger>(serde_json::json!({
+                "type": "schedule",
+                "interval": "1h",
+                "environment": "preview",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn all_node_kinds_serialize_correctly() {
         // Verify each variant serializes with the expected "type" tag.
         let nodes = vec![
@@ -349,6 +519,7 @@ mod tests {
                         model: "claude-3-5-haiku-20241022".into(),
                     },
                     prompt: "hello".into(),
+                    max_output_tokens: None,
                     max_cost_usd: None,
                 },
             },
@@ -360,6 +531,7 @@ mod tests {
                     },
                     prompt: "act".into(),
                     max_turns: Some(5),
+                    max_output_tokens: None,
                     max_cost_usd: Some(0.10),
                     tools: vec![],
                 },

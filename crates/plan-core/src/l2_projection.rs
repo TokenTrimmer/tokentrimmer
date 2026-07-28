@@ -307,6 +307,7 @@ mod tests {
                 + chrono::Duration::seconds(secs),
             provider: "anthropic".into(),
             model: "claude".into(),
+            requested_model: None,
             input_tokens: 100,
             output_tokens,
             cached_tokens: 0,

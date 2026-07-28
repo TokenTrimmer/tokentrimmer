@@ -4,20 +4,26 @@ TokenTrimmer's workflow engine (`crates/core/src/workflow/`) is an in-gateway,
 durable, cost-controlled workflow runtime. A workflow is a JSON graph of nodes
 (LLM calls, agent loops, HTTP calls, transforms, branches, sub-workflows) that
 the gateway executes server-side, applying routing, caching, cost accounting,
-budget caps, and signed receipts to every step — and rolling the cost up into
-one `saved_usd` figure per run.
+and budget caps while rolling the cost up into one `saved_usd` estimate per
+run. Eligible terminal records can be minted on demand as signed estimates;
+they are not automatic per-step receipts or provider-invoice reconciliation.
 
 This page documents the DSL (the node types, the `ModelSelection`, edges,
-`allowed_hosts`, `secrets`), the CRUD + run API, and the SSE event shape. It's
+`allowed_hosts`, `secrets`, environment variables), the CRUD + run API, and the SSE event shape. It's
 grounded in `crates/core/src/workflow/types.rs` + `routes/workflows.rs`.
 
 ## The workflow definition
 
 A workflow is a `WorkflowDefinition` with nodes, edges, entry/exit, an
-allowlist of outbound HTTP hosts, and optionally named secrets. Stored via
+allowlist of outbound HTTP hosts, optional out-of-band triggers, and optionally
+named secrets. Stored via
 `POST /v1/workflows` (CRUD in `routes/workflows.rs`); run via
 `POST /v1/workflows/:id/runs`; estimated (offline cost preview) via
 `POST /v1/workflows/:id/estimate`.
+
+Definition updates are strict at the top level: unknown fields are rejected.
+Clients that read and then update a workflow must preserve `metadata` and
+`triggers` even when they do not render controls for them.
 
 ## Node types (`NodeKind`)
 
@@ -28,14 +34,14 @@ object with a `"type"` discriminant + the variant's fields inlined via
 | `type` | What it does | Cost-relevant fields |
 |--------|---|---|
 | `trigger` | Entry-point; receives the workflow's external input. | — |
-| `model` | A single LLM call. `selection` picks the model/route; `prompt` is the template; `max_cost_usd` (optional) caps THIS call's cost. | `max_cost_usd: Option<f64>` |
-| `agent` | An agentic multi-turn loop with tool access. `max_turns` (default `DEFAULT_MAX_TURNS = 8`), `max_cost_usd`, `tools`. | `max_turns`, `max_cost_usd` |
+| `model` | A single LLM call. `selection` picks the model/route; `prompt` is the template; optional `max_output_tokens` is forwarded as the provider completion limit. | `max_output_tokens`, `max_cost_usd` |
+| `agent` | An agentic multi-turn loop with tool access. `max_turns` (default `DEFAULT_MAX_TURNS = 8`), optional per-turn `max_output_tokens`, `max_cost_usd`, `tools`. | `max_turns`, `max_output_tokens`, `max_cost_usd` |
 | `transform` | A deterministic expression transform (no LLM call). `expr` is the expression string. | — (no LLM cost) |
 | `branch` | A conditional branch; exactly one outgoing edge is followed. `cond` (expression), `when_true`/`when_false` (node ids). | — |
 | `output` | Terminal output-collection node. | — |
 | `http` | An outbound HTTP call to an allowlisted external API. `method`, `url`, `headers`, `body`, `max_response_bytes`. The `url` host MUST be a static literal in `allowed_hosts` (default-deny); only path/query/headers/body may contain `{{template}}` tokens. | `max_response_bytes` (size cap) |
-| `sub_workflow` | Execute another stored workflow as a nested child. `workflow_id`, `version` (unused at MVP — always latest). The parent's remaining budget cap is passed to the child; cost + baseline roll up so `saved_usd` derives without double-counting. | inherits parent cap |
-| `loop` | A bounded loop — runs the `body_workflow_id` sub-workflow up to `max_iters` times, re-checking `cond` (Branch syntax) before each iteration. Termination is GUARANTEED by `max_iters`; `cond` is early-exit. | `max_iters` |
+| `sub_workflow` | Execute another stored workflow as a nested child. `workflow_id`, `version` (unused at MVP — always latest). Cost + baseline roll up so `saved_usd` derives without double-counting. Nested workflows remain compatible for uncapped runs, but capped static admission rejects them because their future graph is not fully known. | nested graph (not capped-admission eligible) |
+| `loop` | A bounded loop — runs the `body_workflow_id` sub-workflow up to `max_iters` times, re-checking `cond` (Branch syntax) before each iteration. Termination is GUARANTEED by `max_iters`; `cond` is early-exit. It remains compatible for uncapped runs but is not capped-admission eligible. | `max_iters` |
 
 ## Model selection (`ModelSelection`)
 
@@ -55,6 +61,29 @@ selects the one to follow at runtime; `branch` follows exactly one
 (`when_true` or `when_false`). `loop` re-checks `cond` before each iteration
 using the `branch` syntax.
 
+## Out-of-band triggers
+
+`triggers` is optional. An omitted or empty array means a workflow can only be
+started by a human/API run. The two current invokers are:
+
+```json
+[
+  { "type": "schedule", "interval": "6h" },
+  { "type": "webhook", "token_id": "ops_sync_1" }
+]
+```
+
+- `schedule.interval` uses bounded duration components (`1h`, `6h`, `1d`, or
+  `1d6h`), with a one-hour minimum and 30-day maximum for new or updated
+  definitions. The hosted dispatcher normally picks due work up on an
+  approximate hourly sweep rather than at an exact wall-clock time; startup,
+  leader acquisition, and the configured sweep profile can add pickup jitter.
+  One schedule is allowed per workflow. Existing persisted sub-hour schedules
+  are not rewritten or disabled by this validation change; operators must
+  explicitly inventory and migrate them to one hour or longer.
+- `webhook.token_id` is a non-empty URL-safe identifier. The server derives and
+  verifies the signed webhook URL; secrets never live in the definition.
+
 ## Allowed hosts + secrets
 
 - **`allowed_hosts`** (on `WorkflowDefinition`): a default-DENY allowlist of
@@ -66,17 +95,64 @@ using the `branch` syntax.
   adversarially tested).
 - **`secrets`**: named secrets referenced by `{{secrets.NAME}}` templates in
   `http` node headers/body. BYO-secrets (the gateway never has OAuth custody);
-  see `workflow/secrets.rs` + the workflow-secrets migration.
+  see `workflow/secrets.rs` + the workflow-secrets migration. Invalid names are
+  rejected with the definition; missing or unusable references fail closed
+  before the root definition executes any node. Before execution, the gateway
+  loads the complete nested-definition tree through the five supported depth
+  levels in org-scoped batches (maximum 256 distinct nested definitions),
+  checks all of its references, and freezes those exact definitions for the
+  run. A later child save therefore cannot swap an unchecked definition into
+  the already-admitted run.
+- **Environment variables**: bounded, versioned, explicitly non-secret maps
+  managed separately for development, staging, and production. Use
+  `{{variables.NAME}}` in executable template fields. A direct
+  environment-bound run accepts one exact snapshot and passes it to the root
+  and all nested workflows; latest-version and exact-version runs have no map.
+  Missing or malformed references fail the whole frozen tree before the root
+  Trigger. Values are returned by the management API, so credentials must use
+  the encrypted `secrets` surface instead.
 
 ## API surface
 
 | Method + path | What |
 |---|---|
-| `POST /v1/workflows` | Create a workflow (CRUD; `id` + `version` optional). |
+| `POST /v1/workflows` | Append an immutable workflow version (`id`/legacy `version` optional); optional write-only `expected_latest_version` (`0` = absent) rejects stale/concurrent writers with `409`. |
 | `GET /v1/workflows` | List workflow definitions (metadata). |
-| `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls; computes the projected cost from the graph + pricing). |
-| `POST /v1/workflows/:id/runs` | Run synchronously (returns the run + the rolled-up `saved_usd`). |
-| `GET /v1/workflows/:id/...` | (Run status / receipt endpoints — see `routes/workflows.rs`.) |
+| `GET /v1/workflows/:id` | Read the latest org-owned definition. |
+| `GET /v1/workflows/:id/versions` | List at most 100 newest-first immutable version metadata rows, with explicit truncation and `private, no-store`. |
+| `GET /v1/workflows/:id/versions/:version` | Read one exact retained definition plus authoritative hash/timestamp metadata with `private, no-store`. |
+| `GET /v1/workflows/:id/versions/:from/compare/:to` | Compare two exact versions as at most 256 deterministic value-free JSON Pointer changes, with explicit truncation and `private, no-store`. |
+| `GET /v1/workflows/:id/release-state` | Read the latest draft metadata plus at most one current value-free release pointer for each of development, staging, and production. |
+| `GET /v1/workflows/:id/environments/:environment/releases` | List at most 100 newest-first value-free release ledger rows for one environment, with explicit truncation. |
+| `GET /v1/workflows/:id/environments/:environment/variables` | Read the current versioned non-secret map; an unset environment is revision `0` with an empty map. |
+| `PUT /v1/workflows/:id/environments/:environment/variables` | Replace the complete bounded non-secret map under `expected_revision`; stale writers receive `409`. |
+| `POST /v1/workflows/:id/environments/development/publish` | Optimistically publish one exact retained draft version to development. |
+| `POST /v1/workflows/:id/environments/:environment/promote` | Optimistically copy the exact current development release to staging, or staging release to production. |
+| `POST /v1/workflows/:id/environments/:environment/rollback` | Optimistically append a rollback to a version previously released in that same environment. |
+| `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls). Mutually exclusive `workflow_version` and `workflow_environment` selectors choose an exact retained definition or exact current development/staging/production release; environment selection also reports and applies the accepted variables revision. Omission preserves latest-version behavior. |
+| `POST /v1/workflows/:id/runs` | Run synchronously. The same mutually exclusive version/environment selectors apply; environment-bound runs persist exact release and variables revision provenance, while omission preserves latest-version behavior. Returns the run plus rolled-up `saved_usd`. |
+| `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
+| `GET /v1/workflows/runs/:run_id` | Read one org-scoped durable run, its immutable definition version, and optional exact environment/release-revision provenance. |
+| `GET /v1/workflows/runs/:run_id/nodes` | Read up to 500 best-effort node-journal rows, labeled from the exact executed definition. New rows include gateway node-envelope timing; legacy rows expose only post-run persistence time. Neither is provider-attempt timing or replay. |
+| `GET /v1/workflows/secrets` | List up to 500 org-scoped secret names, decryptability states, and timestamps; never returns values/ciphertext and is `private, no-store`. |
+| `POST /v1/workflows/secrets` | Store or rotate a 1–65,536-byte org-scoped secret value. |
+| `DELETE /v1/workflows/secrets/:name` | Idempotently delete one org-scoped secret; stored versions remain intact and fail closed if they still reference it. |
+
+The immutable version reads and comparison support bounded history inspection.
+Comparison returns only RFC 6901 paths plus `added`, `removed`, or `modified`;
+it never echoes either side's values and omits the server-owned embedded
+`version` field. Release state is a separate compare-and-swap pointer plus an
+append-only metadata ledger: saves remain drafts, development publication
+selects an exact newer version, staging/production can only copy the exact current
+lower environment, and rollback can only restore a version already present in
+that environment's history. These transitions do not imply human approval and
+do not silently alter legacy latest-version execution.
+
+Environment configuration is a second revisioned pointer rather than part of
+the immutable definition or release ledger. This lets an accepted run retain
+both the exact code release and exact non-secret configuration revision without
+rewriting either history. Streaming `run.start`, synchronous responses,
+idempotent replays, and durable run reads expose the paired revisions.
 
 ## SSE events (a run's streaming surface)
 
@@ -93,32 +169,96 @@ Every `model`/`agent` node's LLM call goes through the SAME chat pipeline as
 `/v1/chat/completions` — cost accounting, routing, caching, the budget
 enforcer, the kill-switch all apply identically. The run rolls the per-node
 cost + baseline into a parent total; `saved_usd` derives without
-double-counting (sub-workflows pass the parent's remaining cap to the child).
+double-counting. Nested graphs retain their legacy uncapped cost rollup, while
+capped static admission rejects loops and sub-workflows before dispatch.
 
-Each completed run is signable as a workflow receipt — `POST /v1/admin/workflow-runs/{run_id}/receipt/sign` returns a frozen, Ed25519-signed receipt + a
-shareable verify URL. The receipt's canonical payload is
-`wfr:v1|<org>|<workflow_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>`
-(or `wfr:v2|…|<quality_verdict>` when the run carried a sampled flow-level
-quality-gate verdict).
+An eligible retained terminal run can be minted on demand as a workflow receipt —
+`POST /v1/admin/workflow-runs/{run_id}/receipt/sign` returns a frozen,
+Ed25519-signed estimate + a shareable verify URL. It is not an automatic receipt
+for every completed run or provider-invoice reconciliation. Current mints use
+`wfr:v3` without a sampled quality verdict and `wfr:v4` with one:
+
+```
+wfr:v3|<org>|<workflow_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<signed_request_delta_micros>|<formula>|<eligible_requests>|<measured_requests>|<status>
+wfr:v4|<the same v3 fields>|<quality_verdict>
+```
+
+The formula is exactly `tt.request-delta-estimate.v1`; coverage must be
+nonempty and complete (`measured_requests == eligible_requests`), and
+`saved_micros` is the positive-only projection
+`max(signed_request_delta_micros, 0)`. A regression therefore remains visible
+as a negative signed delta instead of becoming an apparent zero-savings run.
+An incomplete or empty cohort does not mint. Already-frozen `wfr:v1`/`wfr:v2`
+receipts retain their historical canonical bytes and remain verifiable.
+
+### Bounded budget admission
+
+`max_output_tokens` is an optional positive integer on `model` and `agent`
+nodes. When present, it is sent as the completion-token limit on each provider
+request (and used by the offline cost estimate). Omitting it keeps historical
+provider-default output behavior, so existing stored definitions remain
+compatible.
+
+When a run requests `max_cost_usd` (from its request or definition budget),
+the gateway performs a fail-closed static admission check before creating a run
+record or dispatching a provider request. Every `model`/`agent` node must then
+have an explicit positive `max_output_tokens`; prompts may contain only
+`{{input}}` references; selections must be statically priceable; agents must
+have `max_turns: 1` and no tools; and loops/sub-workflows are not admissible.
+Tool-bearing agents fail closed because the preview does not price serialized
+tool schemas or gateway-tool work. The directional projection must be within
+the requested cost value. A rejected definition can still run without
+`max_cost_usd`, preserving the legacy uncapped contract.
+
+After admission, ready `model`/`agent` siblings in a capped wave run in stable
+sequence rather than concurrently. Before each launch, the engine reserves its
+priceable single-turn preview against the budget remaining after prior actual
+node cost, then settles that reservation to the returned cost before considering
+the next sibling. The node receives the lesser of its own cap and the run value
+remaining. After normal route selection and request shaping, the gateway prices
+that final request again and fails closed before provider work if it is unknown
+or no longer fits. Capped workflow nodes make one provider attempt: route
+fallbacks, retries, shadow/panel/workflow fan-out, quality judging, and diff
+re-emission are disabled because they are not represented by the single-turn
+reservation. This remains an in-memory directional reservation, not a hard
+runtime or provider-invoice ceiling: a provider call already started can settle
+above its estimate. Uncapped waves retain concurrent execution.
 
 ### Verifying a workflow receipt
 
 The mint returns a self-contained `VerifyReceiptResponse` (from the public GET
 endpoint `GET /v1/workflow-runs/{run_id}/receipt?expires=&sig=`) exposing every
 canonical-payload field — `org_id`, `workflow_id`, `run_id`, `cost_micros`,
-`baseline_micros`, `saved_micros`, `status`, `canonical_version`,
-`quality_verdict`, `signature_hex`, + the embedded `verifying_key_hex`. Any party
-with the share URL can reconstruct the canonical string + check the Ed25519
-signature with that key — offline, no TokenTrimmer network call beyond fetching
-the receipt.
+`baseline_micros`, `saved_micros`, the signed request-delta formula, result, and
+coverage fields, `status`, `canonical_version`, `quality_verdict`,
+`signature_hex`, + the embedded `verifying_key_hex`. New evidence fields are
+null/absent on legacy receipts. Any party with the share URL can reconstruct the
+canonical string + check the Ed25519 signature with that key — offline, no
+TokenTrimmer network call beyond fetching the receipt.
 
-The `tt verify-receipt` CLI dispatches over the **compression** (`vcr:v1|`) +
-**cache-hit** (`l2:v1|`) receipt families (the gateway-signed receipts; the
-families customers verify most). Workflow-receipt (`wfr:`) online verify runs
-via the GET endpoint above; offline CLI verify of `wfr:` is a follow-up (the
-canonical-payload + verify primitives currently live cloud-side; moving them to
-the public `tt_telemetry` crate would make the CLI the single offline-verify
-entry point across all three families).
+`tt verify-receipt` verifies all four currently supported families offline:
+**compression** (`vcr:v1|`), **cache-hit** (`l2:v1|`), **workflow-run**
+(`wfr:v1|` through `wfr:v4|`), and top-level **agent-run** (`arr:v1|` /
+`arr:v2|`). ARR
+deliberately has no `workflow_id`; see
+[`07-agent-runs-api-reference.md`](07-agent-runs-api-reference.md) for its
+canonical fields and mint boundary. Supply a verifying key obtained and trusted
+out of band; the embedded key can establish only self-consistency. A successful
+signature check establishes that the supplied key signed an unchanged receipt,
+not issuer identity, provider usage, or invoice reconciliation.
+
+The generated machine-readable contract index is
+[`receipt-spec/receipt-contracts.manifest.json`](receipt-spec/receipt-contracts.manifest.json),
+with the WFR structural schema at
+[`receipt-spec/wfr-receipt.schema.json`](receipt-spec/wfr-receipt.schema.json).
+Its checked-in [v1](receipt-spec/wfr-v1.golden.json),
+[v2](receipt-spec/wfr-v2.golden.json),
+[v3](receipt-spec/wfr-v3.golden.json), and
+[v4](receipt-spec/wfr-v4.golden.json) golden vectors are verified by both the
+public canonical builder and `tt verify-receipt`; they pin JSON field names,
+canonical bytes, and Ed25519 encoding without asserting anything about the
+issuer or provider-invoice evidence. Rust generation drift and an independent
+JavaScript forged-fixture verifier are blocking CI checks.
 
 ## Example
 

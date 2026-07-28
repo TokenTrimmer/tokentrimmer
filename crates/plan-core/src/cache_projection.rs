@@ -104,6 +104,7 @@ mod tests {
                 + chrono::Duration::seconds(secs),
             provider: "anthropic".into(),
             model: model.into(),
+            requested_model: None,
             input_tokens: tokens,
             output_tokens: 0,
             cached_tokens: 0,

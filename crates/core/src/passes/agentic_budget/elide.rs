@@ -451,7 +451,9 @@ mod tests {
 
     /// With `keep_recent_pairs=3`, the last 3 tool-result blocks are untouched
     /// even when known (caveat C1 — keep recent verbatim). Only the OLDEST
-    /// block (outside the window) is shaped.
+    /// block (outside the window) is shaped. Raising the bound to 4 preserves
+    /// that oldest block too, so a more conservative setting cannot expand the
+    /// field-drop scope.
     #[test]
     fn field_drop_respects_keep_recent_pairs() {
         let diff = json!({
@@ -493,6 +495,7 @@ mod tests {
             assistant_call("c3", "inspect_diff"),
             tool_result("c3", recent("/tmp/.tt-scan-R3.py")),
         ]);
+        let original = req.clone();
         let _out = run(ElidePass::new(3), &mut req);
 
         // The OLDEST tool block (idx 2, c0) is OUTSIDE the keep-3 window → shaped.
@@ -510,6 +513,16 @@ mod tests {
                 "the last keep_recent_pairs tool results must stay verbatim (idx {idx}): {recent_text}"
             );
         }
+
+        let mut wider_window = original;
+        let before = serde_json::to_string(&wider_window).unwrap();
+        let out = run(ElidePass::new(4), &mut wider_window);
+        assert_eq!(
+            serde_json::to_string(&wider_window).unwrap(),
+            before,
+            "keeping all four tool-result blocks must make field-drop inert"
+        );
+        assert_eq!(out.tokens_removed, 0);
     }
 
     /// A degenerate "drop" that re-pretty-prints (adds tokens) is discarded by

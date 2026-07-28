@@ -5,6 +5,7 @@ pub mod agent_run;
 pub(crate) mod agent_run_budget;
 pub(crate) mod agent_run_store;
 pub mod batches;
+pub mod capabilities;
 pub mod chat;
 pub mod embeddings;
 pub(crate) mod gateway_tools;
@@ -19,6 +20,10 @@ pub mod responses;
 pub mod routes_api;
 pub mod spend_api;
 pub mod sse;
+pub mod workflow_releases;
+pub mod workflow_runs;
+pub mod workflow_variables;
+pub mod workflow_versions;
 pub mod workflows;
 
 /// Graft the `tokentrimmer.panel` attribution from a chat-completions response body

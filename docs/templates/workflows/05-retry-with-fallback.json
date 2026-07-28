@@ -1,6 +1,6 @@
 {
   "name": "retry-with-fallback",
-  "description": "A cost-aware error-handling pattern: a primary Model call with a tight max_cost_usd, a Branch on whether the output is empty/errored, + a fallback to a more-capable (still down-routed) model on failure. Demonstrates the Branch + the two-path fallback \u2014 the receipt captures both attempts' costs so the retry overhead is visible, not hidden.",
+  "description": "A cost-aware error-handling pattern: a primary Model call with a tight max_cost_usd, a Branch on whether the output is empty/errored, + a fallback to a more-capable (still down-routed) model on failure. Demonstrates the Branch + the two-path fallback \u2014 run detail exposes both attempts, while an eligible terminal receipt can be minted on demand as a signed aggregate estimate.",
   "nodes": [
     {
       "id": "in",

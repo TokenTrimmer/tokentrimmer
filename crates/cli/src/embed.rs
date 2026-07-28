@@ -4,7 +4,7 @@
 //! pure helpers below.
 
 use anyhow::Context as _;
-use tt_client::{EmbedOutcome, EmbeddingInput};
+use tt_client::{EmbedOutcome, EmbeddingInput, RequestDeltaEstimate};
 
 use crate::context::ResolvedContext;
 use crate::ui;
@@ -29,7 +29,15 @@ fn assemble_input(args: &[String], stdin_text: Option<&str>) -> Option<Embedding
 }
 
 /// One-line styled summary, e.g.
-/// "text-embedding-3-small · 2 embeddings × 3 dims · $0.0002 · saved 75%".
+/// "text-embedding-3-small · 2 embeddings × 3 dims · $0.0002 · request delta +$0.000200 (positive estimate)".
+fn format_signed_usd(value: f64) -> String {
+    if value < 0.0 {
+        format!("−${:.6}", -value)
+    } else {
+        format!("+${value:.6}")
+    }
+}
+
 fn format_embed_summary(out: &EmbedOutcome, requested_model: &str) -> String {
     let model = out.cost.model_used.as_deref().unwrap_or(requested_model);
     let count = out.response.data.len();
@@ -46,11 +54,36 @@ fn format_embed_summary(out: &EmbedOutcome, requested_model: &str) -> String {
     if let Some(cost) = out.cost.cost_usd {
         parts.push(format!("${cost:.4}"));
     }
-    if let (Some(saved), Some(baseline)) = (out.cost.saved_usd, out.cost.baseline_cost_usd) {
-        if baseline > 0.0 {
-            parts.push(format!("saved {:.0}%", saved / baseline * 100.0));
+    // Do not render the legacy positive-only `saved_usd` header as a savings
+    // percentage. The strict client estimate requires every raw component and
+    // leaves partial/old responses explicitly unmeasured.
+    match out.cost.request_delta_estimate() {
+        RequestDeltaEstimate::Measured {
+            signed_usd,
+            positive_usd,
+            ..
+        } if positive_usd > 0.0 => {
+            parts.push(format!(
+                "request delta {} (positive estimate)",
+                format_signed_usd(signed_usd)
+            ));
         }
+        RequestDeltaEstimate::Measured {
+            signed_usd,
+            regression_usd,
+            ..
+        } if regression_usd > 0.0 => {
+            parts.push(format!(
+                "request delta {} (regression)",
+                format_signed_usd(signed_usd)
+            ));
+        }
+        RequestDeltaEstimate::Measured { .. } => {
+            parts.push("request delta $0.000000 (neutral estimate)".to_string());
+        }
+        RequestDeltaEstimate::Unmeasured => parts.push("request delta not measured".to_string()),
     }
+    parts.push("request delta excludes judge/shadow taxes + invoice reconciliation".to_string());
     ui::muted()
         .apply_to(parts.join(&format!(" {} ", ui::BULLET)))
         .to_string()
@@ -165,11 +198,14 @@ mod tests {
     }
 
     #[test]
-    fn format_embed_summary_full() {
+    fn format_embed_summary_shows_measured_positive_request_delta() {
         let cost = CostInfo {
             cost_usd: Some(0.0002),
             saved_usd: Some(0.0003),
             baseline_cost_usd: Some(0.0004),
+            provider_cache_saved_usd: Some(0.0),
+            cache_bust_usd: Some(0.0),
+            summarizer_tax_usd: Some(0.0),
             model_used: Some("text-embedding-3-small".to_string()),
             ..CostInfo::default()
         };
@@ -179,7 +215,55 @@ mod tests {
         assert!(plain.contains("2 embeddings"), "{plain}");
         assert!(plain.contains("× 3 dims"), "{plain}");
         assert!(plain.contains("$0.0002"), "{plain}");
-        assert!(plain.contains("saved 75%"), "{plain}");
+        assert!(
+            plain.contains("request delta +$0.000200 (positive estimate)"),
+            "{plain}"
+        );
+        assert!(!plain.contains("saved 75%"), "{plain}");
+        assert!(
+            plain.contains("excludes judge/shadow taxes + invoice reconciliation"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn format_embed_summary_shows_measured_regression() {
+        let cost = CostInfo {
+            cost_usd: Some(0.0006),
+            // The compatibility field is clamped, so it must not hide this
+            // complete raw-tuple regression in the human-facing summary.
+            saved_usd: Some(0.0),
+            baseline_cost_usd: Some(0.0004),
+            provider_cache_saved_usd: Some(0.0),
+            cache_bust_usd: Some(0.0),
+            summarizer_tax_usd: Some(0.0),
+            ..CostInfo::default()
+        };
+        let summary = format_embed_summary(&outcome(1, 4, cost), "ignored");
+        let plain = console::strip_ansi_codes(&summary);
+        assert!(
+            plain.contains("request delta −$0.000200 (regression)"),
+            "{plain}"
+        );
+        assert!(!plain.contains("saved 0%"), "{plain}");
+    }
+
+    #[test]
+    fn format_embed_summary_marks_partial_tuple_unmeasured() {
+        let cost = CostInfo {
+            cost_usd: Some(0.0002),
+            saved_usd: Some(0.0003),
+            baseline_cost_usd: Some(0.0004),
+            // An old/partial gateway response must not get a legacy fallback.
+            provider_cache_saved_usd: None,
+            cache_bust_usd: Some(0.0),
+            summarizer_tax_usd: Some(0.0),
+            ..CostInfo::default()
+        };
+        let summary = format_embed_summary(&outcome(1, 4, cost), "ignored");
+        let plain = console::strip_ansi_codes(&summary);
+        assert!(plain.contains("request delta not measured"), "{plain}");
+        assert!(!plain.contains("saved 75%"), "{plain}");
     }
 
     #[test]
@@ -190,6 +274,6 @@ mod tests {
         assert!(plain.contains("1 embedding"), "{plain}");
         assert!(!plain.contains("embeddings"), "singular expected: {plain}");
         assert!(!plain.contains('$'), "no cost expected: {plain}");
-        assert!(!plain.contains("saved"), "no savings expected: {plain}");
+        assert!(plain.contains("request delta not measured"), "{plain}");
     }
 }

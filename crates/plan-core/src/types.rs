@@ -20,6 +20,7 @@ use uuid::Uuid;
 /// the replay reads. Embedding / vector fields are intentionally absent in
 /// v1; semantic-cache (L2) projection lands in a follow-up backlog item
 /// (ADR-008 covers the embedding choice).
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestLog {
     /// Stable primary key for ordering during replay.
@@ -32,6 +33,13 @@ pub struct RequestLog {
     pub provider: String,
     /// Provider-side model id (e.g. `"claude-3-5-sonnet"`).
     pub model: String,
+    /// Exact model ID the caller supplied before routing and failover.
+    ///
+    /// `request_logs.model` is the final served model and cannot satisfy a
+    /// historical `model_in` predicate. `None` marks a legacy/uncovered row;
+    /// replay fails model-gated routes closed instead of substituting `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
     /// Input tokens charged on the baseline run.
     pub input_tokens: u32,
     /// Output tokens charged on the baseline run.
@@ -123,6 +131,7 @@ pub struct RequestLog {
 ///
 /// `#[non_exhaustive]` so additional classes can be added without breaking
 /// downstream match arms.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -151,6 +160,7 @@ impl L2TaskClass {
 /// Per-task-class L2 effectiveness, aggregated across the whole threshold
 /// sweep. Lets the Plan answer "how well does the L2 cache work for this class
 /// of request?" — hits vs. considered, plus the poisoning-candidate count.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PerClassL2Metrics {
     /// The task class these metrics are for.
@@ -171,6 +181,7 @@ pub struct PerClassL2Metrics {
 
 /// A route in the proposed config: when conditions match, route to
 /// `target_model`.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposedRoute {
     /// Stable identifier — used as the bucket key in per-route breakdown.
@@ -187,25 +198,29 @@ pub struct ProposedRoute {
     pub then: RouteAction,
 }
 
-/// Match conditions for a [`ProposedRoute`]. v1 supports: `model_in`,
-/// `input_tokens_lt`, `input_tokens_gt`, `tag_equals`. Empty / `None`
-/// fields match anything; all non-empty fields are AND-ed.
+/// Match conditions for a [`ProposedRoute`], wire-identical to the gateway's
+/// 13-field route condition contract. Empty / `None` fields match anything;
+/// all active fields are AND-ed through the canonical gateway evaluator.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteConditions {
-    /// Match only if `req.model` is in this list. Empty list matches any model.
+    /// Match only if `req.requested_model` is in this list. A missing legacy
+    /// snapshot fails closed; the final served `req.model` is never substituted.
     #[serde(default)]
     pub model_in: Vec<String>,
-    /// Match only if `req.input_tokens < this`.
+    /// Match only if realized `req.input_tokens < this`. Historical provider
+    /// tokens are an approximate proxy for the live pre-dispatch estimate.
     #[serde(default)]
     pub input_tokens_lt: Option<u32>,
-    /// Match only if `req.input_tokens > this`.
+    /// Match only if realized `req.input_tokens > this`; see `input_tokens_lt`.
     #[serde(default)]
     pub input_tokens_gt: Option<u32>,
     /// Match only if `req.tag == Some(this)`.
     #[serde(default)]
     pub tag_equals: Option<String>,
     /// Mirror of `tt_routing::RouteConditions::has_images`. Not evaluable in
-    /// replay (RequestLog records no modality) — see `routing::matches_conditions`.
+    /// replay (RequestLog records no modality), so the canonical matcher fails
+    /// the condition closed against the historical feature snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_images: Option<bool>,
     /// Mirror of `tt_routing::RouteConditions::has_audio`. See `has_images`.
@@ -213,25 +228,26 @@ pub struct RouteConditions {
     pub has_audio: Option<bool>,
     /// Mirror of `tt_routing::RouteConditions::has_documents` (Document Lane
     /// D4a). Like the other modality mirrors, not evaluable in replay
-    /// (RequestLog records no modality) — a conservative non-match in
-    /// `routing::matches_conditions`.
+    /// (RequestLog records no modality), so the canonical matcher fails the
+    /// condition closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_documents: Option<bool>,
     /// Mirror of `tt_routing::RouteConditions::content_type` (content-aware
     /// compression, P1a). Carried for lossless wire round-trip only — NOT
     /// projectable in replay (Plan has no live content classifier over the
-    /// historical `RequestLog` row), so a route carrying it is a conservative
-    /// non-match in `routing::matches_conditions`, keeping Plan from
-    /// over-projecting savings on a content-type route.
+    /// historical `RequestLog` row), so a route carrying it fails closed in the
+    /// canonical matcher and cannot over-project Plan savings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    /// Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. Replay
-    /// matches against `RequestLog.body` when present, else conservative no-match.
+    /// Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`.
+    /// `RequestLog.body` is a quality-judge payload, not a proven capture of the
+    /// gateway matcher's exact user/system text; historical replay therefore
+    /// treats this feature as unavailable and fails the route closed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompt_contains_any_of: Vec<String>,
-    /// Mirror of `tt_routing::RouteConditions::estimated_cost_gt`. Evaluated
-    /// against `RequestLog.baseline_cost_usd` (the request's logged cost on its
-    /// original model) — accurately projectable, unlike modality/topic.
+    /// Mirror of `tt_routing::RouteConditions::estimated_cost_gt`. Historical
+    /// replay uses realized `RequestLog.baseline_cost_usd` only as an explicitly
+    /// approximate proxy for the live pre-dispatch estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_gt: Option<f64>,
     /// Mirror of `tt_routing::RouteConditions::estimated_cost_lt`.
@@ -240,17 +256,16 @@ pub struct RouteConditions {
     /// Mirror of `tt_routing::RouteConditions::upstream_latency_ms_p95_gt`.
     /// Carried for lossless wire round-trip only — NOT projectable in replay:
     /// the gateway's live in-process p95 window does not exist for historical
-    /// `RequestLog` rows. Like the modality mirrors, a route carrying this
-    /// condition is treated as a conservative non-match in
-    /// `routing::matches_conditions`, so Plan never over-projects savings on a
-    /// latency route.
+    /// `RequestLog` rows. The feature is unavailable in the historical snapshot,
+    /// so the canonical matcher fails it closed and Plan cannot over-project
+    /// savings on a latency route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_latency_ms_p95_gt: Option<u32>,
     /// Mirror of `tt_routing::RouteConditions::not_reasoning_class`. Carried
     /// for lossless wire round-trip only — NOT evaluable in replay (Plan has
-    /// no reasoning-class classifier). A route carrying this condition is
-    /// treated as a conservative non-match in `routing::matches_conditions`,
-    /// so Plan never over-projects savings on a catalog route.
+    /// no reasoning-class classifier). The canonical matcher therefore fails
+    /// this condition closed and Plan cannot over-project savings on a catalog
+    /// route.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub not_reasoning_class: bool,
 }
@@ -260,16 +275,14 @@ pub struct RouteConditions {
 /// Field order matches `tt_routing::RouteAction` so the two types produce
 /// identical JSON for the same logical value — a requirement for the Plan
 /// apply round-trip (a `ProposedRoute` serialized by the Plan engine and then
-/// deserialized by the Gateway must carry all fields without loss or
-/// reordering). The `flex` flag IS mirrored (COST-7) — it is a real ~50% rate
-/// cut the replay PROJECTS (see [`crate::cost::project_flex_cost`]), so it must
-/// round-trip. KNOWN EXCEPTION: the gateway's `compress` flag is still not
-/// mirrored here (pre-existing drift; it is false-omitted on the wire, so
-/// identity holds whenever it is unset). The
+/// deserialized by the Gateway must carry every configured field without loss
+/// or reordering). Projection support is deliberately narrower than configured
+/// action preservation; unsupported effective actions are called out in replay
+/// caveats and dispatch-changing actions fail projection closed. The
 /// `route_action_cross_type_lockstep_guard` test below fails to compile when
-/// `tt_routing::RouteAction` grows a field, so any future addition must
-/// explicitly decide the mirror question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `tt_routing::RouteAction` grows a field, forcing an explicit mirror decision.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteAction {
     /// Rewrite to this model. May target a different provider than the request
     /// (V3d-1). Cost projection resolves the target's own provider from the
@@ -293,8 +306,9 @@ pub struct RouteAction {
     /// `tt_plan_core::RouteAction` without dropping fallbacks on read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,
-    /// Mirror of `tt_routing::RouteAction::disable_cache`. The replay engine does
-    /// not yet model cache opt-out (follow-up); present for lossless round-trip.
+    /// Mirror of `tt_routing::RouteAction::disable_cache`. Replay suppresses
+    /// projected cache hits for matching routes so an opt-out cannot fabricate
+    /// cache savings; present as well for lossless configured-action round-trip.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_cache: bool,
     /// Mirror of `tt_routing::RouteAction::max_cost_usd`. A matched request whose
@@ -325,6 +339,26 @@ pub struct RouteAction {
     /// gateway side (omitted when false).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub batch: bool,
+    /// Mirror of `tt_routing::RouteAction::compress`. Historical replay cannot
+    /// reconstruct the exact request-pass token reduction, so the configured
+    /// flag is retained but its incremental effect is not projected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compress: bool,
+    /// Mirror of `tt_routing::RouteAction::doc_compaction`. Retained for exact
+    /// configured-action round-trip; historical replay cannot re-run the source
+    /// document compaction from a condensed request-log row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub doc_compaction: bool,
+    /// Mirror of `tt_routing::RouteAction::document_lane`. Retained for exact
+    /// configured-action round-trip; replay has no retained source media or
+    /// distillation result and therefore does not project this effect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub document_lane: bool,
+    /// Mirror of `tt_routing::RouteAction::content_compress`. Retained for exact
+    /// configured-action round-trip; replay cannot reconstruct content blocks
+    /// and therefore does not project its isolated estimate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content_compress: bool,
     /// Mirror of `tt_routing::RouteAction::redact`. The request-redaction
     /// guardrail is a runtime-only SAFETY transform (it strips PII/secrets from
     /// the outbound prompt); the replay engine does not model it (no cost/savings
@@ -354,10 +388,10 @@ pub struct RouteAction {
     /// Mirror of `tt_routing::RouteAction::traffic_pct`. A canary split — when
     /// `Some(pct)`, only a deterministic `pct`% of matched requests take the
     /// rewrite at runtime (chosen by `tt_routing::sticky_traffic_split`); the
-    /// rest pass through unchanged. The replay engine does not yet model the
-    /// split (a follow-up would re-derive the per-request arm via the same sticky
-    /// hash from the logged idempotency key, so projected savings match the
-    /// fraction that actually routed); the field is present so a
+    /// rest pass through unchanged. Request logs do not retain the gateway's
+    /// idempotency key, so a configured percentage other than 100 fails that
+    /// route's cost/latency projection closed rather than assuming every row
+    /// took the canary arm. The field is present so a
     /// `tt_routing::RouteAction` carrying `traffic_pct` round-trips losslessly to
     /// a `tt_plan_core::RouteAction` without dropping the split on read. Omitted
     /// from JSON when `None` (back-compat).
@@ -365,8 +399,9 @@ pub struct RouteAction {
     pub traffic_pct: Option<u32>,
     /// Mirror of `tt_routing::RouteAction::shadow_model`. Shadow mode is a
     /// runtime-only side-channel (the gateway dispatches the candidate, discards
-    /// its response, and records its cost separately); it never changes the
-    /// served response, so the replay engine does not model it. Present so a
+    /// its response, and records its cost separately). Condensed Plan rows cannot
+    /// reconstruct that additional spend, so the matched route's cost/latency
+    /// projection fails closed. Present so a
     /// `tt_routing::RouteAction` carrying `shadow_model` round-trips losslessly to
     /// a `tt_plan_core::RouteAction` without dropping it on read. Omitted from
     /// JSON when `None` (back-compat).
@@ -376,10 +411,9 @@ pub struct RouteAction {
     /// breaker is a runtime-only guardrail (the gateway sticky-pauses the
     /// route when its live paired-judge pass-rate regresses below the floor);
     /// replay has no live verdict stream, so the engine does not simulate
-    /// pauses — it treats the route as always active and projects the route's
-    /// FULL savings (the same not-yet-modeled assumption it already makes for
-    /// `traffic_pct`; a real pause can only shrink realized savings, never
-    /// change quality). Present so a `tt_routing::RouteAction` carrying
+    /// pauses. Because a real pause can shrink realized savings, the matched
+    /// route's cost/latency projection fails closed instead of being treated as
+    /// always active. Present so a `tt_routing::RouteAction` carrying
     /// `auto_pause` round-trips losslessly to a `tt_plan_core::RouteAction`
     /// without dropping it on read. Omitted from JSON when false
     /// (back-compat).
@@ -415,6 +449,22 @@ pub struct RouteAction {
     /// (back-compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_budget_tokens: Option<u32>,
+    /// Mirror of `tt_routing::RouteAction::agentic_budget`. The configured
+    /// versioned structure round-trips exactly, but historical replay has no
+    /// retained loop/tool transcript from which to reconstruct its effects, so
+    /// the matched route's cost/latency projection fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_budget: Option<tt_routing::AgenticBudget>,
+    /// Mirror of `tt_routing::RouteAction::panel`. A panel changes dispatch and
+    /// output generation fundamentally; replay retains the configuration but
+    /// fails the route's cost projection closed until panel-leg evidence exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<tt_routing::RoutePanel>,
+    /// Mirror of `tt_routing::RouteAction::workflow`. A workflow detour/shadow
+    /// is retained without fabricating node execution or workflow cost; the
+    /// matched route's cost/latency projection fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<tt_routing::RouteWorkflow>,
 }
 
 /// Per-model pricing keyed by `"provider:model"`.
@@ -424,6 +474,7 @@ pub type PricingTable = HashMap<String, ModelPricing>;
 /// `tt_shared::pricing::ModelPricing` but without the `effective_at` field
 /// — the replay engine assumes the caller has already picked the right
 /// historical rate for each request.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
     /// USD per 1M input tokens (non-cached).
@@ -461,6 +512,7 @@ pub struct ModelPricing {
 /// this carries the L1 cache TTL the [`crate::cache_projection`] module
 /// uses plus the L2 (semantic) projection knobs consumed by
 /// [`crate::l2_projection`].
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanConfig {
     /// L1 cache TTL, seconds. `None` disables L1 projection entirely.
@@ -498,6 +550,7 @@ fn default_l2_threshold_sweep() -> Vec<f32> {
 }
 
 /// The full input to a Plan replay.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanInput {
     /// Stable identifier for the plan run — flows through to the result so
@@ -530,6 +583,7 @@ pub struct PlanInput {
 
 /// The Plan replay result — what gets serialized to `plan_runs` and
 /// surfaced to the user in the CLI / dashboard.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanResult {
     /// Echoed from the input.
@@ -572,6 +626,7 @@ pub struct PlanResult {
 }
 
 /// Point-estimate aggregates the replay produces.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Aggregates {
     /// Sum of `baseline_cost_usd` across all replayed requests.
@@ -616,6 +671,7 @@ pub struct Aggregates {
 }
 
 /// 95% bootstrap CIs for the headline metrics.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfidenceIntervals {
     /// `(lo, hi)` for projected total savings, USD.
@@ -635,6 +691,7 @@ pub struct ConfidenceIntervals {
 }
 
 /// One row of the per-route attribution table.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerRouteBreakdown {
     /// Route the bucket belongs to.
@@ -653,6 +710,7 @@ pub struct PerRouteBreakdown {
 
 /// Result of projecting L1 cache hits over a request window. See
 /// [`crate::cache_projection::project_l1_hits`].
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheProjection {
     /// Total requests considered.
@@ -666,6 +724,7 @@ pub struct CacheProjection {
 /// One row of the L2 (semantic) cache sensitivity sweep. Produced by
 /// [`crate::l2_projection::project_l2_hits`] — one per threshold in
 /// [`PlanConfig::l2_threshold_sweep`].
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct L2Projection {
     /// Cosine-similarity threshold this row was computed at.
@@ -741,6 +800,7 @@ mod tests {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -781,6 +841,7 @@ mod tests {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -814,6 +875,7 @@ mod tests {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(j.contains("\"disable_cache\":true"));
@@ -859,6 +921,7 @@ mod tests {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(
@@ -1027,36 +1090,29 @@ mod tests {
     /// `tt_plan_core::RouteAction` silently drop it on read (the drift this
     /// branch had to repair for the auto-pause fields).
     ///
-    /// `flex` IS now mirrored (COST-7) and set TRUE here so the round-trip
-    /// exercises it. KNOWN REMAINING DRIFT: `compress` and `doc_compaction`
-    /// (Document Lane D2) are NOT mirrored in `tt_plan_core::RouteAction`
-    /// (pre-existing precedent — both are runtime-only request-pass levers whose
-    /// savings are REALIZED from real tokenizer counts, not projected by replay
-    /// from a historical `RequestLog` row); each is set `false` here, where its
-    /// skip_serializing_if gating omits it from the wire form, keeping the
-    /// byte-identity assertion honest for every mirrored field. The
-    /// output-shaping levers (`format_switch` / `diff`, research Phase 3.3 +
-    /// 3.4) ARE mirrored — round-trip-only, not projected by replay.
+    /// Every field is deliberately non-default where the wire contract permits
+    /// it. Some combinations would be rejected by route validation (for example
+    /// panel plus workflow), but this test is about lossless configured-action
+    /// transport rather than semantic route validity.
     #[test]
     fn route_action_cross_type_lockstep_guard() {
         let gateway = tt_routing::RouteAction {
-            // not mirrored (CO-1 workflow detour is a runtime dispatch path,
-            // not replay-projected) — `None` is omitted from the wire.
-            workflow: None,
+            workflow: Some(tt_routing::RouteWorkflow {
+                workflow_id: "00000000-0000-0000-0000-000000000001".into(),
+                max_cost_usd: Some(0.4),
+                environment: Some(tt_routing::RouteWorkflowEnvironment::Production),
+                mode: Some("shadow".into()),
+            }),
             batch: false,
             target_model: Some("gpt-4o-mini".to_string()),
             fallbacks: vec!["claude-haiku-4-5".to_string()],
             disable_cache: true,
             max_cost_usd: Some(0.25),
-            flex: true,      // mirrored (COST-7) — round-trips to plan-core
-            compress: false, // not mirrored (pre-existing) — omitted when false
-            // not mirrored (Document Lane D2, runtime-only) — omitted when false
-            doc_compaction: false,
-            // not mirrored (Document Lane D4, runtime-only) — omitted when false
-            document_lane: false,
-            // not mirrored (content-aware compression, runtime-only) — omitted
-            // when false
-            content_compress: false,
+            flex: true,
+            compress: true,
+            doc_compaction: true,
+            document_lane: true,
+            content_compress: true,
             redact: true,
             format_switch: Some("csv".to_string()),
             diff: false, // mutually exclusive with format_switch on a real route
@@ -1068,11 +1124,21 @@ mod tests {
             minify_json: true,
             reasoning_max_effort: Some("low".to_string()),
             reasoning_budget_tokens: Some(8192),
-            // not mirrored (route-grained shaping mode, not a replay-projected
-            // effect) — `None` is omitted from the wire, keeping byte-identity.
-            agentic_budget: None,
-            // not mirrored (panel is a UI-only concept, not projected by replay).
-            panel: None,
+            agentic_budget: Some(tt_routing::AgenticBudget {
+                cache_prefix: true,
+                elide_stale_tools: true,
+                keep_recent_pairs: 2,
+                clear_at_least_tokens: 128,
+                route_mechanical_to: Some("gpt-4o-mini".into()),
+                semantic_substep_cache: true,
+            }),
+            panel: Some(tt_routing::RoutePanel {
+                strategy: "best-of-n".into(),
+                members: vec!["gpt-4o-mini".into(), "claude-haiku-4-5".into()],
+                arbiter: Some("gpt-4o".into()),
+                quorum: Some(2),
+                max_cost_usd: Some(0.5),
+            }),
         };
         let gateway_json = serde_json::to_string(&gateway).unwrap();
 
@@ -1084,6 +1150,10 @@ mod tests {
         assert!(plan_action.disable_cache);
         assert_eq!(plan_action.max_cost_usd, Some(0.25));
         assert!(plan_action.flex, "flex must round-trip from gateway JSON");
+        assert!(plan_action.compress);
+        assert!(plan_action.doc_compaction);
+        assert!(plan_action.document_lane);
+        assert!(plan_action.content_compress);
         assert!(plan_action.redact);
         assert_eq!(plan_action.format_switch.as_deref(), Some("csv"));
         assert!(!plan_action.diff);
@@ -1095,6 +1165,9 @@ mod tests {
         assert!(plan_action.minify_json);
         assert_eq!(plan_action.reasoning_max_effort.as_deref(), Some("low"));
         assert_eq!(plan_action.reasoning_budget_tokens, Some(8192));
+        assert!(plan_action.agentic_budget.is_some());
+        assert!(plan_action.panel.is_some());
+        assert!(plan_action.workflow.is_some());
 
         // …and re-emits the gateway wire form byte-for-byte (same declaration
         // order + same skip_serializing_if gating).

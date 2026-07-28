@@ -1,5 +1,6 @@
-//! Local `tt plan --apply`: write the projected routes to the gateway's
-//! Postgres `routes` table and emit a signed `plan.applied` audit row.
+//! Local `tt plan --apply`: write projected routes as disabled drafts to the
+//! gateway's Postgres `routes` table and emit a signed `plan.applied` audit
+//! row.
 
 use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
@@ -11,19 +12,24 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use tt_plan_core::types::{PlanResult, ProposedRoute};
-use tt_routing::{validate_route_has_effect, NewRoute, PostgresRoutingStore, RoutingStore};
+use tt_routing::{
+    canonicalize_route_value, validate_route_has_effect, NewRoute, PostgresRoutingStore,
+    RoutingStore,
+};
 
 use crate::local_audit;
 
 /// Outcome of planning which routes to create.
+#[derive(Debug)]
 pub struct ApplyPlan {
     pub to_create: Vec<NewRoute>,
     pub skipped_noop: Vec<String>,
     pub skipped_existing: Vec<String>,
 }
 
-/// Convert proposed routes (plan-core types) into `tt_routing::NewRoute` specs,
-/// dropping no-ops and names that already exist. Pure — no DB, no IO.
+/// Convert proposed routes (plan-core types) into canonical, disabled-draft
+/// `tt_routing::NewRoute` specs, dropping no-ops and names that already exist.
+/// Pure — no DB, no IO.
 ///
 /// `tt_plan_core::types::{RouteConditions, RouteAction}` and the
 /// `tt_routing::{RouteConditions, RouteAction}` are MIRRORED but DISTINCT types
@@ -40,6 +46,16 @@ pub fn plan_routes_to_apply(
     let mut skipped_existing = Vec::new();
 
     for r in proposed {
+        // A local plan apply writes directly to Postgres, without the dashboard
+        // control plane's server-bound catalog intent or live owner/admin
+        // re-check. Keep the catalog namespace out of this generic writer;
+        // use the authenticated dashboard catalog enable/repair flow instead.
+        if tt_routing::catalog::is_catalog_route_name(&r.name) {
+            anyhow::bail!(
+                "proposed catalog route '{}' is reserved for the dashboard catalog enable/repair flow with a fresh owner/admin confirmation",
+                r.name
+            );
+        }
         let when: tt_routing::RouteConditions =
             serde_json::from_value(serde_json::to_value(&r.when).context("encode conditions")?)
                 .context("decode conditions as tt_routing::RouteConditions")?;
@@ -55,13 +71,38 @@ pub fn plan_routes_to_apply(
             skipped_existing.push(r.name.clone());
             continue;
         }
-        to_create.push(NewRoute {
+
+        // Plan proposals are advisory. This direct Postgres writer has no
+        // control-plane activation confirmation, so it must never carry an
+        // enabled proposal into a live route. Materialize every effective new
+        // proposal as a disabled draft; the normal Dashboard/control-plane
+        // activation flow performs the separate, freshly confirmed enable.
+        let spec = NewRoute {
             name: r.name.clone(),
             priority: r.priority,
-            enabled: r.enabled,
+            enabled: false,
             when,
             then,
-        });
+        };
+        // Plan writeback is a direct Postgres writer, so it cannot rely on
+        // the gateway HTTP handler to enforce the versioned route contract.
+        // Preserve the deliberate no-op skip above, then fail closed on every
+        // other definition the canonical gateway contract would reject.
+        let canonical = canonicalize_route_value(
+            serde_json::to_value(&spec).context("encode route for canonical validation")?,
+        )
+        .map_err(|issues| {
+            let details = issues
+                .iter()
+                .map(|issue| format!("{}: {}", issue.field, issue.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::anyhow!(
+                "proposed route '{}' fails canonical route validation: {details}",
+                r.name
+            )
+        })?;
+        to_create.push(canonical.route);
     }
 
     Ok(ApplyPlan {
@@ -72,8 +113,9 @@ pub fn plan_routes_to_apply(
 }
 
 /// Apply the proposed routes for `org_id`: validate + dedup, confirm,
-/// idempotently create, then emit a signed `plan.applied` audit entry to
-/// `chain_path`. `signing_key` + `chain_path` are injected for testability.
+/// idempotently create disabled drafts, then emit a signed `plan.applied` audit
+/// entry to `chain_path`. `signing_key` + `chain_path` are injected for
+/// testability.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_routes(
     pool: &PgPool,
@@ -112,12 +154,12 @@ pub async fn apply_routes(
     }
 
     crate::ui::note(&format!(
-        "about to create {} route(s) for org {org_id}:",
+        "about to create {} disabled draft route(s) for org {org_id}:",
         plan.to_create.len()
     ));
     for r in &plan.to_create {
         let tgt = r.then.target_model.as_deref().unwrap_or("(modifier-only)");
-        crate::ui::note(&format!("  + {} → {}", r.name, tgt));
+        crate::ui::note(&format!("  + {} → {} (disabled draft)", r.name, tgt));
     }
 
     if !assume_yes {
@@ -126,7 +168,10 @@ pub async fn apply_routes(
                 "refusing to apply without confirmation on a non-interactive stdin — pass --yes to proceed"
             );
         }
-        print!("Apply these {} route(s)? [y/N] ", plan.to_create.len());
+        print!(
+            "Create these {} disabled draft route(s)? [y/N] ",
+            plan.to_create.len()
+        );
         std::io::stdout().flush().ok();
         let mut line = String::new();
         std::io::stdin()
@@ -149,7 +194,7 @@ pub async fn apply_routes(
         created.push(name);
     }
     crate::ui::ok(&format!(
-        "created {} route(s); the gateway applies them on its next refresh (~60s)",
+        "created {} disabled draft route(s); they are not live. Activate them through the normal control-plane/Dashboard route activation flow after fresh confirmation.",
         created.len()
     ));
 
@@ -163,7 +208,7 @@ pub async fn apply_routes(
         local_audit::append_entry(chain_path, signing_key, org_id, "plan.applied", payload)
             .with_context(|| {
                 format!(
-            "{} route(s) were created and are live, but recording the plan.applied proof failed",
+            "{} route(s) were created as disabled drafts, but recording the plan.applied proof failed",
             created.len()
         )
             })?;
@@ -209,6 +254,7 @@ mod tests {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                ..Default::default()
             },
         }
     }
@@ -220,6 +266,31 @@ mod tests {
             .expect("ok");
         assert_eq!(plan.to_create.len(), 1);
         assert_eq!(plan.to_create[0].name, "swap-mini");
+        assert!(
+            !plan.to_create[0].enabled,
+            "effective proposals must materialize as disabled drafts"
+        );
+    }
+
+    #[test]
+    fn enabled_and_disabled_proposals_both_materialize_as_disabled_drafts() {
+        let enabled = proposed("enabled-proposal", Some("gpt-4o-mini"));
+        let mut disabled = proposed("disabled-proposal", Some("gpt-4o-mini"));
+        disabled.enabled = false;
+
+        let plan = plan_routes_to_apply(&HashSet::new(), &[enabled, disabled]).expect("ok");
+
+        assert_eq!(
+            plan.to_create
+                .iter()
+                .map(|route| route.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["enabled-proposal", "disabled-proposal"]
+        );
+        assert!(
+            plan.to_create.iter().all(|route| !route.enabled),
+            "the local writer must create only disabled drafts regardless of proposal state"
+        );
     }
 
     #[test]
@@ -238,6 +309,30 @@ mod tests {
             .expect("ok");
         assert!(plan.to_create.is_empty());
         assert_eq!(plan.skipped_existing, vec!["swap-mini".to_string()]);
+    }
+
+    #[test]
+    fn rejects_effective_route_that_fails_the_canonical_contract() {
+        let err = plan_routes_to_apply(&HashSet::new(), &[proposed("blank-target", Some("   "))])
+            .expect_err("an effect check alone must not let an invalid route reach Postgres");
+
+        let message = err.to_string();
+        assert!(message.contains("blank-target"));
+        assert!(message.contains("then.target_model"));
+        assert!(message.contains("non-whitespace"));
+    }
+
+    #[test]
+    fn rejects_catalog_managed_route_before_direct_postgres_write() {
+        let error = plan_routes_to_apply(
+            &HashSet::new(),
+            &[proposed("catalog:openai->gpt-4o-mini", Some("gpt-4o-mini"))],
+        )
+        .expect_err("the direct plan writer cannot bypass catalog confirmation");
+
+        assert!(error
+            .to_string()
+            .contains("dashboard catalog enable/repair flow"));
     }
 
     // --- DB-gated integration tests ---
@@ -354,6 +449,10 @@ mod tests {
             .expect("list");
         assert_eq!(after_first.len(), 1);
         assert_eq!(after_first[0].name, "swap-mini-itest");
+        assert!(
+            !after_first[0].enabled,
+            "local plan apply must persist an enabled proposal as a disabled draft"
+        );
 
         apply_routes(
             &pool,

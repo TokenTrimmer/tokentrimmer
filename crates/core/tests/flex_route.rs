@@ -40,6 +40,7 @@ use tt_shared::{
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
 use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
+use tt_telemetry::request_logs::InMemoryRequestLogWriter;
 use uuid::Uuid;
 
 /// Mock provider that records the `service_tier` value carried on each upstream
@@ -235,6 +236,36 @@ fn chat_request_streaming(model: &str, bearer: &str, stream: bool) -> Request<Bo
         .unwrap()
 }
 
+/// A header-selected Fusion panel on the same flex-eligible model. This takes
+/// the real panel branch after `prepare`, so the test can assert a route Flex
+/// action does not leak its single-dispatch tier into the panel member leg.
+fn panel_chat_request(model: &str, bearer: &str) -> Request<Body> {
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "hello world" }],
+        "stream": false,
+        // Fusion admission requires an explicit output bound.
+        "max_tokens": 64,
+        "tt_extras": {
+            "panel": {
+                "members": [model],
+                "arbiter_model": model,
+                // Panel admission prices a worst-case member + arbiter shape,
+                // so keep the test's budget deliberately far above that cap.
+                "max_cost_usd": 1_000.0,
+            }
+        }
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("x-tokentrimmer-panel", "best-of-n")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 async fn issue_key_for(store: &InMemoryKeyStore, org_id: Uuid) -> String {
     let audit = InMemoryAuditWriter::new();
     issue(
@@ -251,7 +282,8 @@ async fn issue_key_for(store: &InMemoryKeyStore, org_id: Uuid) -> String {
 }
 
 /// Build a gateway whose org has a single route matching `model_in` with the
-/// flex action set, returning the app + the recorded-service-tier handle.
+/// flex action set, returning the app, recorded-service-tier handle, and
+/// request-log writer.
 async fn app_with_flex_route(
     model_in: &str,
 ) -> (
@@ -259,6 +291,7 @@ async fn app_with_flex_route(
     String,
     Arc<Mutex<Vec<Option<String>>>>,
     Arc<AtomicUsize>,
+    Arc<InMemoryRequestLogWriter>,
 ) {
     let calls = Arc::new(AtomicUsize::new(0));
     let tiers = Arc::new(Mutex::new(Vec::new()));
@@ -318,19 +351,22 @@ async fn app_with_flex_route(
     let routing = Arc::new(CachingRoutingStore::new(
         routes_backing as Arc<dyn RoutingStore>,
     ));
+    let request_log_writer = Arc::new(InMemoryRequestLogWriter::new());
 
     let app = build_router(
         AppState::new(registry)
             .with_key_store(key_store)
-            .with_routing_store(routing),
+            .with_routing_store(routing)
+            .with_panel_enabled(true)
+            .with_request_log_writer(request_log_writer.clone()),
     );
-    (app, plaintext, tiers, calls)
+    (app, plaintext, tiers, calls, request_log_writer)
 }
 
 /// (a) Eligible model + flex route → upstream request carries service_tier=flex.
 #[tokio::test]
 async fn flex_applied_to_eligible_model_sets_service_tier() {
-    let (app, key, tiers, calls) = app_with_flex_route("flex-eligible").await;
+    let (app, key, tiers, calls, _writer) = app_with_flex_route("flex-eligible").await;
 
     let resp = app
         .oneshot(chat_request("flex-eligible", &key))
@@ -350,7 +386,7 @@ async fn flex_applied_to_eligible_model_sets_service_tier() {
 /// (b) Ineligible model + flex route → flex NOT applied + warning surfaced.
 #[tokio::test]
 async fn flex_not_applied_to_ineligible_model_warns() {
-    let (app, key, tiers, calls) = app_with_flex_route("flex-ineligible").await;
+    let (app, key, tiers, calls, _writer) = app_with_flex_route("flex-ineligible").await;
 
     let resp = app
         .oneshot(chat_request("flex-ineligible", &key))
@@ -388,11 +424,59 @@ async fn flex_not_applied_to_ineligible_model_warns() {
     assert_eq!(flex_saved, 0.0, "ineligible → zero flex saving");
 }
 
+/// A Fusion panel is an aggregate multi-dispatch path, not a single Flex
+/// dispatch. Its member legs must never inherit a route Flex tier selected for
+/// the primary model, and the aggregate must not claim Flex savings.
+#[tokio::test]
+async fn flex_route_is_suppressed_for_a_selected_fusion_panel() {
+    let (app, key, tiers, calls, _writer) = app_with_flex_route("flex-eligible").await;
+
+    let resp = app
+        .oneshot(panel_chat_request("flex-eligible", &key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "one Best-of-N member leg");
+
+    // The selected panel ran, but its member leg did not receive the route's
+    // single-dispatch `service_tier="flex"` mutation.
+    assert_eq!(
+        tiers.lock().unwrap().as_slice(),
+        [None],
+        "a Fusion panel must not inherit a route Flex service tier"
+    );
+    let warnings = resp
+        .headers()
+        .get("x-tokentrimmer-warnings")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        warnings.split(',').any(|w| w == "flex_not_applied:panel"),
+        "expected deterministic panel suppression warning, got: {warnings:?}"
+    );
+    let flex_saved: f64 = resp.headers()["x-tokentrimmer-flex-saved-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        flex_saved, 0.0,
+        "panel aggregate must not claim Flex savings"
+    );
+
+    let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["tokentrimmer"]["panel"].is_object(),
+        "the request must have taken the actual Fusion panel path: {body}"
+    );
+}
+
 /// (c) Flex-served response attributes savings == standard_baseline − flex_cost,
 /// to the cent, as the dedicated flex source (and inside `saved_usd`).
 #[tokio::test]
 async fn flex_saving_equals_standard_minus_flex_to_the_cent() {
-    let (app, key, _tiers, _calls) = app_with_flex_route("flex-eligible").await;
+    let (app, key, _tiers, _calls, _writer) = app_with_flex_route("flex-eligible").await;
 
     let resp = app
         .oneshot(chat_request("flex-eligible", &key))
@@ -441,6 +525,47 @@ async fn flex_saving_equals_standard_minus_flex_to_the_cent() {
     );
 }
 
+/// A nonzero Flex component must survive the gateway's cost-breakdown →
+/// request-log mapping. The header is the client-visible source of the value;
+/// the in-memory writer observes the exact row that production hands to its
+/// durable writer, without requiring a database in this HTTP regression.
+#[tokio::test]
+async fn flex_saving_header_is_persisted_on_request_log_row() {
+    let (app, key, _tiers, _calls, writer) = app_with_flex_route("flex-eligible").await;
+
+    let resp = app
+        .oneshot(chat_request("flex-eligible", &key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let header_saved = resp.headers()["x-tokentrimmer-flex-saved-usd"]
+        .to_str()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    assert!(
+        header_saved > 0.0,
+        "eligible Flex route must expose a nonzero saving"
+    );
+
+    // The request-log write is intentionally detached from the response path.
+    for _ in 0..20 {
+        if !writer.rows().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1, "expected one request-log row");
+    // Response headers are deliberately rounded to six decimal places, while
+    // the row retains the full breakdown precision.
+    assert!(
+        (rows[0].flex_saved_usd - header_saved).abs() < 0.000_000_5,
+        "persisted flex saving ({}) must equal response header ({header_saved})",
+        rows[0].flex_saved_usd,
+    );
+}
+
 /// Extract the JSON payload of the terminal `tokentrimmer.usage` SSE event from
 /// a drained event-stream body (`event: tokentrimmer.usage\ndata: {json}`).
 fn parse_tokentrimmer_usage(body: &str) -> serde_json::Value {
@@ -467,7 +592,7 @@ fn parse_tokentrimmer_usage(body: &str) -> serde_json::Value {
 /// streaming.
 #[tokio::test]
 async fn flex_streaming_attributes_savings_on_usage_event() {
-    let (app, key, tiers, calls) = app_with_flex_route("flex-eligible").await;
+    let (app, key, tiers, calls, _writer) = app_with_flex_route("flex-eligible").await;
 
     let resp = app
         .oneshot(chat_request_streaming("flex-eligible", &key, true))

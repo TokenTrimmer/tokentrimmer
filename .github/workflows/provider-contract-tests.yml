@@ -13,6 +13,9 @@ env:
   RUST_BACKTRACE: 1
   PROVIDER_WEEKLY_USD_CAP: '5'
 
+permissions:
+  contents: read
+
 jobs:
   contract:
     name: provider ${{ matrix.provider }}
@@ -24,6 +27,8 @@ jobs:
         provider: [openai, anthropic, gemini, mistral, groq, together, openrouter]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
@@ -63,9 +68,12 @@ jobs:
     if: failure()
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       issues: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Open provider-broken issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

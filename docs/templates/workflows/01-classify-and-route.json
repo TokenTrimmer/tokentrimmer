@@ -1,6 +1,6 @@
 {
   "name": "classify-and-route",
-  "description": "Classify a user's intent, then route coding queries to a cheaper code model and chat to a sub-workflow. Each Model node carries a max_cost_usd ceiling; the Branch picks one path. The template differentiator: every run is signable as a receipt (POST /v1/admin/workflow-runs/{run_id}/receipt/sign).",
+  "description": "Classify a user's intent, then route coding queries to a cheaper code model and chat to a sub-workflow. Each Model node carries a max_cost_usd admission estimate; the Branch picks one path. An eligible retained terminal run can be minted on demand as a signed estimate (POST /v1/admin/workflow-runs/{run_id}/receipt/sign).",
   "nodes": [
     {
       "id": "in",

@@ -8,7 +8,10 @@ use axum::response::IntoResponse;
 use httpmock::prelude::*;
 use tt_cli::proxy::{
     config::{Config, Mode},
-    routes::anthropic::{post_messages, AppState},
+    routes::{
+        anthropic::{post_messages, AppState},
+        openai::post_chat_completions,
+    },
     session::SessionLog,
 };
 
@@ -56,6 +59,8 @@ async fn anthropic_route_forwards_to_upstream_and_logs() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     let snap = log.snapshot();
     assert_eq!(snap.requests, 1);
+    assert_eq!(snap.measured_request_deltas, 0);
+    assert_eq!(snap.unmeasured_request_deltas, 1);
 }
 
 /// The gateway now exposes an Anthropic-native /v1/messages ingress that runs
@@ -137,17 +142,21 @@ async fn messages_route_to_gateway_in_gateway_and_hybrid_else_anthropic() {
 }
 
 #[tokio::test]
-async fn anthropic_route_records_realized_savings_from_header() {
-    // The gateway reports realized savings on `x-tokentrimmer-saved-usd`. The
-    // proxy must read it into the session rollup so the Ctrl-C banner shows a
-    // real "you saved $X" figure instead of $0.0000.
+async fn anthropic_route_records_signed_request_delta_and_legacy_compatibility_value() {
+    // A complete component set is a measured signed delta. The legacy
+    // positive-only header remains in the rollup for existing JSONL readers,
+    // but it must not hide this regression.
     let upstream = MockServer::start_async().await;
     let _m = upstream
         .mock_async(|when, then| {
             when.method(POST).path("/v1/messages");
             then.status(200)
-                .header("x-tokentrimmer-cost-usd", "0.0001")
-                .header("x-tokentrimmer-saved-usd", "0.0009")
+                .header("x-tokentrimmer-baseline-cost-usd", "0.0010")
+                .header("x-tokentrimmer-cost-usd", "0.0008")
+                .header("x-tokentrimmer-provider-cache-saved-usd", "0.0001")
+                .header("x-tokentrimmer-cache-bust-usd", "0.0001")
+                .header("x-tokentrimmer-summarizer-tax-usd", "0.0002")
+                .header("x-tokentrimmer-saved-usd", "0.0000")
                 .header("x-tokentrimmer-cache", "hit-l1")
                 .body("ok");
         })
@@ -182,9 +191,127 @@ async fn anthropic_route_records_realized_savings_from_header() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let snap = log.snapshot();
+    assert_eq!(snap.measured_request_deltas, 1);
+    assert_eq!(snap.unmeasured_request_deltas, 0);
     assert!(
-        (snap.total_savings_usd - 0.0009).abs() < 1e-9,
-        "rollup should record realized savings from the header, got {}",
+        (snap.total_signed_request_delta_usd + 0.0002).abs() < 1e-12,
+        "signed delta should preserve a regression, got {}",
+        snap.total_signed_request_delta_usd
+    );
+    assert_eq!(snap.total_positive_request_delta_usd, 0.0);
+    assert!((snap.total_regression_request_delta_usd - 0.0002).abs() < 1e-12);
+    assert!(
+        (snap.total_savings_usd - 0.0).abs() < 1e-12,
+        "legacy compatibility value should remain independent, got {}",
         snap.total_savings_usd
     );
+}
+
+#[tokio::test]
+async fn openai_route_records_positive_signed_request_delta_from_all_components() {
+    let upstream = MockServer::start_async().await;
+    let _m = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("x-tokentrimmer-baseline-cost-usd", "0.0020")
+                .header("x-tokentrimmer-cost-usd", "0.0010")
+                .header("x-tokentrimmer-provider-cache-saved-usd", "0.0002")
+                .header("x-tokentrimmer-cache-bust-usd", "0.0001")
+                .header("x-tokentrimmer-summarizer-tax-usd", "0.0002")
+                .header("x-tokentrimmer-saved-usd", "0.0005")
+                .body("ok");
+        })
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        mode: Mode::Bypass,
+        tt_api_key: None,
+        gateway_base_url: "http://unused".into(),
+        upstream_anthropic: "http://unused".into(),
+        upstream_openai: upstream.base_url(),
+        session_log_dir: tmp.path().to_path_buf(),
+        no_tui: true,
+        no_preview: true,
+    };
+    let log = Arc::new(SessionLog::new(&cfg.session_log_dir).unwrap());
+    let state = AppState {
+        config: Arc::new(cfg),
+        http: reqwest::Client::new(),
+        log: log.clone(),
+    };
+    let resp = post_chat_completions(
+        axum::extract::State(state),
+        axum::http::HeaderMap::new(),
+        Bytes::from_static(b"req"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), 200);
+
+    let snap = log.snapshot();
+    assert_eq!(snap.measured_request_deltas, 1);
+    assert_eq!(snap.unmeasured_request_deltas, 0);
+    assert!((snap.total_signed_request_delta_usd - 0.0005).abs() < 1e-12);
+    assert!((snap.total_positive_request_delta_usd - 0.0005).abs() < 1e-12);
+    assert_eq!(snap.total_regression_request_delta_usd, 0.0);
+    assert!((snap.total_savings_usd - 0.0005).abs() < 1e-12);
+    let body = std::fs::read_to_string(log.path()).unwrap();
+    assert!(body.contains("\"state\":\"measured\""));
+}
+
+#[tokio::test]
+async fn openai_error_response_with_invalid_components_is_unmeasured() {
+    let upstream = MockServer::start_async().await;
+    let _m = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(503)
+                .header("x-tokentrimmer-baseline-cost-usd", "not-a-number")
+                .header("x-tokentrimmer-cost-usd", "0.0010")
+                .header("x-tokentrimmer-provider-cache-saved-usd", "0.0002")
+                .header("x-tokentrimmer-cache-bust-usd", "0.0001")
+                .header("x-tokentrimmer-summarizer-tax-usd", "0.0002")
+                .header("x-tokentrimmer-saved-usd", "0.1234")
+                .body("gateway error");
+        })
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        mode: Mode::Bypass,
+        tt_api_key: None,
+        gateway_base_url: "http://unused".into(),
+        upstream_anthropic: "http://unused".into(),
+        upstream_openai: upstream.base_url(),
+        session_log_dir: tmp.path().to_path_buf(),
+        no_tui: true,
+        no_preview: true,
+    };
+    let log = Arc::new(SessionLog::new(&cfg.session_log_dir).unwrap());
+    let state = AppState {
+        config: Arc::new(cfg),
+        http: reqwest::Client::new(),
+        log: log.clone(),
+    };
+    let resp = post_chat_completions(
+        axum::extract::State(state),
+        axum::http::HeaderMap::new(),
+        Bytes::from_static(b"req"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), 503);
+
+    let snap = log.snapshot();
+    assert_eq!(snap.requests, 1);
+    assert_eq!(snap.measured_request_deltas, 0);
+    assert_eq!(snap.unmeasured_request_deltas, 1);
+    assert_eq!(snap.total_signed_request_delta_usd, 0.0);
+    assert!((snap.total_savings_usd - 0.1234).abs() < 1e-12);
+    let body = std::fs::read_to_string(log.path()).unwrap();
+    assert!(body.contains("\"state\":\"unmeasured\""));
 }

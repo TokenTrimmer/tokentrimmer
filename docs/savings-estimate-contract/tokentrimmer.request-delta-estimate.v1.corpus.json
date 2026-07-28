@@ -1,0 +1,88 @@
+{
+  "schema_version": "tokentrimmer.request-delta-estimate.corpus.v1",
+  "formula_version": "tt.request-delta-estimate.v1",
+  "scope": "One complete gateway-recorded request delta. This is a catalog-priced estimate, not provider-invoice reconciliation.",
+  "formula": "baseline_cost_usd - cost_usd - provider_cache_saved_usd - cache_bust_penalty_usd - summarizer_tax_usd",
+  "rules": {
+    "measured": "Every component is present, finite, and non-negative and the signed result is finite.",
+    "unmeasured": "Any missing, non-number, non-finite, negative, or overflowing component makes the whole request delta unmeasured; no component is zero-filled.",
+    "positive_request_delta_usd": "max(signed_request_delta_usd, 0)",
+    "regression_request_delta_usd": "max(-signed_request_delta_usd, 0)"
+  },
+  "vectors": [
+    {
+      "id": "measured-positive",
+      "input": {
+        "baseline_cost_usd": 1,
+        "cost_usd": 0.4,
+        "provider_cache_saved_usd": 0.1,
+        "cache_bust_penalty_usd": 0.05,
+        "summarizer_tax_usd": 0.05
+      },
+      "expected": {
+        "state": "measured",
+        "signed_request_delta_usd": 0.4,
+        "positive_request_delta_usd": 0.4,
+        "regression_request_delta_usd": 0
+      }
+    },
+    {
+      "id": "measured-regression",
+      "input": {
+        "baseline_cost_usd": 0.8,
+        "cost_usd": 0.7,
+        "provider_cache_saved_usd": 0.05,
+        "cache_bust_penalty_usd": 0.1,
+        "summarizer_tax_usd": 0.2
+      },
+      "expected": {
+        "state": "measured",
+        "signed_request_delta_usd": -0.25,
+        "positive_request_delta_usd": 0,
+        "regression_request_delta_usd": 0.25
+      }
+    },
+    {
+      "id": "measured-zero",
+      "input": {
+        "baseline_cost_usd": 1,
+        "cost_usd": 0.7,
+        "provider_cache_saved_usd": 0.1,
+        "cache_bust_penalty_usd": 0.1,
+        "summarizer_tax_usd": 0.1
+      },
+      "expected": {
+        "state": "measured",
+        "signed_request_delta_usd": 0,
+        "positive_request_delta_usd": 0,
+        "regression_request_delta_usd": 0
+      }
+    },
+    {
+      "id": "missing-component-is-unmeasured",
+      "input": {
+        "baseline_cost_usd": 1,
+        "cost_usd": 0.5,
+        "provider_cache_saved_usd": 0.1,
+        "cache_bust_penalty_usd": 0.1,
+        "summarizer_tax_usd": null
+      },
+      "expected": {
+        "state": "unmeasured"
+      }
+    },
+    {
+      "id": "negative-component-is-unmeasured",
+      "input": {
+        "baseline_cost_usd": 1,
+        "cost_usd": 0.5,
+        "provider_cache_saved_usd": -0.1,
+        "cache_bust_penalty_usd": 0.1,
+        "summarizer_tax_usd": 0.1
+      },
+      "expected": {
+        "state": "unmeasured"
+      }
+    }
+  ]
+}

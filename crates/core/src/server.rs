@@ -168,6 +168,10 @@ pub fn build_router_with_retrieval(
         .route("/ready", get(routes::ready::handler))
         .route("/metrics", get(routes::metrics::handler))
         .route("/v1/models", get(routes::models::handler))
+        // Authenticated, per-process runtime evidence. This is intentionally
+        // distinct from `/v1/models`: catalog metadata does not prove gateway
+        // feature gates, credential readiness, or provider acceptance.
+        .route("/v1/capabilities", get(routes::capabilities::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))
         // POST creates a new run; GET lists the caller's runs (org-scoped,
         // newest-first, durable Postgres view — no transcript). The bare list
@@ -233,7 +237,49 @@ pub fn build_router_with_retrieval(
         // ordering documents intent).
         .route(
             "/v1/workflows/secrets",
-            post(routes::workflows::set_workflow_secret),
+            post(routes::workflows::set_workflow_secret)
+                .get(routes::workflows::list_workflow_secrets),
+        )
+        .route(
+            "/v1/workflows/secrets/:name",
+            axum::routing::delete(routes::workflows::delete_workflow_secret),
+        )
+        .route(
+            "/v1/workflows/:id/versions",
+            get(routes::workflow_versions::list_versions),
+        )
+        .route(
+            "/v1/workflows/:id/versions/:version",
+            get(routes::workflow_versions::get_version),
+        )
+        .route(
+            "/v1/workflows/:id/versions/:from_version/compare/:to_version",
+            get(routes::workflow_versions::compare_versions),
+        )
+        .route(
+            "/v1/workflows/:id/release-state",
+            get(routes::workflow_releases::get_release_state),
+        )
+        .route(
+            "/v1/workflows/:id/environments/:environment/releases",
+            get(routes::workflow_releases::list_release_history),
+        )
+        .route(
+            "/v1/workflows/:id/environments/:environment/variables",
+            get(routes::workflow_variables::get_environment_variables)
+                .put(routes::workflow_variables::replace_environment_variables),
+        )
+        .route(
+            "/v1/workflows/:id/environments/development/publish",
+            post(routes::workflow_releases::publish_development),
+        )
+        .route(
+            "/v1/workflows/:id/environments/:environment/promote",
+            post(routes::workflow_releases::promote_environment),
+        )
+        .route(
+            "/v1/workflows/:id/environments/:environment/rollback",
+            post(routes::workflow_releases::rollback_environment),
         )
         .route("/v1/workflows/:id", get(routes::workflows::get))
         .route(
@@ -244,11 +290,15 @@ pub fn build_router_with_retrieval(
         // HTTP route, so runs + receipts vanished on navigation. Both org-scoped.
         .route(
             "/v1/workflows/:id/runs",
-            get(routes::workflows::list_workflow_runs),
+            get(routes::workflow_runs::list_workflow_runs),
+        )
+        .route(
+            "/v1/workflows/runs/:run_id/nodes",
+            get(routes::workflow_runs::list_workflow_node_runs),
         )
         .route(
             "/v1/workflows/runs/:run_id",
-            get(routes::workflows::get_workflow_run),
+            get(routes::workflow_runs::get_workflow_run),
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,

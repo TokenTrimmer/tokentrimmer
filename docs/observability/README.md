@@ -31,7 +31,7 @@ TokenTrimmer cost (`tokentrimmer.*`), mirroring the `x-tokentrimmer-*` headers
 
 | Attribute | Mirrors header |
 | --- | --- |
-| `tokentrimmer.cost_usd` | `x-tokentrimmer-cost-usd` — what the provider bills. |
+| `tokentrimmer.cost_usd` | `x-tokentrimmer-cost-usd` — observed served usage priced from the active catalog; not provider-invoice reconciliation. |
 | `tokentrimmer.baseline_cost_usd` | `x-tokentrimmer-baseline-cost-usd` — cost with no TokenTrimmer. |
 | `tokentrimmer.saved_usd` | `x-tokentrimmer-saved-usd` — TokenTrimmer-attributed savings. |
 | `tokentrimmer.provider_cache_saved_usd` | `x-tokentrimmer-provider-cache-saved-usd` — provider-side cache discount. |

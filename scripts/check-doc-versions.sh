@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # check-doc-versions.sh — assert GETTING_STARTED.md contains the openai version
-# strings that are pinned in sdk-python/pyproject.toml and
-# sdk-typescript/package.json. Exits non-zero with a clear message on drift so
+# strings that are pinned in sdk-python/pyproject.toml and the TypeScript SDK's
+# OpenAI peer contract. Exits non-zero with a clear message on drift so
 # the CI job fails loudly rather than letting stale docs reach users.
 set -euo pipefail
 
@@ -28,11 +28,25 @@ else
 fi
 
 # ── TypeScript pin ────────────────────────────────────────────────────────────
-# Extract the openai value from package.json dependencies, e.g. "^6.44.0"
-ts_pin="$(grep -A1 '"dependencies"' "$PKG_JSON" | grep '"openai"' | sed 's/.*"openai": *"\([^"]*\)".*/\1/')"
+# Parse JSON instead of depending on property order or a nearby `dependencies`
+# block. The peer dependency is the SDK's customer-facing compatibility
+# contract; the dev dependency must stay identical so CI tests that contract.
+ts_pins="$(node -e '
+const manifest = require(process.argv[1]);
+const peer = manifest.peerDependencies?.openai ?? "";
+const dev = manifest.devDependencies?.openai ?? "";
+process.stdout.write(`${peer}\n${dev}`);
+' "$PKG_JSON")"
+ts_pin="$(printf '%s\n' "$ts_pins" | sed -n '1p')"
+ts_dev_pin="$(printf '%s\n' "$ts_pins" | sed -n '2p')"
 if [[ -z "$ts_pin" ]]; then
-    echo "ERROR: could not parse openai pin from $PKG_JSON" >&2
+    echo "ERROR: could not parse peerDependencies.openai from $PKG_JSON" >&2
     exit 1
+fi
+if [[ "$ts_dev_pin" != "$ts_pin" ]]; then
+    echo "DRIFT  TypeScript dev OpenAI pin '$ts_dev_pin' does not match peer pin '$ts_pin'" >&2
+    echo "       Update devDependencies.openai in $PKG_JSON" >&2
+    fail=1
 fi
 if grep -qF "$ts_pin" "$DOC"; then
     echo "OK  TypeScript pin '$ts_pin' found in GETTING_STARTED.md"

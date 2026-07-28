@@ -4,7 +4,7 @@
 //!   cargo test -p tt-core --test panel_fanout
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,7 +13,10 @@ use futures::stream::{BoxStream, StreamExt};
 use uuid::Uuid;
 
 use tt_core::{
-    routes::panel::{run_panel, ArbiterStrategyKind, LegRole, LegStatus, ModelRef, PanelConfig},
+    routes::panel::{
+        admit_panel_request, run_panel, ArbiterStrategyKind, LegRole, LegStatus, ModelRef,
+        PanelAdmission, PanelConfig,
+    },
     ApiError, AppState, ProviderRegistry,
 };
 use tt_shared::{
@@ -140,16 +143,24 @@ fn test_ctx() -> RequestContext {
     }
 }
 
-fn base_req() -> ChatCompletionRequest {
+fn base_req(model: &str) -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: "mock-leg1".into(),
+        model: model.into(),
         messages: vec![Message::User {
             content: MessageContent::Text("hello".into()),
             name: None,
         }],
         stream: false,
+        max_tokens: Some(100),
         ..Default::default()
     }
+}
+
+/// Exercise the public engine through the same opaque admission proof that
+/// production direct Rust callers must obtain before `run_panel` can fan out.
+fn admission(state: &AppState, cfg: &PanelConfig, req: &ChatCompletionRequest) -> PanelAdmission {
+    admit_panel_request(state, cfg, req, Some(999.0))
+        .expect("priced test panel should pass its explicit admission budget")
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +198,7 @@ async fn both_legs_return_three_legs_and_summed_cost() {
     let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
     creds.insert("mock-provider-leg1".to_string(), test_creds("key1"));
     creds.insert("mock-provider-leg2".to_string(), test_creds("key2"));
-    // Arbiter cred is NOT in the creds map; Synthesize uses ctx.credentials directly.
+    creds.insert("mock-provider-arbiter".to_string(), test_creds("arb-key"));
 
     let cfg = PanelConfig {
         strategy: ArbiterStrategyKind::Synthesize,
@@ -208,13 +219,16 @@ async fn both_legs_return_three_legs_and_summed_cost() {
         quorum: None,
         max_cost_usd: None,
     };
+    let req = base_req("mock-leg1");
+    let admission = admission(&state, &cfg, &req);
 
     let result = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -265,6 +279,7 @@ async fn all_legs_error_returns_quorum_unmet() {
 
     let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
     creds.insert("mock-provider-fail".to_string(), test_creds("key1"));
+    creds.insert("mock-provider-arbiter".to_string(), test_creds("arb-key"));
 
     let cfg = PanelConfig {
         strategy: ArbiterStrategyKind::Synthesize,
@@ -279,13 +294,16 @@ async fn all_legs_error_returns_quorum_unmet() {
         quorum: Some(1),
         max_cost_usd: None,
     };
+    let req = base_req("mock-fail");
+    let admission = admission(&state, &cfg, &req);
 
     let err = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -335,6 +353,7 @@ async fn member_missing_cred_is_skipped() {
     let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
     creds.insert("mock-provider-has-cred".to_string(), test_creds("key1"));
     // "mock-provider-no-cred" intentionally omitted
+    creds.insert("mock-provider-arbiter".to_string(), test_creds("arb-key"));
 
     let cfg = PanelConfig {
         strategy: ArbiterStrategyKind::Synthesize,
@@ -355,13 +374,16 @@ async fn member_missing_cred_is_skipped() {
         quorum: Some(1), // only 1 survivor needed
         max_cost_usd: None,
     };
+    let req = base_req("mock-has-cred");
+    let admission = admission(&state, &cfg, &req);
 
     let result = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -444,6 +466,153 @@ impl Provider for MockPanic {
 }
 
 // ---------------------------------------------------------------------------
+// Credential preflight: reject before any member/arbiter dispatch
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn missing_cross_provider_arbiter_credential_stops_before_any_dispatch() {
+    // Both providers panic if called. A deterministic credential-preflight
+    // error therefore proves the source context's key was neither sent to the
+    // arbiter nor used to start the otherwise credentialed member leg.
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockPanic {
+        id: "mock-provider-member-panic",
+        model: "mock-member-panic",
+    }));
+    registry.register(Arc::new(MockPanic {
+        id: "mock-provider-arbiter-panic",
+        model: "mock-arbiter-panic",
+    }));
+
+    let state = AppState::new(registry);
+    let ctx = test_ctx();
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert(
+        "mock-provider-member-panic".to_string(),
+        test_creds("member-key"),
+    );
+    // Intentionally omit `mock-provider-arbiter-panic`: the unrelated
+    // `ctx.credentials` must not become an arbiter fallback.
+
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Synthesize,
+        members: vec![ModelRef {
+            model: "mock-member-panic".to_string(),
+            provider: None,
+        }],
+        arbiter_model: ModelRef {
+            model: "mock-arbiter-panic".to_string(),
+            provider: None,
+        },
+        quorum: Some(1),
+        max_cost_usd: None,
+    };
+    let req = base_req("mock-member-panic");
+    let admission = admission(&state, &cfg, &req);
+
+    let error = run_panel(
+        &state,
+        &ctx,
+        &req,
+        &creds,
+        &cfg,
+        &admission,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect_err("missing arbiter credential must stop before fan-out");
+
+    assert!(
+        matches!(
+            &error,
+            ApiError::PanelCredentialPreflight {
+                required: 1,
+                credentialed: 1,
+                missing_arbiter: true,
+            }
+        ),
+        "expected missing-arbiter credential preflight error, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn insufficient_credentialed_member_quorum_stops_before_any_dispatch() {
+    // As above, a provider call would panic. The mapped arbiter isolates this
+    // case to the member-quorum half of the preflight.
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockPanic {
+        id: "mock-provider-member-one-panic",
+        model: "mock-member-one-panic",
+    }));
+    registry.register(Arc::new(MockPanic {
+        id: "mock-provider-member-two-panic",
+        model: "mock-member-two-panic",
+    }));
+    registry.register(Arc::new(MockPanic {
+        id: "mock-provider-arbiter-panic",
+        model: "mock-arbiter-panic",
+    }));
+
+    let state = AppState::new(registry);
+    let ctx = test_ctx();
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert(
+        "mock-provider-member-one-panic".to_string(),
+        test_creds("member-one-key"),
+    );
+    creds.insert(
+        "mock-provider-arbiter-panic".to_string(),
+        test_creds("arbiter-key"),
+    );
+
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Synthesize,
+        members: vec![
+            ModelRef {
+                model: "mock-member-one-panic".to_string(),
+                provider: None,
+            },
+            ModelRef {
+                model: "mock-member-two-panic".to_string(),
+                provider: None,
+            },
+        ],
+        arbiter_model: ModelRef {
+            model: "mock-arbiter-panic".to_string(),
+            provider: None,
+        },
+        quorum: Some(2),
+        max_cost_usd: None,
+    };
+    let req = base_req("mock-member-one-panic");
+    let admission = admission(&state, &cfg, &req);
+
+    let error = run_panel(
+        &state,
+        &ctx,
+        &req,
+        &creds,
+        &cfg,
+        &admission,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect_err("insufficient credentialed member quorum must stop before fan-out");
+
+    assert!(
+        matches!(
+            &error,
+            ApiError::PanelCredentialPreflight {
+                required: 2,
+                credentialed: 1,
+                missing_arbiter: false,
+            }
+        ),
+        "expected member-quorum credential preflight error, got {error:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 4: only-panicking member → quorum unmet (does not hang or propagate)
 // ---------------------------------------------------------------------------
 
@@ -470,6 +639,7 @@ async fn panicked_only_leg_returns_quorum_unmet() {
 
     let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
     creds.insert("mock-provider-panic".to_string(), test_creds("key1"));
+    creds.insert("mock-provider-arbiter".to_string(), test_creds("arb-key"));
 
     let cfg = PanelConfig {
         strategy: ArbiterStrategyKind::Synthesize,
@@ -484,13 +654,16 @@ async fn panicked_only_leg_returns_quorum_unmet() {
         quorum: Some(1),
         max_cost_usd: None,
     };
+    let req = base_req("mock-panic");
+    let admission = admission(&state, &cfg, &req);
 
     let err = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -538,6 +711,7 @@ async fn panicked_leg_recorded_as_error_good_leg_counts_for_quorum() {
     let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
     creds.insert("mock-provider-good".to_string(), test_creds("key1"));
     creds.insert("mock-provider-panic".to_string(), test_creds("key2"));
+    creds.insert("mock-provider-arbiter".to_string(), test_creds("arb-key"));
 
     let cfg = PanelConfig {
         strategy: ArbiterStrategyKind::Synthesize,
@@ -558,13 +732,16 @@ async fn panicked_leg_recorded_as_error_good_leg_counts_for_quorum() {
         quorum: Some(1), // 1 survivor is enough
         max_cost_usd: None,
     };
+    let req = base_req("mock-good");
+    let admission = admission(&state, &cfg, &req);
 
     let result = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -596,6 +773,7 @@ struct MockSleepy {
     id: &'static str,
     model: &'static str,
     sleep_ms: u64,
+    seen_keys: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -633,8 +811,12 @@ impl Provider for MockSleepy {
     async fn chat_completion(
         &self,
         req: ChatCompletionRequest,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.seen_keys
+            .lock()
+            .expect("arbiter credential recorder must not be poisoned")
+            .push(ctx.credentials.api_key.expose().to_string());
         tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
         Ok(ChatCompletionResponse {
             id: "chatcmpl-sleepy".into(),
@@ -695,10 +877,12 @@ async fn arbiter_cross_provider_creds_and_latency() {
         output_price: 15.0,
         fail: false,
     }));
+    let arbiter_seen_keys = Arc::new(Mutex::new(Vec::new()));
     registry.register(Arc::new(MockSleepy {
         id: "mock-provider-arb-sleepy",
         model: "mock-arb-sleepy",
         sleep_ms: 3,
+        seen_keys: Arc::clone(&arbiter_seen_keys),
     }));
 
     let state = AppState::new(registry);
@@ -725,13 +909,16 @@ async fn arbiter_cross_provider_creds_and_latency() {
         quorum: Some(1),
         max_cost_usd: None,
     };
+    let req = base_req("mock-member");
+    let admission = admission(&state, &cfg, &req);
 
     let result = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -755,5 +942,14 @@ async fn arbiter_cross_provider_creds_and_latency() {
         arbiter_leg.latency_ms >= 1,
         "arbiter latency must be measured (got {}), not hardcoded 0",
         arbiter_leg.latency_ms
+    );
+    let seen_arbiter_keys = arbiter_seen_keys
+        .lock()
+        .expect("arbiter credential recorder must not be poisoned")
+        .clone();
+    assert_eq!(
+        seen_arbiter_keys,
+        vec!["arb-key".to_string()],
+        "the cross-provider arbiter must receive only its mapped credential, never ctx's source key"
     );
 }

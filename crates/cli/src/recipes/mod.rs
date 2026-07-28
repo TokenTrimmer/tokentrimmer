@@ -1,7 +1,7 @@
 //! `tt recipes` — curated, ready-to-apply savings route-sets.
 //!
 //! A *recipe* is a small, named bundle of routing rules that targets one common
-//! cost lane (cheap classification, vision gating, cost ceilings, outage
+//! cost lane (cheap classification, vision gating, cost admission limits, outage
 //! failover, long-context downshift). The route bodies are the SAME shape the
 //! gateway's `POST /v1/routes` accepts (see `tt_routing::NewRoute`), so applying
 //! a recipe is just creating its routes over the user-facing routes API — the
@@ -153,7 +153,7 @@ pub fn humanize_route(route: &Value) -> String {
         actions.push(format!("fallbacks → {}", list.join(" → ")));
     }
     if let Some(v) = then["max_cost_usd"].as_f64() {
-        actions.push(format!("cap ${v}/call"));
+        actions.push(format!("preflight est. limit ${v}/call"));
     }
     if then["disable_cache"].as_bool() == Some(true) {
         actions.push("skip cache".to_string());
@@ -386,11 +386,11 @@ mod tests {
         console::set_colors_enabled(false);
         let recipe = find("cost-ceiling").unwrap();
         let out = show_text(&recipe);
-        assert!(out.contains("Cost ceiling"));
+        assert!(out.contains("Cost admission limit"));
         assert!(out.contains("lane    : cap"));
         assert!(out.contains("est. cost > $0.05"));
         assert!(out.contains("use gpt-4o-mini"));
-        assert!(out.contains("cap $0.05/call"));
+        assert!(out.contains("preflight est. limit $0.05/call"));
     }
 
     #[test]

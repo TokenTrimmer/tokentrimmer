@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use futures::future::join_all;
 
 use crate::error::ApiError;
@@ -69,6 +70,8 @@ pub(crate) fn ready_nodes(
 /// Result from one concurrently-executed Model/Agent node.
 pub(crate) struct ConcurrentNodeResult {
     pub node_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
     pub outcome: Result<NodeOutput, ApiError>,
 }
 
@@ -98,9 +101,13 @@ pub(crate) async fn run_concurrent_model_wave(
     let futs: Vec<_> = specs
         .iter()
         .map(|(node_id, spec)| async move {
+            let started_at = Utc::now();
+            let outcome = executor.run_intelligence(node_id.as_str(), spec).await;
             ConcurrentNodeResult {
                 node_id: node_id.clone(),
-                outcome: executor.run_intelligence(node_id.as_str(), spec).await,
+                started_at,
+                finished_at: Utc::now(),
+                outcome,
             }
         })
         .collect();

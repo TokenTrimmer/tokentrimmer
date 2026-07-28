@@ -46,6 +46,7 @@ fn req(
         ts: ts(id_seed as i64),
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet".into(),
+        requested_model: None,
         input_tokens,
         output_tokens: 100,
         cached_tokens: 0,
@@ -409,6 +410,7 @@ async fn replay_with_quality_attaches_quality_field() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
     let mut pricing = HashMap::new();

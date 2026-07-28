@@ -31,6 +31,7 @@ pub use writer::{build_entry, generate_signing_key, AuditWriter, InMemoryAuditWr
 /// Fields are stable: the hash chain covers a canonical serialization of a
 /// subset of them (see [`canonical_payload_bytes`]). Do not reorder or rename
 /// without updating the chain computation.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     /// Unique entry identifier (UUIDv4).
@@ -56,6 +57,7 @@ pub struct AuditEntry {
 }
 
 /// Who caused an audit event.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Actor {

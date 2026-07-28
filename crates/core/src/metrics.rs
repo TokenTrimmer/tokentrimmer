@@ -312,9 +312,10 @@ pub fn record_diff(outcome: &'static str, reason: &'static str) {
     metrics::counter!("tt_diff_total", "outcome" => outcome, "reason" => reason).increment(1);
 }
 
-/// Count one deep-research panel request. `strategy` is the panel strategy
+/// Count one Fusion panel request. `strategy` is the panel strategy
 /// name (bounded cardinality — e.g. `"consensus"`, `"best_of"`); `outcome` ∈
-/// `success|quorum_unmet|disabled|strategy_unsupported|error` (bounded).
+/// `success|quorum_unmet|credential_preflight|disabled|strategy_unsupported|error`
+/// (bounded).
 pub fn record_panel_request(strategy: &str, outcome: &str) {
     metrics::counter!(
         "tt_panel_requests_total",
@@ -324,7 +325,7 @@ pub fn record_panel_request(strategy: &str, outcome: &str) {
     .increment(1);
 }
 
-/// Count one deep-research panel leg dispatch. `role` ∈ `primary|secondary`
+/// Count one Fusion panel leg dispatch. `role` ∈ `primary|secondary`
 /// or an ordinal index string (bounded by the panel size, small); `status` ∈
 /// `success|error|timeout` (bounded).
 pub fn record_panel_leg(role: &str, status: &str) {

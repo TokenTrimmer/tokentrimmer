@@ -1,0 +1,261 @@
+{
+  "corpus": {
+    "id": "tokentrimmer.route-contract-corpus",
+    "version": 1
+  },
+  "contract": {
+    "id": "tokentrimmer.route.v1",
+    "version": 1
+  },
+  "cases": [
+    {
+      "id": "canonical_defaults_have_a_stable_hash",
+      "gateway": {
+        "name": "canonical-defaults",
+        "then": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "control_plane": {
+        "name": "canonical-defaults",
+        "priority": 100,
+        "enabled": true,
+        "conditions": {},
+        "target": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "accepted",
+          "canonical": {
+            "schema_version": 1,
+            "name": "canonical-defaults",
+            "priority": 100,
+            "enabled": true,
+            "conditions": {
+              "model_in": [],
+              "input_tokens_lt": null,
+              "input_tokens_gt": null,
+              "tag_equals": null
+            },
+            "target": {
+              "target_model": "gpt-4o-mini"
+            },
+            "canonical_hash": "sha256:4a74dd18f72de123f99b91434af07114a7827eb66cc942002ad5cdbe0d778de4"
+          }
+        },
+        "control_plane": {
+          "outcome": "accepted",
+          "canonical": {
+            "schema_version": 1,
+            "name": "canonical-defaults",
+            "priority": 100,
+            "enabled": true,
+            "conditions": {
+              "model_in": [],
+              "input_tokens_lt": null,
+              "input_tokens_gt": null,
+              "tag_equals": null
+            },
+            "target": {
+              "target_model": "gpt-4o-mini"
+            },
+            "canonical_hash": "sha256:4a74dd18f72de123f99b91434af07114a7827eb66cc942002ad5cdbe0d778de4"
+          }
+        }
+      }
+    },
+    {
+      "id": "rejects_zero_panel_quorum",
+      "gateway": {
+        "name": "zero-panel-quorum",
+        "then": {
+          "panel": {
+            "strategy": "majority",
+            "members": ["member-a", "member-b"],
+            "quorum": 0
+          }
+        }
+      },
+      "control_plane": {
+        "name": "zero-panel-quorum",
+        "priority": 100,
+        "enabled": false,
+        "conditions": {},
+        "target": {
+          "panel": {
+            "strategy": "majority",
+            "members": ["member-a", "member-b"],
+            "quorum": 0
+          }
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "then.panel.quorum", "code": "nonpositive_quorum" }
+          ]
+        },
+        "control_plane": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "target.panel.quorum", "code": "nonpositive_quorum" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "rejects_unknown_nested_condition",
+      "gateway": {
+        "name": "unknown-condition",
+        "when": {
+          "future_match": true
+        },
+        "then": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "control_plane": {
+        "name": "unknown-condition",
+        "priority": 100,
+        "enabled": false,
+        "conditions": {
+          "future_match": true
+        },
+        "target": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "when.future_match", "code": "invalid_field" }
+          ]
+        },
+        "control_plane": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "conditions.future_match", "code": "invalid_field" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "rejects_legacy_schema_version",
+      "gateway": {
+        "schema_version": 0,
+        "name": "legacy-version",
+        "then": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "control_plane": {
+        "schema_version": 0,
+        "name": "legacy-version",
+        "priority": 100,
+        "enabled": false,
+        "conditions": {},
+        "target": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "schema_version", "code": "legacy_schema_version" }
+          ]
+        },
+        "control_plane": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "schema_version", "code": "legacy_schema_version" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "rejects_future_schema_version",
+      "gateway": {
+        "schema_version": 2,
+        "name": "future-version",
+        "then": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "control_plane": {
+        "schema_version": 2,
+        "name": "future-version",
+        "priority": 100,
+        "enabled": false,
+        "conditions": {},
+        "target": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "schema_version", "code": "future_schema_version" }
+          ]
+        },
+        "control_plane": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "schema_version", "code": "future_schema_version" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "rejects_priority_beyond_shared_postgres_int",
+      "gateway": {
+        "name": "priority-overflow",
+        "priority": 2147483648,
+        "then": {
+          "target_model": "gpt-4o-mini"
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "priority", "code": "invalid_field" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "rejects_route_without_an_effect",
+      "gateway": {
+        "name": "no-effect",
+        "then": {}
+      },
+      "control_plane": {
+        "name": "no-effect",
+        "priority": 100,
+        "enabled": false,
+        "conditions": {},
+        "target": {}
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "then", "code": "invalid_configuration" }
+          ]
+        },
+        "control_plane": {
+          "outcome": "rejected",
+          "issues": [
+            { "field": "target", "code": "invalid_configuration" }
+          ]
+        }
+      }
+    }
+  ]
+}

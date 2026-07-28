@@ -12,7 +12,8 @@ use tt_shared::messages::{Message, MessageContent, Tool};
 
 use crate::{
     error::ApiError,
-    routes::agent_run::{self, LoopOutcome},
+    routes::agent_run::{self, LoopOutcome, RunStatus},
+    routes::agent_run_budget::estimate_next_turn_cost,
     workflow::types::{ModelSelection, NodeOutput, WorkflowDefinition},
     AppState,
 };
@@ -24,6 +25,7 @@ use crate::{
 /// All inputs the executor needs to run one Model or Agent node.  The `prompt`
 /// is the already-substituted user message; `selection` drives model/route
 /// resolution.
+#[derive(Clone)]
 pub(crate) struct IntelligenceSpec {
     pub selection: ModelSelection,
     /// Already-substituted user prompt (engine handles `{{var}}` expansion).
@@ -31,7 +33,42 @@ pub(crate) struct IntelligenceSpec {
     pub tools: Vec<Tool>,
     /// Turn cap (1 for Model nodes, N for Agent nodes).
     pub max_turns: u32,
+    /// Optional output ceiling applied to every model turn.
+    pub max_output_tokens: Option<u32>,
     pub max_cost_usd: Option<f64>,
+}
+
+/// Project the single provider turn represented by a bounded workflow node.
+///
+/// The workflow admission gate currently permits capped Model nodes and
+/// single-turn Agent nodes only when they use a pinned model, a declared output
+/// cap, and no tools. Returning `None` for every other shape keeps this helper
+/// honest if an internal caller bypasses that route-level gate. The engine uses
+/// the result as an in-memory reservation before launch, then settles against
+/// the executor's actual `NodeOutput.cost_usd`.
+pub(crate) fn reservation_cost_usd(spec: &IntelligenceSpec) -> Option<f64> {
+    if spec.max_turns != 1
+        || !spec.tools.is_empty()
+        || !matches!(spec.max_output_tokens, Some(value) if value > 0)
+    {
+        return None;
+    }
+    let ModelSelection::Model { model } = &spec.selection else {
+        return None;
+    };
+    let messages = [Message::User {
+        content: MessageContent::Text(spec.prompt.clone()),
+        name: None,
+    }];
+    estimate_next_turn_cost(model, &messages, spec.max_output_tokens)
+}
+
+fn workflow_budget_dispatch_failure(status: RunStatus, note: Option<&str>) -> Option<String> {
+    (status == RunStatus::Failed)
+        .then_some(note)
+        .flatten()
+        .filter(|note| note.contains("workflow budget dispatch"))
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +89,20 @@ pub(crate) trait NodeExecutor: Send + Sync {
     /// [`ApiError::ServiceUnavailable`] if the backing store is unavailable.
     #[allow(dead_code)]
     async fn load_subworkflow(&self, id: uuid::Uuid) -> Result<WorkflowDefinition, ApiError>;
+
+    /// Load a bounded set of latest child definitions. The default preserves
+    /// simple test executors; the gateway implementation overrides it with one
+    /// org-scoped batch query for whole-tree preflight.
+    async fn load_subworkflows(
+        &self,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, WorkflowDefinition>, ApiError> {
+        let mut definitions = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            definitions.insert(*id, self.load_subworkflow(*id).await?);
+        }
+        Ok(definitions)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +157,18 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
             .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))
     }
 
+    async fn load_subworkflows(
+        &self,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, WorkflowDefinition>, ApiError> {
+        let pool = self
+            .state
+            .db_pool
+            .as_ref()
+            .ok_or_else(|| ApiError::ServiceUnavailable("workflow store unavailable".into()))?;
+        crate::workflow::preflight::load_latest_definitions(pool, self.org_id, ids).await
+    }
+
     async fn run_intelligence(
         &self,
         node_id: &str,
@@ -132,6 +195,7 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
             messages,
             spec.tools.clone(),
             spec.max_turns,
+            spec.max_output_tokens,
             spec.max_cost_usd,
             route_ref,
             None, // workflow-level tag threading deferred to Task 6+
@@ -140,6 +204,11 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
 
         match outcome {
             LoopOutcome::Terminal(run) => {
+                if let Some(message) =
+                    workflow_budget_dispatch_failure(run.status, run.note.as_deref())
+                {
+                    return Err(ApiError::InvalidRequest(message));
+                }
                 // Extract the last assistant text from the transcript.
                 let last_text = run
                     .messages
@@ -245,5 +314,55 @@ mod tests {
         // Auto: let the gateway decide; no model pin, no forced route.
         assert_eq!(model, "");
         assert_eq!(route, None);
+    }
+
+    #[test]
+    fn reservation_requires_the_exact_priceable_single_turn_shape() {
+        let mut spec = IntelligenceSpec {
+            selection: ModelSelection::Model {
+                model: "gpt-4o-mini".into(),
+            },
+            prompt: "hello".into(),
+            tools: vec![],
+            max_turns: 1,
+            max_output_tokens: Some(64),
+            max_cost_usd: None,
+        };
+
+        assert!(reservation_cost_usd(&spec).is_some_and(|cost| cost > 0.0));
+        spec.max_output_tokens = None;
+        assert_eq!(reservation_cost_usd(&spec), None);
+        spec.max_output_tokens = Some(64);
+        spec.max_turns = 2;
+        assert_eq!(reservation_cost_usd(&spec), None);
+        spec.max_turns = 1;
+        spec.selection = ModelSelection::Route {
+            route_ref: "dynamic".into(),
+        };
+        assert_eq!(reservation_cost_usd(&spec), None);
+    }
+
+    #[test]
+    fn post_route_budget_rejection_propagates_out_of_the_agent_loop() {
+        assert_eq!(
+            workflow_budget_dispatch_failure(
+                RunStatus::Failed,
+                Some(
+                    "turn 0 failed: invalid request: workflow budget dispatch rejected the final routed request before provider work"
+                ),
+            ),
+            Some(
+                "turn 0 failed: invalid request: workflow budget dispatch rejected the final routed request before provider work"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            workflow_budget_dispatch_failure(
+                RunStatus::Failed,
+                Some("turn 0 failed: provider unavailable"),
+            ),
+            None,
+            "existing non-budget agent-loop failures retain their accounting behavior"
+        );
     }
 }

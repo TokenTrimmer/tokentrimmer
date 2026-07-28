@@ -39,6 +39,7 @@ fn make_req(
         ts: ts(secs),
         provider: provider.into(),
         model: model.into(),
+        requested_model: None,
         input_tokens: 100,
         output_tokens,
         cached_tokens: 0,

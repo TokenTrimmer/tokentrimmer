@@ -3,11 +3,15 @@
 //! These tests assert:
 //! 1. A preview request with `X-TokenTrimmer-Panel: synthesize` and 2 priced
 //!    members returns 200 with a `panel` object: members length 2 + arbiter +
-//!    numeric `total_estimated_cost_usd`. The mock dispatch counter MUST remain
-//!    at ZERO — no providers are called.
+//!    numeric `total_estimated_cost_usd` that matches Fusion's shared static
+//!    dispatch plan. The mock dispatch counter MUST remain at ZERO — no
+//!    providers are called.
 //! 2. A member with a bogus/unpriced model ⇒ `total_estimated_cost_usd: null`
 //!    AND `within_budget: false` (fail-closed); still zero dispatch.
-//! 3. No panel header ⇒ response has no `panel` key (unchanged behavior).
+//! 3. `max_completion_tokens`, `n`, and a body budget use that same static
+//!    plan; Majority and missing output caps fail closed rather than pricing a
+//!    flatter, executable-looking plan.
+//! 4. No panel header ⇒ response has no `panel` key (unchanged behavior).
 //!
 //! NOTE: The `/v1/preview` base-model lookup uses the `tt_preview` pricing
 //! catalog, which covers real provider models (gpt-4o, gpt-4o-mini, etc.).
@@ -29,7 +33,13 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tower::util::ServiceExt;
 
-use tt_core::{build_router, AppState, ProviderRegistry};
+use tt_core::{
+    build_router,
+    routes::panel::{
+        estimate_panel_cost, ArbiterStrategyKind, ModelRef, PanelAdmissionEstimate, PanelConfig,
+    },
+    AppState, ProviderRegistry,
+};
 use tt_shared::{
     messages::{Choice, Message, MessageContent},
     pricing::Capability,
@@ -154,7 +164,7 @@ impl Provider for CountedMock {
 // for the panel dry-run estimate.
 // ---------------------------------------------------------------------------
 
-fn app_two_priced_members() -> (axum::Router, Arc<AtomicUsize>) {
+fn app_two_priced_members() -> (axum::Router, Arc<AtomicUsize>, AppState) {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(CountedMock::new(
@@ -168,7 +178,36 @@ fn app_two_priced_members() -> (axum::Router, Arc<AtomicUsize>) {
         Arc::clone(&calls),
     )));
     let state = AppState::new(registry).with_panel_enabled(true);
-    (build_router(state), calls)
+    (build_router(state.clone()), calls, state)
+}
+
+fn synthesize_config(max_cost_usd: Option<f64>) -> PanelConfig {
+    PanelConfig {
+        strategy: ArbiterStrategyKind::Synthesize,
+        members: vec![
+            ModelRef {
+                model: "gpt-4o".to_string(),
+                provider: None,
+            },
+            ModelRef {
+                model: "gpt-4o-mini".to_string(),
+                provider: None,
+            },
+        ],
+        arbiter_model: ModelRef {
+            model: "gpt-4o".to_string(),
+            provider: None,
+        },
+        quorum: None,
+        max_cost_usd,
+    }
+}
+
+fn assert_same_cost(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-15,
+        "preview must use the shared static plan: actual={actual}, expected={expected}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +217,7 @@ fn app_two_priced_members() -> (axum::Router, Arc<AtomicUsize>) {
 
 #[tokio::test]
 async fn preview_panel_returns_estimate_with_zero_dispatch() {
-    let (app, calls) = app_two_priced_members();
+    let (app, calls, state) = app_two_priced_members();
 
     let req = Request::builder()
         .method("POST")
@@ -260,6 +299,37 @@ async fn preview_panel_returns_estimate_with_zero_dispatch() {
         "total_estimated_cost_usd must be positive"
     );
 
+    // The total must be the same capped member/arbiter plan that Fusion
+    // admission prices — not the old flat 3-leg catalog sum.
+    let expected = estimate_panel_cost(
+        &state,
+        &synthesize_config(None),
+        PanelAdmissionEstimate {
+            input_tokens: body["current"]["input_tokens_estimated"]
+                .as_u64()
+                .expect("preview input token estimate") as u32,
+            max_tokens: Some(100),
+            max_completion_tokens: None,
+            n: None,
+        },
+    )
+    .expect("priced static plan");
+    assert_same_cost(total.unwrap(), expected);
+
+    // The preview's budget comparison must never be mistaken for the real
+    // Fusion admission gate or runtime/provider readiness.
+    assert_eq!(panel["estimate_evidence"]["scope"], "preview_only");
+    assert_eq!(
+        panel["estimate_evidence"]["plan"],
+        "shared_static_cost_shape"
+    );
+    let estimate_reason = panel["estimate_evidence"]["reason"]
+        .as_str()
+        .expect("preview estimate evidence reason");
+    assert!(estimate_reason.contains("does not execute Fusion admission"));
+    assert!(estimate_reason.contains("not a cost reservation"));
+    assert!(estimate_reason.contains("runtime spend ceiling"));
+
     // CRITICAL: zero upstream calls — /v1/preview must remain side-effect-free.
     let dispatches = calls.load(Ordering::Relaxed);
     assert_eq!(
@@ -275,7 +345,7 @@ async fn preview_panel_returns_estimate_with_zero_dispatch() {
 
 #[tokio::test]
 async fn preview_panel_unpriceable_member_fails_closed_with_zero_dispatch() {
-    let (app, calls) = app_two_priced_members();
+    let (app, calls, _state) = app_two_priced_members();
 
     let req = Request::builder()
         .method("POST")
@@ -347,12 +417,189 @@ async fn preview_panel_unpriceable_member_fails_closed_with_zero_dispatch() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3 (optional): no panel header ⇒ response has no `panel` key.
+// Test 3: a body cap, modern output-cap precedence, and multi-choice member
+//         dispatch all use the shared static plan. Still zero dispatch.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn preview_panel_matches_static_plan_for_caps_choices_and_body_budget() {
+    let (app, calls, state) = app_two_priced_members();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/preview")
+        .header("content-type", "application/json")
+        .header("x-tokentrimmer-panel", "synthesize")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "Plan this request." }],
+                "max_tokens": 1,
+                "max_completion_tokens": 1000,
+                "n": 2,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["gpt-4o", "gpt-4o-mini"],
+                        "arbiter_model": "gpt-4o",
+                        "max_cost_usd": 999.0
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let panel = &body["panel"];
+    let total = panel["total_estimated_cost_usd"]
+        .as_f64()
+        .expect("priced static plan must have a total");
+
+    let input_tokens = body["current"]["input_tokens_estimated"]
+        .as_u64()
+        .expect("preview input token estimate") as u32;
+    let expected = estimate_panel_cost(
+        &state,
+        &synthesize_config(Some(999.0)),
+        PanelAdmissionEstimate {
+            input_tokens,
+            max_tokens: Some(1),
+            max_completion_tokens: Some(1000),
+            n: Some(2),
+        },
+    )
+    .expect("priced modern static plan");
+    assert_same_cost(total, expected);
+
+    let legacy_one_choice = estimate_panel_cost(
+        &state,
+        &synthesize_config(Some(999.0)),
+        PanelAdmissionEstimate {
+            input_tokens,
+            max_tokens: Some(1),
+            max_completion_tokens: None,
+            n: Some(1),
+        },
+    )
+    .expect("priced legacy static plan");
+    assert!(
+        total > legacy_one_choice,
+        "preview must honor max_completion_tokens precedence and all requested member choices: \
+         total={total}, legacy_one_choice={legacy_one_choice}"
+    );
+
+    // No cost-limit header was sent. A resolved panel body budget is the
+    // admission-compatible fallback for this dry-run comparison.
+    assert_eq!(panel["within_budget"], true);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: an uncapped request cannot produce a static Fusion total. Still
+//         zero dispatch.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn preview_panel_missing_output_cap_fails_closed_with_zero_dispatch() {
+    let (app, calls, _state) = app_two_priced_members();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/preview")
+        .header("content-type", "application/json")
+        .header("x-tokentrimmer-panel", "synthesize")
+        .header("x-tokentrimmer-cost-limit-usd", "999.0")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "hello" }],
+                "tt_extras": {
+                    "panel": {
+                        "members": ["gpt-4o", "gpt-4o-mini"],
+                        "arbiter_model": "gpt-4o"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let panel = &body["panel"];
+
+    assert!(
+        panel["total_estimated_cost_usd"].is_null(),
+        "an uncapped Fusion plan must not pretend to have a bounded total: {panel}"
+    );
+    assert_eq!(panel["within_budget"], false);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: Majority's unrepresented embedding work has no static pricing
+//         contract, so preview fails closed rather than pricing the unused
+//         LLM arbiter field. Still zero dispatch.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn preview_panel_majority_fails_closed_for_unpriced_embedding_work() {
+    let (app, calls, _state) = app_two_priced_members();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/preview")
+        .header("content-type", "application/json")
+        .header("x-tokentrimmer-panel", "majority")
+        .header("x-tokentrimmer-cost-limit-usd", "999.0")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "hello" }],
+                "max_tokens": 100,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["gpt-4o", "gpt-4o-mini"],
+                        "arbiter_model": "gpt-4o"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let panel = &body["panel"];
+
+    assert!(
+        panel["arbiter"]["estimated_cost_usd"].is_null(),
+        "Majority must not price the unused LLM arbiter as an embedding proxy: {panel}"
+    );
+    assert!(panel["total_estimated_cost_usd"].is_null());
+    assert_eq!(panel["within_budget"], false);
+    assert!(
+        panel["members"]
+            .as_array()
+            .expect("members array")
+            .iter()
+            .all(|member| member["estimated_cost_usd"].is_number()),
+        "known member work can remain individually visible while total fails closed: {panel}"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: no panel header ⇒ response has no `panel` key.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn preview_without_panel_header_has_no_panel_key() {
-    let (app, calls) = app_two_priced_members();
+    let (app, calls, _state) = app_two_priced_members();
 
     let req = Request::builder()
         .method("POST")

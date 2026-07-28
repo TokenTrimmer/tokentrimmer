@@ -1,13 +1,13 @@
 # TokenTrimmer
 
-> TokenTrimmer is a gateway for LLM APIs (OpenAI-compatible, Anthropic-native, + Gemini) that routes, caches, compresses, and meters every request — reducing what you spend and signing every saving as a receipt you can verify offline. "They observe, we reduce AND prove."
+> TokenTrimmer is a gateway for LLM APIs (OpenAI-compatible, Anthropic-native, + Gemini) that routes, caches, compresses, and meters every request. Eligible events can be minted on demand as tamper-evident signed estimates that you can verify offline; they are not universal receipt or provider-invoice proof.
 
 The gateway is open source (Apache-2.0); `cargo install tt-cli` works. The hosted service adds the dashboard, billing, the durable Postgres + cache, and the cloud admin endpoints (signing, attestations).
 
 ## Key concepts
-- The proof-of-savings moat: a Verifiable Compression Receipt (VCR) — an Ed25519 signature over `vcr:v1|<org>|<trace>|<route>|<model>|<token_delta>|<savings_micros>|<ts>`, verifiable offline with `tt verify-receipt --receipt <json> --key-hex <hex>`.
+- Receipt evidence for eligible events: a Verifiable Compression Receipt (VCR) — an Ed25519 signature over `vcr:v1|<org>|<trace>|<route>|<model>|<token_delta>|<savings_micros>|<ts>`, mintable on demand and verifiable offline with `tt verify-receipt --receipt <json> --key-hex <hex>`. Signature verification does not independently prove issuer identity, savings math, or provider-invoice reconciliation.
 - Two cost gates: the runtime `$` cap + kill-switch (`monthly_cap_usd` + `CircuitBreaker`) AND the PR-time `budgets.toml` cost-gate (`tt inspect`).
-- "They observe, we reduce AND prove" — the honest differentiator vs Helicone/LiteLLM/Portkey.
+- The differentiator is explicitly bounded evidence: catalog-priced gateway estimates and eligible, on-demand tamper-evident signed payloads, not automatic economic or invoice proof.
 
 ## API references (the gateway's `/v1/*` surface)
 - [Coding agents — cap your Claude Code / Cursor spend](docs/coding-agents.md): the `/v1/messages` Anthropic-native ingress.
@@ -26,7 +26,7 @@ The gateway is open source (Apache-2.0); `cargo install tt-cli` works. The hoste
 - `POST /v1/preview` — offline cost preview (no LLM call; projects the cost + savings + route suggestions).
 - `POST /v1/agent/runs` — create + run an agentic loop (per-turn cost, runaway detector). `stream:true` → SSE.
 - `GET /v1/agent/runs` — list runs. `GET /v1/agent/runs/:id` — fetch. `POST /v1/agent/runs/:id/tool_outputs` — resume.
-- `GET /v1/routes` / `POST /v1/routes` — routing rules CRUD. `GET /v1/routes/:id` / `DELETE`. `POST /v1/routes/:id/pause` / `resume`. `GET /v1/routes/:id/savings`.
+- `GET /v1/routes` / `POST /v1/routes` — routing rules CRUD. `GET /v1/routes/:id` / `DELETE /v1/routes/:id?expected_revision=N`. `POST /v1/routes/:id/pause?expected_revision=N` / `POST /v1/routes/:id/resume?expected_revision=N`. `GET /v1/routes/:id/savings`.
 - `GET /v1/spend` — spend-today + MTD + budget-remaining. `POST /v1/spend/limit` — set/clear the monthly cap.
 - `POST /v1/workflows` (CRUD) + `POST /v1/workflows/:id/estimate` (offline cost preview) + `POST /v1/workflows/:id/runs` (run; SSE).
 - `POST /v1/files` / `GET /v1/files/:id/content` / `POST /v1/batches` / `GET /v1/batches/:id` / `POST /v1/batches/:id/cancel` — the Batch Lane (OpenAI-compatible).

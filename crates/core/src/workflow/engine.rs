@@ -31,12 +31,14 @@
 //!
 //! # Budget cap
 //!
-//! Before each Model or Agent node the engine calls
-//! `budget_reached(accrued, run_max_cost_usd)`.  If the cap is already met the
-//! run stops with `WfStatus::BudgetExhausted` without invoking the executor.
-//! The budget cap is purely accrued-cost-based (no look-ahead estimate) so that
-//! any node that exceeds the cap on its own still records a run; the NEXT node
-//! is what gets blocked.
+//! A capped Model/Agent wave is serialized. Before each launch the engine
+//! reserves the shared preview estimate when the node has the exact priceable
+//! single-turn shape, then settles the reservation against actual node cost
+//! before considering its sibling. If the cap is already met or the next
+//! reservation does not fit, the run stops with `WfStatus::BudgetExhausted`
+//! without invoking that node. A started node's routed provider work can still
+//! settle above its directional estimate; provider/invoice hard-ceiling work
+//! remains separate.
 //!
 //! # Branch reachability
 //!
@@ -48,14 +50,17 @@
 //!
 //! # Limitations (W1a MVP)
 //!
-//! - Model/Agent nodes in the same wave run concurrently (W3a-1 Task 2);
-//!   control nodes (Trigger, Transform, Branch, Output) are always sequential.
+//! - Uncapped Model/Agent nodes in the same wave run concurrently (W3a-1 Task
+//!   2); capped waves serialize reservation/settlement. Control nodes (Trigger,
+//!   Transform, Branch, Output) are always sequential.
 //! - A single explicit `def.edges` arc from a Branch node is treated as
 //!   unconditional; avoid adding explicit outgoing edges from Branch nodes.
 //! - The topo order is defensive: if validate somehow missed a cycle the engine
 //!   returns `WfStatus::Failed` rather than looping.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
@@ -68,10 +73,13 @@ use uuid::Uuid;
 use crate::routes::agent_run_budget::budget_reached;
 use crate::workflow::distill_cache::{CachedDistill, DistillCacheKey};
 pub(crate) use crate::workflow::distill_cache::{DistillCacheStore, FlowDocDistillCache, NoCache};
+use crate::workflow::environment_variables::required_variable_names;
 use crate::workflow::events::WfEvent;
-use crate::workflow::executor::{IntelligenceSpec, NodeExecutor};
+use crate::workflow::executor::{reservation_cost_usd, IntelligenceSpec, NodeExecutor};
 use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
+use crate::workflow::preflight::{prepare_workflow_tree, PreparedWorkflowTree};
 use crate::workflow::schedule;
+use crate::workflow::secrets::required_secret_names;
 use crate::workflow::types::{ModelSelection, Node, NodeKind, NodeOutput, WorkflowDefinition};
 
 // ---------------------------------------------------------------------------
@@ -86,7 +94,7 @@ pub(crate) enum WfStatus {
     BudgetExhausted,
 }
 
-/// Returned by [`run_workflow`].
+/// Returned by [`run_workflow_with_variables`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WorkflowRunResult {
     pub status: WfStatus,
@@ -113,6 +121,10 @@ pub(crate) struct NodeJournalEntry {
     pub cost_usd: f64,
     pub model_used: Option<String>,
     pub error: Option<String>,
+    /// Gateway workflow-node envelope timing. For intelligence nodes this
+    /// spans the executor call, not individual provider attempts.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: chrono::DateTime<chrono::Utc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,12 +143,47 @@ const MAX_SUBWORKFLOW_DEPTH: u32 = 5;
 /// 50-node, depth-3, 10-iter workflow uses ≤ 5 050 nodes. Adjust upward if
 /// product requirements change.
 const MAX_TOTAL_NODE_EXECUTIONS: u32 = 10_000;
+#[cfg(test)]
+static EMPTY_WORKFLOW_VARIABLES: LazyLock<BTreeMap<String, String>> = LazyLock::new(BTreeMap::new);
 
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
-/// Run a validated [`WorkflowDefinition`] to completion.
+/// Run a validated [`WorkflowDefinition`] without environment variables.
+/// Environment-bound callers use [`run_workflow_with_variables`] so an exact
+/// accepted configuration snapshot is threaded through the whole run tree.
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub(crate) fn run_workflow<'a>(
+    executor: &'a dyn NodeExecutor,
+    def: &'a WorkflowDefinition,
+    inputs: &'a serde_json::Value,
+    run_max_cost_usd: Option<f64>,
+    journal: impl FnMut(NodeJournalEntry) + Send + 'a,
+    events: Option<&'a tokio::sync::mpsc::UnboundedSender<WfEvent>>,
+    secrets: &'a HashMap<String, SecretString>,
+    depth: u32,
+    ancestors: &'a [Uuid],
+    cache: &'a dyn DistillCacheStore,
+) -> BoxFuture<'a, WorkflowRunResult> {
+    run_workflow_with_variables(
+        executor,
+        def,
+        inputs,
+        run_max_cost_usd,
+        journal,
+        events,
+        secrets,
+        &EMPTY_WORKFLOW_VARIABLES,
+        depth,
+        ancestors,
+        cache,
+    )
+}
+
+/// Run a validated [`WorkflowDefinition`] to completion with an immutable map
+/// of non-secret environment variables accepted by the route.
 ///
 /// `executor` provides the Model/Agent node bridge to the gateway.
 /// `inputs` is the workflow's trigger payload.
@@ -152,7 +199,7 @@ const MAX_TOTAL_NODE_EXECUTIONS: u32 = 10_000;
 /// Boxes the journal to type-erase it before delegating to
 /// [`run_workflow_boxed`], which is the concrete (non-generic) recursive impl.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_workflow<'a>(
+pub(crate) fn run_workflow_with_variables<'a>(
     executor: &'a dyn NodeExecutor,
     def: &'a WorkflowDefinition,
     inputs: &'a serde_json::Value,
@@ -160,27 +207,67 @@ pub(crate) fn run_workflow<'a>(
     journal: impl FnMut(NodeJournalEntry) + Send + 'a,
     events: Option<&'a tokio::sync::mpsc::UnboundedSender<WfEvent>>,
     secrets: &'a HashMap<String, SecretString>,
+    variables: &'a BTreeMap<String, String>,
     depth: u32,
     ancestors: &'a [Uuid],
     cache: &'a dyn DistillCacheStore,
 ) -> BoxFuture<'a, WorkflowRunResult> {
-    // Seed a fresh execution counter at the root. The Arc is cloned into every
-    // recursive `run_workflow_boxed` call so all nested loops and sub-workflows
-    // draw from ONE shared budget.
-    let executions = Arc::new(AtomicU32::new(0));
-    run_workflow_boxed(
-        executor,
-        def,
-        inputs,
-        run_max_cost_usd,
-        Box::new(journal),
-        events,
-        secrets,
-        depth,
-        ancestors,
-        executions,
-        cache,
-    )
+    Box::pin(async move {
+        // Load, secret-check, and freeze every nested definition before the
+        // root Trigger or any parent work. Runtime recursion reuses this exact
+        // tree, avoiding a latest-version race after preflight.
+        let prepared = match prepare_workflow_tree(
+            executor,
+            def,
+            secrets,
+            variables,
+            depth,
+            MAX_SUBWORKFLOW_DEPTH,
+        )
+        .await
+        {
+            Ok(tree) => Arc::new(tree),
+            Err(error) => {
+                if let Some(tx) = events {
+                    let _ = tx.send(WfEvent::RunDone {
+                        status: "failed".to_string(),
+                        cost_usd: 0.0,
+                        baseline_cost_usd: 0.0,
+                        saved_usd: 0.0,
+                    });
+                }
+                return WorkflowRunResult {
+                    status: WfStatus::Failed,
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                    node_outputs: vec![],
+                    error: Some(error),
+                };
+            }
+        };
+
+        // Seed a fresh execution counter at the root. The Arc is cloned into
+        // every recursive call so all nested loops and sub-workflows draw from
+        // ONE shared budget.
+        let executions = Arc::new(AtomicU32::new(0));
+        run_workflow_boxed(
+            executor,
+            def,
+            inputs,
+            run_max_cost_usd,
+            Box::new(journal),
+            events,
+            secrets,
+            variables,
+            prepared,
+            depth,
+            ancestors,
+            executions,
+            cache,
+        )
+        .await
+    })
 }
 
 /// Private recursive implementation.  Takes an OWNED `Box<dyn FnMut + Send + 'a>`
@@ -197,6 +284,8 @@ fn run_workflow_boxed<'a>(
     journal: Box<dyn FnMut(NodeJournalEntry) + Send + 'a>,
     events: Option<&'a tokio::sync::mpsc::UnboundedSender<WfEvent>>,
     secrets: &'a HashMap<String, SecretString>,
+    variables: &'a BTreeMap<String, String>,
+    prepared: Arc<PreparedWorkflowTree>,
     depth: u32,
     ancestors: &'a [Uuid],
     executions: Arc<AtomicU32>,
@@ -210,7 +299,105 @@ fn run_workflow_boxed<'a>(
                 let _ = tx.send(ev);
             }
         };
-        // ---- 1. Find the Trigger node -----------------------------------------
+
+        // ---- 1. Defense-in-depth local Http secret preflight -----------------
+        // Whole-tree preparation already checked and froze every definition
+        // before the root began. Retain the local check as an invariant at each
+        // recursive boundary.
+        let required_secrets = match required_secret_names(def) {
+            Ok(names) => names,
+            Err(errors) => {
+                emit(WfEvent::RunDone {
+                    status: "failed".to_string(),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                });
+                return WorkflowRunResult {
+                    status: WfStatus::Failed,
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                    node_outputs: vec![],
+                    error: Some(format!(
+                        "workflow secret preflight failed: {}",
+                        errors.join("; ")
+                    )),
+                };
+            }
+        };
+        let missing_secrets = required_secrets
+            .into_iter()
+            .filter(|name| !secrets.contains_key(name))
+            .collect::<Vec<_>>();
+        if !missing_secrets.is_empty() {
+            emit(WfEvent::RunDone {
+                status: "failed".to_string(),
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+            });
+            return WorkflowRunResult {
+                status: WfStatus::Failed,
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+                node_outputs: vec![],
+                error: Some(format!(
+                    "workflow secret preflight failed: missing or unusable secret(s): {}",
+                    missing_secrets.join(", ")
+                )),
+            };
+        }
+
+        // ---- 1b. Defense-in-depth local variable preflight -----------------
+        let required_variables = match required_variable_names(def) {
+            Ok(names) => names,
+            Err(errors) => {
+                emit(WfEvent::RunDone {
+                    status: "failed".to_string(),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                });
+                return WorkflowRunResult {
+                    status: WfStatus::Failed,
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                    node_outputs: vec![],
+                    error: Some(format!(
+                        "workflow variable preflight failed: {}",
+                        errors.join("; ")
+                    )),
+                };
+            }
+        };
+        let missing_variables = required_variables
+            .into_iter()
+            .filter(|name| !variables.contains_key(name))
+            .collect::<Vec<_>>();
+        if !missing_variables.is_empty() {
+            emit(WfEvent::RunDone {
+                status: "failed".to_string(),
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+            });
+            return WorkflowRunResult {
+                status: WfStatus::Failed,
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+                node_outputs: vec![],
+                error: Some(format!(
+                    "workflow variable preflight failed: missing environment variable(s): {}",
+                    missing_variables.join(", ")
+                )),
+            };
+        }
+
+        // ---- 2. Find the Trigger node -----------------------------------------
         let trigger_id = match def
             .nodes
             .iter()
@@ -235,10 +422,10 @@ fn run_workflow_boxed<'a>(
             }
         };
 
-        // ---- 2. Build union adjacency list ------------------------------------
+        // ---- 3. Build union adjacency list ------------------------------------
         let adj = build_union_adj(def);
 
-        // ---- 3. Topological sort (defensive; validate already checked) --------
+        // ---- 4. Topological sort (defensive; validate already checked) --------
         let topo_order = match topo_sort(def, &adj) {
             Ok(order) => order,
             Err(e) => {
@@ -259,10 +446,10 @@ fn run_workflow_boxed<'a>(
             }
         };
 
-        // ---- 4. Node lookup map -----------------------------------------------
+        // ---- 5. Node lookup map -----------------------------------------------
         let node_map: HashMap<&str, &Node> = def.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
-        // ---- 5. Run state -------------------------------------------------------
+        // ---- 6. Run state -------------------------------------------------------
         let mut outputs: HashMap<String, NodeOutput> = HashMap::new();
         let mut collected_outputs: Vec<(String, NodeOutput)> = Vec::new();
         let mut accrued: f64 = 0.0;
@@ -332,16 +519,8 @@ fn run_workflow_boxed<'a>(
                         )),
                     };
                 }
-                // HARD BUDGET GATE — checked once before launching any node in the wave.
-                //
-                // GUARANTEE: no Model/Agent node is ever LAUNCHED when accrued >= cap.
-                // OVERSHOOT BOUND: if the gate passes (accrued < cap), ALL nodes in
-                // the wave launch concurrently. Their individual costs are unknown
-                // pre-launch, so accrued may overshoot the cap by up to
-                // sum(launched-node costs) before the gate is re-checked at the start
-                // of the next wave. Per-node cost reservation is not attempted (costs
-                // are unknown until completion). This is the endorsed bound for
-                // concurrent execution; the guarantee is "never launch past cap".
+                // HARD BUDGET GATE — checked before building or launching the wave.
+                // Capped waves receive an additional per-node reservation below.
                 if budget_reached(accrued, run_max_cost_usd) {
                     let saved_usd = (accrued_baseline - accrued).max(0.0);
                     emit(WfEvent::RunDone {
@@ -375,6 +554,7 @@ fn run_workflow_boxed<'a>(
                         NodeKind::Model {
                             selection,
                             prompt,
+                            max_output_tokens,
                             max_cost_usd: node_cap,
                         } => {
                             if matches!(selection, ModelSelection::Auto) {
@@ -402,9 +582,10 @@ fn run_workflow_boxed<'a>(
                                 node_id.clone(),
                                 IntelligenceSpec {
                                     selection: selection.clone(),
-                                    prompt: substitute(prompt, &trigger_id, &outputs),
+                                    prompt: substitute(prompt, &trigger_id, &outputs, variables),
                                     tools: vec![],
                                     max_turns: 1,
+                                    max_output_tokens: *max_output_tokens,
                                     max_cost_usd: *node_cap,
                                 },
                             ));
@@ -413,6 +594,7 @@ fn run_workflow_boxed<'a>(
                             selection,
                             prompt,
                             max_turns,
+                            max_output_tokens,
                             max_cost_usd: node_cap,
                             tools,
                         } => {
@@ -441,9 +623,10 @@ fn run_workflow_boxed<'a>(
                                 node_id.clone(),
                                 IntelligenceSpec {
                                     selection: selection.clone(),
-                                    prompt: substitute(prompt, &trigger_id, &outputs),
+                                    prompt: substitute(prompt, &trigger_id, &outputs, variables),
                                     tools: tools.clone(),
                                     max_turns: max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+                                    max_output_tokens: *max_output_tokens,
                                     max_cost_usd: *node_cap,
                                 },
                             ));
@@ -452,15 +635,65 @@ fn run_workflow_boxed<'a>(
                     }
                 }
 
-                // Fix #4: emit NodeStart for all concurrent nodes BEFORE launch
-                // so streaming clients see every node start before any NodeDone.
-                for (node_id, _) in &specs {
-                    emit(WfEvent::NodeStart {
-                        node_id: node_id.clone(),
-                    });
-                }
-                // Run all specs concurrently; results returned in stable topo order.
-                let results = schedule::run_concurrent_model_wave(executor, &specs).await;
+                // Uncapped waves retain parallel execution. Capped waves launch
+                // in stable order so each node's preview reservation can be
+                // settled against actual cost before its sibling is considered.
+                // This removes sibling-wave overshoot; a started node's routed
+                // provider work may still settle above its reservation.
+                let mut reservation_blocked = false;
+                let results = if let Some(cap) = run_max_cost_usd {
+                    let mut settled_for_launch = accrued;
+                    let mut sequential = Vec::with_capacity(specs.len());
+                    for (node_id, spec) in &specs {
+                        if budget_reached(settled_for_launch, Some(cap)) {
+                            reservation_blocked = true;
+                            break;
+                        }
+                        let remaining = (cap - settled_for_launch).max(0.0);
+                        let dispatch_cap = spec
+                            .max_cost_usd
+                            .map_or(remaining, |node_cap| node_cap.min(remaining));
+                        if let Some(reserved) = reservation_cost_usd(spec) {
+                            if !reserved.is_finite() || reserved < 0.0 || reserved > dispatch_cap {
+                                reservation_blocked = true;
+                                break;
+                            }
+                        }
+                        let mut launch_spec = spec.clone();
+                        launch_spec.max_cost_usd = Some(dispatch_cap);
+                        emit(WfEvent::NodeStart {
+                            node_id: node_id.clone(),
+                        });
+                        let started_at = chrono::Utc::now();
+                        let outcome = executor.run_intelligence(node_id, &launch_spec).await;
+                        let finished_at = chrono::Utc::now();
+                        let failed = outcome.is_err();
+                        if let Ok(out) = &outcome {
+                            settled_for_launch += out.cost_usd;
+                        }
+                        sequential.push(schedule::ConcurrentNodeResult {
+                            node_id: node_id.clone(),
+                            started_at,
+                            finished_at,
+                            outcome,
+                        });
+                        if failed {
+                            // Unlike an uncapped concurrent wave, no sibling has
+                            // launched yet, so stop rather than creating more spend.
+                            break;
+                        }
+                    }
+                    sequential
+                } else {
+                    // Fix #4: emit NodeStart for all concurrent nodes BEFORE
+                    // launch so streaming clients see every start before a done.
+                    for (node_id, _) in &specs {
+                        emit(WfEvent::NodeStart {
+                            node_id: node_id.clone(),
+                        });
+                    }
+                    schedule::run_concurrent_model_wave(executor, &specs).await
+                };
 
                 // DETERMINISTIC FOLD: NodeDone events + journal entries emitted
                 // in stable topo order, never inside the concurrent futures.
@@ -470,11 +703,28 @@ fn run_workflow_boxed<'a>(
                 // attribute the failure to the offending node (red badge) before
                 // the terminal run.done — instead of leaving the node at "…" forever.
                 let mut wave_error: Option<(String, String)> = None;
-                for schedule::ConcurrentNodeResult { node_id, outcome } in results {
+                for schedule::ConcurrentNodeResult {
+                    node_id,
+                    started_at,
+                    finished_at,
+                    outcome,
+                } in results
+                {
                     match outcome {
                         Err(e) => {
+                            let message = format!("{e}");
+                            journal(NodeJournalEntry {
+                                node_id: node_id.clone(),
+                                status: "failed".into(),
+                                output: None,
+                                cost_usd: 0.0,
+                                model_used: None,
+                                error: Some(message.clone()),
+                                started_at,
+                                finished_at,
+                            });
                             if wave_error.is_none() {
-                                wave_error = Some((node_id.clone(), format!("{e}")));
+                                wave_error = Some((node_id.clone(), message));
                             }
                         }
                         Ok(out) => {
@@ -488,6 +738,8 @@ fn run_workflow_boxed<'a>(
                                 cost_usd: out.cost_usd,
                                 model_used: out.model_used.clone(),
                                 error: None,
+                                started_at,
+                                finished_at,
                             });
                             outputs.insert(node_id.clone(), out);
                             propagate_edges(&node_id, def, &mut reachable);
@@ -524,6 +776,23 @@ fn run_workflow_boxed<'a>(
                         saved_usd,
                         node_outputs: collected_outputs,
                         error: Some(format!("node \"{err_node_id}\" failed: {err_msg}")),
+                    };
+                }
+                if reservation_blocked {
+                    let saved_usd = (accrued_baseline - accrued).max(0.0);
+                    emit(WfEvent::RunDone {
+                        status: "budget_exhausted".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                    });
+                    return WorkflowRunResult {
+                        status: WfStatus::BudgetExhausted,
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                        node_outputs: collected_outputs,
+                        error: None,
                     };
                 }
             }
@@ -568,6 +837,7 @@ fn run_workflow_boxed<'a>(
                 emit(WfEvent::NodeStart {
                     node_id: node_id.clone(),
                 });
+                let node_started_at = chrono::Utc::now();
 
                 match &node.kind {
                     // ---------------------------------------------------------------
@@ -594,7 +864,7 @@ fn run_workflow_boxed<'a>(
 
                     // ---------------------------------------------------------------
                     NodeKind::Transform { expr } => {
-                        let value = substitute(expr, &trigger_id, &outputs);
+                        let value = substitute(expr, &trigger_id, &outputs, variables);
                         let out = NodeOutput {
                             content: serde_json::Value::String(value.clone()),
                             cost_usd: 0.0,
@@ -609,6 +879,8 @@ fn run_workflow_boxed<'a>(
                             cost_usd: 0.0,
                             model_used: None,
                             error: None,
+                            started_at: node_started_at,
+                            finished_at: chrono::Utc::now(),
                         });
                         outputs.insert(node_id.clone(), out);
                         propagate_edges(node_id, def, &mut reachable);
@@ -628,7 +900,7 @@ fn run_workflow_boxed<'a>(
                         when_true,
                         when_false,
                     } => {
-                        let taken = if eval_cond(cond, &trigger_id, &outputs) {
+                        let taken = if eval_cond(cond, &trigger_id, &outputs, variables) {
                             when_true.clone()
                         } else {
                             when_false.clone()
@@ -640,6 +912,8 @@ fn run_workflow_boxed<'a>(
                             cost_usd: 0.0,
                             model_used: None,
                             error: None,
+                            started_at: node_started_at,
+                            finished_at: chrono::Utc::now(),
                         });
                         // Chosen arm + any unconditional explicit edges from this node.
                         reachable.insert(taken.clone());
@@ -693,8 +967,13 @@ fn run_workflow_boxed<'a>(
                         // {{secrets.NAME}} refs resolve to real values on the wire spec.
                         // The resulting HttpReqSpec may contain secret values and MUST NOT
                         // be written to any journal, NodeOutput.content, or error string.
-                        let sub_url =
-                            wf_http::substitute_with_secrets(url, &trigger_id, &outputs, secrets);
+                        let sub_url = wf_http::substitute_with_secrets(
+                            url,
+                            &trigger_id,
+                            &outputs,
+                            secrets,
+                            variables,
+                        );
                         let sub_headers: Vec<(String, String)> = headers
                             .iter()
                             .map(|(k, v)| {
@@ -705,12 +984,19 @@ fn run_workflow_boxed<'a>(
                                         &trigger_id,
                                         &outputs,
                                         secrets,
+                                        variables,
                                     ),
                                 )
                             })
                             .collect();
                         let sub_body = body.as_ref().map(|b| {
-                            wf_http::substitute_with_secrets(b, &trigger_id, &outputs, secrets)
+                            wf_http::substitute_with_secrets(
+                                b,
+                                &trigger_id,
+                                &outputs,
+                                secrets,
+                                variables,
+                            )
                         });
 
                         let spec = HttpReqSpec {
@@ -746,6 +1032,8 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: None,
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
                                 });
                                 outputs.insert(node_id.clone(), out);
                                 propagate_edges(node_id, def, &mut reachable);
@@ -761,11 +1049,22 @@ fn run_workflow_boxed<'a>(
                             Err(e) => {
                                 // SECURITY: HttpError strings are sanitized (no url/headers/secrets).
                                 let saved_usd = (accrued_baseline - accrued).max(0.0);
+                                let message = format!("http error: {e}");
+                                journal(NodeJournalEntry {
+                                    node_id: node_id.clone(),
+                                    status: "failed".into(),
+                                    output: None,
+                                    cost_usd: 0.0,
+                                    model_used: None,
+                                    error: Some(message.clone()),
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
+                                });
                                 // WF-9: attribute the Http-node failure to the node
                                 // before the terminal run.done.
                                 emit(WfEvent::NodeError {
                                     node_id: node_id.clone(),
-                                    message: format!("http error: {e}"),
+                                    message: message.clone(),
                                 });
                                 emit(WfEvent::RunDone {
                                     status: "failed".to_string(),
@@ -779,7 +1078,7 @@ fn run_workflow_boxed<'a>(
                                     baseline_cost_usd: accrued_baseline,
                                     saved_usd,
                                     node_outputs: collected_outputs,
-                                    error: Some(format!("node \"{node_id}\": http error: {e}")),
+                                    error: Some(format!("node \"{node_id}\": {message}")),
                                 };
                             }
                         }
@@ -830,10 +1129,11 @@ fn run_workflow_boxed<'a>(
                                 error: Some("loop body cycle detected".into()),
                             };
                         }
-                        // c. Load body once (stable across iterations).
-                        let child_def = match executor.load_subworkflow(*body_workflow_id).await {
-                            Ok(d) => d,
-                            Err(e) => {
+                        // c. Reuse the exact body loaded during root preflight.
+                        let child_prepared = Arc::clone(&prepared);
+                        let child_def = match prepared.definition(body_workflow_id) {
+                            Some(definition) => definition,
+                            None => {
                                 let saved_usd = (accrued_baseline - accrued).max(0.0);
                                 emit(WfEvent::RunDone {
                                     status: "failed".to_string(),
@@ -847,10 +1147,9 @@ fn run_workflow_boxed<'a>(
                                     baseline_cost_usd: accrued_baseline,
                                     saved_usd,
                                     node_outputs: collected_outputs,
-                                    error: Some(format!(
-                                        "node \"{node_id}\": \
-                                         load_subworkflow error: {e}"
-                                    )),
+                                    error: Some(
+                                        "loop body missing from prepared workflow tree".into(),
+                                    ),
                                 };
                             }
                         };
@@ -868,7 +1167,7 @@ fn run_workflow_boxed<'a>(
                                 break;
                             }
                             // Cond checked BEFORE body (while-semantics).
-                            if !eval_cond(cond, &trigger_id, &outputs) {
+                            if !eval_cond(cond, &trigger_id, &outputs, variables) {
                                 break;
                             }
                             let remaining =
@@ -877,12 +1176,14 @@ fn run_workflow_boxed<'a>(
                             // events must not flood the parent stream.
                             let child = run_workflow_boxed(
                                 executor,
-                                &child_def,
+                                child_def,
                                 &iter_input,
                                 remaining,
                                 Box::new(|e: NodeJournalEntry| journal(e)),
                                 None,
                                 secrets,
+                                variables,
+                                Arc::clone(&child_prepared),
                                 depth + 1,
                                 &child_ancestors,
                                 Arc::clone(&executions),
@@ -954,6 +1255,8 @@ fn run_workflow_boxed<'a>(
                             cost_usd: loop_cost,
                             model_used: None,
                             error: None,
+                            started_at: node_started_at,
+                            finished_at: chrono::Utc::now(),
                         });
                         propagate_edges(node_id, def, &mut reachable);
                         emit(WfEvent::NodeDone {
@@ -1028,10 +1331,11 @@ fn run_workflow_boxed<'a>(
                                 error: Some("sub-workflow cycle detected".into()),
                             };
                         }
-                        // d. Load child definition.
-                        let child_def = match executor.load_subworkflow(*workflow_id).await {
-                            Ok(d) => d,
-                            Err(e) => {
+                        // d. Reuse the exact child loaded during root preflight.
+                        let child_prepared = Arc::clone(&prepared);
+                        let child_def = match prepared.definition(workflow_id) {
+                            Some(definition) => definition,
+                            None => {
                                 let saved_usd = (accrued_baseline - accrued).max(0.0);
                                 emit(WfEvent::RunDone {
                                     status: "failed".to_string(),
@@ -1045,10 +1349,9 @@ fn run_workflow_boxed<'a>(
                                     baseline_cost_usd: accrued_baseline,
                                     saved_usd,
                                     node_outputs: collected_outputs,
-                                    error: Some(format!(
-                                        "node \"{node_id}\": \
-                                     load_subworkflow error: {e}"
-                                    )),
+                                    error: Some(
+                                        "sub-workflow missing from prepared workflow tree".into(),
+                                    ),
                                 };
                             }
                         };
@@ -1061,12 +1364,14 @@ fn run_workflow_boxed<'a>(
                         // recursive call — no infinite instantiation.
                         let child = run_workflow_boxed(
                             executor,
-                            &child_def,
+                            child_def,
                             inputs,
                             remaining,
                             Box::new(|e: NodeJournalEntry| journal(e)),
                             events,
                             secrets,
+                            variables,
+                            child_prepared,
                             depth + 1,
                             &child_ancestors,
                             Arc::clone(&executions),
@@ -1121,6 +1426,8 @@ fn run_workflow_boxed<'a>(
                             cost_usd: out.cost_usd,
                             model_used: None,
                             error: None,
+                            started_at: node_started_at,
+                            finished_at: chrono::Utc::now(),
                         });
                         outputs.insert(node_id.clone(), out);
                         propagate_edges(node_id, def, &mut reachable);
@@ -1163,6 +1470,8 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: Some(err.to_string()),
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
                                 });
                                 let out = NodeOutput {
                                     content: serde_json::Value::Null,
@@ -1193,7 +1502,7 @@ fn run_workflow_boxed<'a>(
                         // the org_id + scopes its get/upsert to that org.
                         let caller_key = cache_key
                             .as_ref()
-                            .map(|k| substitute(k, &trigger_id, &outputs));
+                            .map(|k| substitute(k, &trigger_id, &outputs, variables));
                         let content_hash = blake3::hash(data_b64.as_bytes()).to_hex().to_string();
                         let key = DistillCacheKey {
                             content_hash,
@@ -1210,6 +1519,8 @@ fn run_workflow_boxed<'a>(
                                 cost_usd: 0.0,
                                 model_used: None,
                                 error: None,
+                                started_at: node_started_at,
+                                finished_at: chrono::Utc::now(),
                             });
                             let out = NodeOutput {
                                 content,
@@ -1271,6 +1582,8 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: None,
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
                                 });
                                 NodeOutput {
                                     content,
@@ -1290,6 +1603,8 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: Some(err.to_string()),
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
                                 });
                                 NodeOutput {
                                     content: serde_json::Value::Null,
@@ -1444,7 +1759,12 @@ fn propagate_edges(node_id: &str, def: &WorkflowDefinition, reachable: &mut Hash
 
 /// Substitute `{{...}}` references in `template` using the accumulated node
 /// outputs.  `trigger_id` is the canonical name for the `{{input}}` alias.
-fn substitute(template: &str, trigger_id: &str, outputs: &HashMap<String, NodeOutput>) -> String {
+fn substitute(
+    template: &str,
+    trigger_id: &str,
+    outputs: &HashMap<String, NodeOutput>,
+    variables: &BTreeMap<String, String>,
+) -> String {
     let mut result = String::with_capacity(template.len() + 16);
     let mut remaining = template;
 
@@ -1454,7 +1774,7 @@ fn substitute(template: &str, trigger_id: &str, outputs: &HashMap<String, NodeOu
 
         if let Some(close) = remaining.find("}}") {
             let ref_str = remaining[..close].trim();
-            let resolved = resolve_ref(ref_str, trigger_id, outputs);
+            let resolved = resolve_ref(ref_str, trigger_id, outputs, variables);
             result.push_str(&resolved);
             remaining = &remaining[close + 2..];
         } else {
@@ -1476,7 +1796,12 @@ fn substitute(template: &str, trigger_id: &str, outputs: &HashMap<String, NodeOu
 ///   Secrets are resolved exclusively in `wf_http::substitute_with_secrets` so
 ///   that Model/Agent prompts, Transform exprs, and Branch conditions are always
 ///   secret-free.
-fn resolve_ref(ref_str: &str, trigger_id: &str, outputs: &HashMap<String, NodeOutput>) -> String {
+fn resolve_ref(
+    ref_str: &str,
+    trigger_id: &str,
+    outputs: &HashMap<String, NodeOutput>,
+    variables: &BTreeMap<String, String>,
+) -> String {
     // Split on the first `.` to allow `node.field`.
     let (node_part, field_part) = match ref_str.find('.') {
         Some(pos) => (&ref_str[..pos], Some(&ref_str[pos + 1..])),
@@ -1489,6 +1814,12 @@ fn resolve_ref(ref_str: &str, trigger_id: &str, outputs: &HashMap<String, NodeOu
     // "the secret is an empty string").
     if node_part == "secrets" {
         return "***".to_string();
+    }
+    if node_part == "variables" {
+        return field_part
+            .and_then(|name| variables.get(name))
+            .cloned()
+            .unwrap_or_default();
     }
 
     // `{{input}}` is an alias for the Trigger node.
@@ -1535,23 +1866,28 @@ fn json_to_string(v: &serde_json::Value) -> String {
 /// - `{{ref}} != "literal"` — string inequality.
 /// - `{{ref}}` — truthiness: non-empty / non-`"false"` / non-`"null"` /
 ///   non-`"0"` string.
-fn eval_cond(cond: &str, trigger_id: &str, outputs: &HashMap<String, NodeOutput>) -> bool {
+fn eval_cond(
+    cond: &str,
+    trigger_id: &str,
+    outputs: &HashMap<String, NodeOutput>,
+    variables: &BTreeMap<String, String>,
+) -> bool {
     let cond = cond.trim();
 
     if let Some((lhs, rhs)) = cond.split_once(" == ") {
-        let lhs_val = substitute(lhs.trim(), trigger_id, outputs);
+        let lhs_val = substitute(lhs.trim(), trigger_id, outputs, variables);
         let rhs_val = strip_quotes(rhs.trim());
         return lhs_val == rhs_val;
     }
 
     if let Some((lhs, rhs)) = cond.split_once(" != ") {
-        let lhs_val = substitute(lhs.trim(), trigger_id, outputs);
+        let lhs_val = substitute(lhs.trim(), trigger_id, outputs, variables);
         let rhs_val = strip_quotes(rhs.trim());
         return lhs_val != rhs_val;
     }
 
     // Truthiness fallback.
-    let resolved = substitute(cond, trigger_id, outputs);
+    let resolved = substitute(cond, trigger_id, outputs, variables);
     is_truthy(&resolved)
 }
 
@@ -1596,6 +1932,12 @@ mod tests {
         responses: HashMap<String, NodeOutput>,
         /// Append-only call log: (node_id, prompt).
         calls: std::sync::Mutex<Vec<(String, String)>>,
+        /// Per-node completion caps captured from the engine's intelligence
+        /// specs before an executor/provider path sees them.
+        output_caps: std::sync::Mutex<Vec<(String, Option<u32>)>>,
+        /// Effective per-node cost caps after the engine applies remaining run
+        /// budget. This is the value the gateway dispatch guard receives.
+        cost_caps: std::sync::Mutex<Vec<(String, Option<f64>)>>,
         /// workflow_id → WorkflowDefinition registry for sub-workflow loading tests.
         subworkflows: HashMap<Uuid, WorkflowDefinition>,
     }
@@ -1608,6 +1950,8 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v))
                     .collect(),
                 calls: std::sync::Mutex::new(Vec::new()),
+                output_caps: std::sync::Mutex::new(Vec::new()),
+                cost_caps: std::sync::Mutex::new(Vec::new()),
                 subworkflows: HashMap::new(),
             }
         }
@@ -1624,6 +1968,14 @@ mod tests {
         fn calls(&self) -> Vec<(String, String)> {
             self.calls.lock().unwrap().clone()
         }
+
+        fn output_caps(&self) -> Vec<(String, Option<u32>)> {
+            self.output_caps.lock().unwrap().clone()
+        }
+
+        fn cost_caps(&self) -> Vec<(String, Option<f64>)> {
+            self.cost_caps.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -1637,6 +1989,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((node_id.to_string(), spec.prompt.clone()));
+            self.output_caps
+                .lock()
+                .unwrap()
+                .push((node_id.to_string(), spec.max_output_tokens));
+            self.cost_caps
+                .lock()
+                .unwrap()
+                .push((node_id.to_string(), spec.max_cost_usd));
             self.responses
                 .get(node_id)
                 .cloned()
@@ -1672,6 +2032,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1682,6 +2043,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{m1}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1741,6 +2103,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "yes path".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1751,6 +2114,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "no path".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1808,6 +2172,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{tr}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1899,6 +2264,72 @@ mod tests {
         // m1 and m2 each emit one journal entry (Trigger and Output do not).
         let node_ids: Vec<_> = journal_entries.iter().map(|e| e.node_id.as_str()).collect();
         assert_eq!(node_ids, vec!["m1", "m2"]);
+        assert!(journal_entries
+            .iter()
+            .all(|entry| entry.finished_at >= entry.started_at));
+    }
+
+    #[tokio::test]
+    async fn model_and_agent_output_caps_reach_the_executor_intelligence_specs() {
+        let mut def = make_sequential_def();
+        def.nodes[1].kind = NodeKind::Agent {
+            selection: ModelSelection::Model {
+                model: "stub-model".into(),
+            },
+            prompt: "{{input}}".into(),
+            max_turns: Some(1),
+            max_output_tokens: Some(23),
+            max_cost_usd: None,
+            tools: vec![],
+        };
+        if let NodeKind::Model {
+            max_output_tokens, ..
+        } = &mut def.nodes[2].kind
+        {
+            *max_output_tokens = Some(41);
+        }
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("response_1"),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    model_used: Some("stub-model".into()),
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("response_2"),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    model_used: Some("stub-model".into()),
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hello"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        assert_eq!(
+            stub.output_caps(),
+            vec![("m1".into(), Some(23)), ("m2".into(), Some(41))]
+        );
     }
 
     /// budget_cap: after m1 (cost 0.25) the cap of 0.20 is exceeded;
@@ -2070,7 +2501,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(substitute("hello {{input}}", "t", &outputs), "hello world");
+        assert_eq!(
+            substitute("hello {{input}}", "t", &outputs, &BTreeMap::new()),
+            "hello world"
+        );
     }
 
     #[test]
@@ -2083,13 +2517,37 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(substitute("{{n1.answer}}", "t", &outputs), "42");
+        assert_eq!(
+            substitute("{{n1.answer}}", "t", &outputs, &BTreeMap::new()),
+            "42"
+        );
     }
 
     #[test]
     fn substitute_missing_ref_is_empty() {
         let outputs = HashMap::new();
-        assert_eq!(substitute("{{missing}}", "t", &outputs), "");
+        assert_eq!(
+            substitute("{{missing}}", "t", &outputs, &BTreeMap::new()),
+            ""
+        );
+    }
+
+    #[test]
+    fn substitute_resolves_exact_environment_variable() {
+        let variables = BTreeMap::from([("REGION".into(), "us-east".into())]);
+        assert_eq!(
+            substitute(
+                "deploy {{variables.REGION}}",
+                "t",
+                &HashMap::new(),
+                &variables,
+            ),
+            "deploy us-east"
+        );
+        assert_eq!(
+            substitute("{{variables.MISSING}}", "t", &HashMap::new(), &variables,),
+            ""
+        );
     }
 
     #[test]
@@ -2102,7 +2560,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(eval_cond(r#"{{input}} == "yes""#, "t", &outputs));
+        assert!(eval_cond(
+            r#"{{input}} == "yes""#,
+            "t",
+            &outputs,
+            &BTreeMap::new()
+        ));
     }
 
     #[test]
@@ -2115,7 +2578,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!eval_cond(r#"{{input}} == "yes""#, "t", &outputs));
+        assert!(!eval_cond(
+            r#"{{input}} == "yes""#,
+            "t",
+            &outputs,
+            &BTreeMap::new()
+        ));
     }
 
     #[test]
@@ -2128,7 +2596,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(eval_cond("{{input}}", "t", &outputs));
+        assert!(eval_cond("{{input}}", "t", &outputs, &BTreeMap::new()));
     }
 
     #[test]
@@ -2141,7 +2609,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!eval_cond("{{input}}", "t", &outputs));
+        assert!(!eval_cond("{{input}}", "t", &outputs, &BTreeMap::new()));
     }
 
     // ---- Task 4: engine sums baseline + computes saved ----------------------
@@ -2487,6 +2955,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2497,6 +2966,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2857,7 +3327,175 @@ mod tests {
         );
     }
 
-    /// Hard-budget gate under concurrency.
+    /// A capped wave reserves and settles nodes one at a time. The first node's
+    /// realized cost leaves less than the second node's priceable reservation,
+    /// so the sibling is never launched. Before reservation both siblings ran
+    /// concurrently and the wave could settle above the shared cap.
+    #[tokio::test]
+    async fn capped_wave_settles_before_reserving_the_next_sibling() {
+        let mut def = make_diamond_def(); // t → {mb, mc} → out
+        for node in &mut def.nodes {
+            if let NodeKind::Model {
+                selection,
+                max_output_tokens,
+                ..
+            } = &mut node.kind
+            {
+                *selection = ModelSelection::Model {
+                    model: "gpt-4o-mini".into(),
+                };
+                *max_output_tokens = Some(64);
+            }
+        }
+        let stub = StubExecutor::new(vec![
+            (
+                "mb",
+                NodeOutput {
+                    content: json!("b"),
+                    cost_usd: 0.499_999_9,
+                    baseline_cost_usd: 0.5,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+            (
+                "mc",
+                NodeOutput {
+                    content: json!("c"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.05,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            Some(0.5),
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::BudgetExhausted);
+        assert!((result.cost_usd - 0.499_999_9).abs() < 1e-12);
+        assert_eq!(
+            stub.called_nodes(),
+            vec!["mb"],
+            "mc must not launch after mb settlement leaves too little for its reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_wave_passes_each_node_the_actual_remaining_run_value() {
+        let mut def = make_diamond_def();
+        for node in &mut def.nodes {
+            if let NodeKind::Model {
+                selection,
+                max_output_tokens,
+                ..
+            } = &mut node.kind
+            {
+                *selection = ModelSelection::Model {
+                    model: "gpt-4o-mini".into(),
+                };
+                *max_output_tokens = Some(64);
+            }
+        }
+        let stub = StubExecutor::new(vec![
+            (
+                "mb",
+                NodeOutput {
+                    content: json!("b"),
+                    cost_usd: 0.25,
+                    baseline_cost_usd: 0.25,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+            (
+                "mc",
+                NodeOutput {
+                    content: json!("c"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.10,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            Some(0.5),
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        assert_eq!(stub.called_nodes(), vec!["mb", "mc"]);
+        assert_eq!(
+            stub.cost_caps(),
+            vec![
+                ("mb".to_string(), Some(0.5)),
+                ("mc".to_string(), Some(0.25)),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_wave_does_not_launch_a_node_whose_own_cap_cannot_fit_it() {
+        let mut def = make_sequential_def();
+        for node in &mut def.nodes {
+            if let NodeKind::Model {
+                selection,
+                max_output_tokens,
+                max_cost_usd,
+                ..
+            } = &mut node.kind
+            {
+                *selection = ModelSelection::Model {
+                    model: "gpt-4o-mini".into(),
+                };
+                *max_output_tokens = Some(64);
+                *max_cost_usd = Some(0.000_000_001);
+            }
+        }
+        let stub = StubExecutor::new(vec![]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            Some(1.0),
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::BudgetExhausted);
+        assert!(stub.called_nodes().is_empty());
+    }
+
+    /// Hard-budget gate before a capped wave.
     ///
     /// A "prior" node brings accrued to exactly the cap (1.0).  The next wave
     /// contains 3 Model nodes each costing 0.40.  The gate fires BEFORE
@@ -2865,8 +3503,6 @@ mod tests {
     ///
     /// # Gate guarantee
     /// No Model/Agent node is ever launched when `accrued >= run_max_cost_usd`.
-    /// Overshoot is bounded by the costs of nodes launched while `accrued < cap`
-    /// (pre-launch costs are unknown, so all-or-nothing per wave is enforced).
     #[tokio::test]
     async fn hard_budget_under_concurrency() {
         // Workflow: t → prior → {n1, n2, n3} → out
@@ -2885,6 +3521,7 @@ mod tests {
                     kind: NodeKind::Model {
                         selection: ModelSelection::Model { model: "s".into() },
                         prompt: "p".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2893,6 +3530,7 @@ mod tests {
                     kind: NodeKind::Model {
                         selection: ModelSelection::Model { model: "s".into() },
                         prompt: "1".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2901,6 +3539,7 @@ mod tests {
                     kind: NodeKind::Model {
                         selection: ModelSelection::Model { model: "s".into() },
                         prompt: "2".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2909,6 +3548,7 @@ mod tests {
                     kind: NodeKind::Model {
                         selection: ModelSelection::Model { model: "s".into() },
                         prompt: "3".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -3340,14 +3980,14 @@ mod tests {
         let outputs = HashMap::new();
 
         // `{{secrets.K}}` → "***" (explicit redaction marker, not the secret).
-        let result = substitute("text {{secrets.K}} more", "t", &outputs);
+        let result = substitute("text {{secrets.K}} more", "t", &outputs, &BTreeMap::new());
         assert_eq!(
             result, "text *** more",
             "shared substitute must redact secrets.* refs; got: {result}"
         );
 
         // `{{secrets}}` (no dot) → "***".
-        let result2 = substitute("{{secrets}}", "t", &outputs);
+        let result2 = substitute("{{secrets}}", "t", &outputs, &BTreeMap::new());
         assert_eq!(
             result2, "***",
             "shared substitute must redact bare {{secrets}}; got: {result2}"
@@ -3429,6 +4069,10 @@ mod tests {
             WfStatus::Failed,
             "run should fail due to HostNotAllowed"
         );
+        assert_eq!(journal_entries.len(), 1);
+        assert_eq!(journal_entries[0].node_id, "h");
+        assert_eq!(journal_entries[0].status, "failed");
+        assert!(journal_entries[0].finished_at >= journal_entries[0].started_at);
 
         // ---- SECURITY INVARIANT: "sekret-value" must NOT appear anywhere ----
 
@@ -3465,6 +4109,72 @@ mod tests {
                 "secret leaked into node_outputs[{nid}]: {content_str}"
             );
         }
+    }
+
+    /// Missing Http secrets fail before the Trigger or Http node is executed.
+    /// The unavailable name may be reported as safe metadata, but no wire call
+    /// or node journal entry is allowed.
+    #[tokio::test]
+    async fn missing_http_secret_fails_before_any_node() {
+        let def = WorkflowDefinition {
+            triggers: vec![],
+            id: Uuid::nil(),
+            version: 1,
+            name: "missing_secret".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "h".into(),
+                    kind: NodeKind::Http {
+                        method: "GET".into(),
+                        url: "https://api.example.com/x".into(),
+                        headers: vec![(
+                            "authorization".into(),
+                            "Bearer {{secrets.MISSING_KEY}}".into(),
+                        )],
+                        body: None,
+                        max_response_bytes: None,
+                    },
+                },
+            ],
+            edges: vec![Edge {
+                from: "t".into(),
+                to: "h".into(),
+                map: None,
+            }],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec!["other-host.com".into()],
+            metadata: serde_json::Value::Null,
+        };
+
+        let stub = StubExecutor::new(vec![]);
+        let mut journal_entries = Vec::new();
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("input"),
+            None,
+            |entry| journal_entries.push(entry),
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Failed);
+        assert_eq!(result.cost_usd, 0.0);
+        assert!(journal_entries.is_empty());
+        assert!(stub.called_nodes().is_empty());
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("MISSING_KEY")));
     }
 
     // ---- Task 1 (W3a-3): StubExecutor::load_subworkflow registry ----------------
@@ -3550,6 +4260,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -3930,6 +4641,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4032,6 +4744,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4147,6 +4860,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4237,6 +4951,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4330,6 +5045,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4484,6 +5200,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },

@@ -24,16 +24,19 @@
 //!
 //!   Ciphertexts from one path can never cross-decrypt under another.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng, Payload},
     AeadCore, XChaCha20Poly1305, XNonce,
 };
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tt_shared::context::SecretString;
 use uuid::Uuid;
+
+use super::types::{NodeKind, WorkflowDefinition};
 
 /// Length of the XChaCha20-Poly1305 nonce (extended-nonce ChaCha20).
 const NONCE_LEN: usize = 24;
@@ -174,6 +177,26 @@ SELECT name, secret_enc \
 FROM workflow_secrets \
 WHERE org_id = $1";
 
+const LIST_SECRET_ROWS_SQL: &str = "\
+SELECT name, secret_enc, created_at, rotated_at \
+FROM workflow_secrets \
+WHERE org_id = $1 \
+ORDER BY name ASC \
+LIMIT $2";
+
+const DELETE_SECRET_SQL: &str = "\
+DELETE FROM workflow_secrets \
+WHERE org_id = $1 AND name = $2";
+
+/// Internal encrypted row used to derive safe picker metadata. The ciphertext
+/// is deliberately private to this module and is never serialized.
+pub(crate) struct WorkflowSecretRow {
+    pub(crate) name: String,
+    secret_enc: Vec<u8>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) rotated_at: Option<DateTime<Utc>>,
+}
+
 /// Encrypt `plain` and UPSERT it into `workflow_secrets` for `(org_id, name)`.
 ///
 /// On conflict (the secret already exists) the ciphertext is rotated in-place
@@ -241,6 +264,123 @@ pub(crate) async fn load_secrets(
     map
 }
 
+/// Read a deterministic, bounded page of encrypted rows for the safe secret
+/// inventory. Callers may derive decryptability, but must never expose the
+/// ciphertext or plaintext.
+pub(crate) async fn list_secret_rows(
+    pool: &PgPool,
+    org_id: Uuid,
+    limit: i64,
+) -> Result<Vec<WorkflowSecretRow>, sqlx::Error> {
+    use sqlx::Row as _;
+
+    let rows = sqlx::query(LIST_SECRET_ROWS_SQL)
+        .bind(org_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(WorkflowSecretRow {
+                name: row.try_get("name")?,
+                secret_enc: row.try_get("secret_enc")?,
+                created_at: row.try_get("created_at")?,
+                rotated_at: row.try_get("rotated_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Delete one org/name-bound ciphertext row. The operation is deliberately
+/// idempotent: a retry after a lost `204` remains successful, and a name that
+/// belongs only to another org is indistinguishable from an absent name.
+pub(crate) async fn delete_secret(
+    pool: &PgPool,
+    org_id: Uuid,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(DELETE_SECRET_SQL)
+        .bind(org_id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+impl WorkflowSecretRow {
+    /// Test whether this row decrypts for its original org/name binding. The
+    /// plaintext is immediately dropped and never leaves this module.
+    pub(crate) fn is_decryptable(&self, master: &[u8; 32], org_id: Uuid) -> bool {
+        decrypt_secret(master, org_id, &self.name, &self.secret_enc).is_some()
+    }
+}
+
+/// Collect every exact `{{secrets.NAME}}` reference used by Http wire fields.
+/// Invalid or unclosed references are rejected without echoing their contents,
+/// because definitions can themselves contain sensitive user input.
+pub(crate) fn required_secret_names(
+    def: &WorkflowDefinition,
+) -> Result<BTreeSet<String>, Vec<String>> {
+    let mut names = BTreeSet::new();
+    let mut errors = Vec::new();
+
+    for node in &def.nodes {
+        let NodeKind::Http {
+            url, headers, body, ..
+        } = &node.kind
+        else {
+            continue;
+        };
+
+        scan_secret_references(url, &node.id, "url", &mut names, &mut errors);
+        for (_, value) in headers {
+            scan_secret_references(value, &node.id, "header", &mut names, &mut errors);
+        }
+        if let Some(body) = body {
+            scan_secret_references(body, &node.id, "body", &mut names, &mut errors);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(names)
+    } else {
+        Err(errors)
+    }
+}
+
+fn scan_secret_references(
+    value: &str,
+    node_id: &str,
+    field: &str,
+    names: &mut BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
+    const PREFIX: &str = "{{secrets.";
+    let mut remaining = value;
+
+    while let Some(start) = remaining.find(PREFIX) {
+        let after_prefix = &remaining[start + PREFIX.len()..];
+        let Some(end) = after_prefix.find("}}") else {
+            errors.push(format!(
+                "node \"{node_id}\": Http {field} contains an unclosed \
+                 {{{{secrets.NAME}}}} reference"
+            ));
+            return;
+        };
+        let name = &after_prefix[..end];
+        if is_valid_secret_name(name) {
+            names.insert(name.to_string());
+        } else {
+            errors.push(format!(
+                "node \"{node_id}\": Http {field} contains an invalid secret reference; \
+                 names must match ^[A-Z0-9_]{{1,64}}$"
+            ));
+        }
+        remaining = &after_prefix[end + 2..];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -272,6 +412,100 @@ mod tests {
         assert!(is_valid_secret_name("A"));
         assert!(is_valid_secret_name("KEY_123"));
         assert!(is_valid_secret_name(&"A".repeat(64)));
+    }
+
+    #[test]
+    fn secret_inventory_query_is_scoped_ordered_and_bounded() {
+        assert!(LIST_SECRET_ROWS_SQL.contains("WHERE org_id = $1"));
+        assert!(LIST_SECRET_ROWS_SQL.contains("ORDER BY name ASC"));
+        assert!(LIST_SECRET_ROWS_SQL.contains("LIMIT $2"));
+        assert!(!LIST_SECRET_ROWS_SQL.contains("SELECT *"));
+    }
+
+    #[test]
+    fn secret_delete_query_is_exactly_org_and_name_scoped() {
+        assert!(DELETE_SECRET_SQL.starts_with("DELETE FROM workflow_secrets"));
+        assert!(DELETE_SECRET_SQL.contains("WHERE org_id = $1 AND name = $2"));
+        assert!(!DELETE_SECRET_SQL.contains("RETURNING"));
+    }
+
+    #[test]
+    fn required_secret_names_are_exact_and_deduplicated() {
+        use super::super::types::{BudgetPolicy, Node};
+
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "refs".into(),
+            nodes: vec![Node {
+                id: "http".into(),
+                kind: NodeKind::Http {
+                    method: "POST".into(),
+                    url: "https://api.example.com/{{secrets.PATH_KEY}}".into(),
+                    headers: vec![
+                        ("authorization".into(), "Bearer {{secrets.API_KEY}}".into()),
+                        ("x-repeat".into(), "{{secrets.API_KEY}}".into()),
+                    ],
+                    body: Some("{{secrets.BODY_KEY}}".into()),
+                    max_response_bytes: None,
+                },
+            }],
+            edges: vec![],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec!["api.example.com".into()],
+            metadata: serde_json::Value::Null,
+            triggers: vec![],
+        };
+
+        assert_eq!(
+            required_secret_names(&def)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["API_KEY", "BODY_KEY", "PATH_KEY"]
+        );
+    }
+
+    #[test]
+    fn malformed_secret_references_do_not_echo_definition_contents() {
+        use super::super::types::{BudgetPolicy, Node};
+
+        let sensitive_malformed_name = "bad-private-value";
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "bad refs".into(),
+            nodes: vec![Node {
+                id: "http".into(),
+                kind: NodeKind::Http {
+                    method: "POST".into(),
+                    url: "https://api.example.com".into(),
+                    headers: vec![(
+                        "authorization".into(),
+                        format!("{{{{secrets.{sensitive_malformed_name}}}}}"),
+                    )],
+                    body: Some("{{secrets.UNCLOSED".into()),
+                    max_response_bytes: None,
+                },
+            }],
+            edges: vec![],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec!["api.example.com".into()],
+            metadata: serde_json::Value::Null,
+            triggers: vec![],
+        };
+
+        let errors = required_secret_names(&def).unwrap_err();
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .all(|error| !error.contains(sensitive_malformed_name)));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("invalid secret reference")));
+        assert!(errors.iter().any(|error| error.contains("unclosed")));
     }
 
     /// Round-trip: encrypt then decrypt recovers the original plaintext.

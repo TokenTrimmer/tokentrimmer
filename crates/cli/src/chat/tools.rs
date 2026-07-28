@@ -12,7 +12,9 @@ use tt_mcp::tools::preview_cost::PreviewCostTool;
 use tt_mcp::tools::Registry;
 use tt_shared::messages::{Message, MessageContent, ToolCall};
 
-use super::{format_turn_footer, shape, Conversation, Ledger, UsageInfo};
+use super::{
+    format_turn_footer, format_unmeasured_turn_footer, shape, Conversation, Ledger, UsageInfo,
+};
 use crate::ui;
 
 /// Hard cap on tool-call rounds per turn (loop guard).
@@ -47,25 +49,16 @@ fn registry_tools(reg: &Registry) -> Vec<tt_client::Tool> {
         .collect()
 }
 
-/// Build a `UsageInfo` from a non-streamed response: cost/saved/baseline come
-/// from the gateway headers, tokens from the body's `usage`. Falls back to
-/// `cost + saved` when the gateway sends no baseline header.
+/// Build a `UsageInfo` from a non-streamed response. Missing raw components
+/// remain explicit: this never derives a request-delta baseline from legacy
+/// `saved_usd` compatibility data.
 #[must_use]
-pub fn usage_from_parts(
-    cost_usd: f64,
-    saved_usd: f64,
-    baseline_usd: Option<f64>,
+pub fn usage_from_headers(
+    cost: &tt_client::CostInfo,
     in_tok: u64,
     out_tok: u64,
-) -> UsageInfo {
-    UsageInfo {
-        cost_usd,
-        baseline_cost_usd: baseline_usd.unwrap_or(cost_usd + saved_usd),
-        saved_usd,
-        input_tokens: in_tok,
-        output_tokens: out_tok,
-        cached_tokens: 0,
-    }
+) -> Option<UsageInfo> {
+    UsageInfo::from_header_cost(cost, in_tok, out_tok)
 }
 
 /// The muted one-line preview shown when the model calls a tool.
@@ -85,11 +78,21 @@ pub fn format_tool_call(name: &str, args: &str) -> String {
 #[derive(Default)]
 struct TurnTotals {
     cost: f64,
-    saved: f64,
     baseline: f64,
+    provider_cache_saved: f64,
+    cache_bust: f64,
+    summarizer_tax: f64,
     in_tok: u64,
     out_tok: u64,
+    /// Successful gateway responses in this tool turn. Every one must carry a
+    /// complete tuple before the turn can report a signed request delta.
+    successful_rounds: u32,
+    /// Successfully received cost/usage records. These alone may still be
+    /// insufficient when a sibling successful round omitted raw accounting.
     billed_rounds: u32,
+    measured_delta_rounds: u32,
+    legacy_saved: f64,
+    legacy_saved_rounds: u32,
     /// Estimated tokens of tool results + tool-call args before/after shaping
     /// (`chat::shape`). Token counts only — never converted to a USD claim.
     trim_before: u64,
@@ -97,23 +100,64 @@ struct TurnTotals {
 }
 
 impl TurnTotals {
-    fn add(&mut self, u: &UsageInfo) {
+    fn add_round(&mut self, usage: Option<&UsageInfo>) {
+        self.successful_rounds += 1;
+        let Some(u) = usage else {
+            return;
+        };
         self.cost += u.cost_usd;
-        self.saved += u.saved_usd;
-        self.baseline += u.baseline_cost_usd;
         self.in_tok += u.input_tokens;
         self.out_tok += u.output_tokens;
         self.billed_rounds += 1;
+        if let Some(saved_usd) = u.legacy_saved_usd {
+            self.legacy_saved += saved_usd;
+            self.legacy_saved_rounds += 1;
+        }
+        if let tt_client::RequestDeltaEstimate::Measured {
+            baseline_cost_usd,
+            provider_cache_saved_usd,
+            cache_bust_usd,
+            summarizer_tax_usd,
+            ..
+        } = u.request_delta_estimate
+        {
+            self.baseline += baseline_cost_usd;
+            self.provider_cache_saved += provider_cache_saved_usd;
+            self.cache_bust += cache_bust_usd;
+            self.summarizer_tax += summarizer_tax_usd;
+            self.measured_delta_rounds += 1;
+        }
     }
     fn add_trim(&mut self, s: shape::ShapeStats) {
         self.trim_before += u64::from(s.tokens_before);
         self.trim_after += u64::from(s.tokens_after);
     }
     fn as_usage(&self) -> UsageInfo {
+        let request_delta_estimate =
+            if self.successful_rounds > 0 && self.measured_delta_rounds == self.successful_rounds {
+                tt_client::RequestDeltaEstimate::from_components(
+                    Some(self.baseline),
+                    Some(self.cost),
+                    Some(self.provider_cache_saved),
+                    Some(self.cache_bust),
+                    Some(self.summarizer_tax),
+                )
+            } else {
+                tt_client::RequestDeltaEstimate::Unmeasured
+            };
         UsageInfo {
             cost_usd: self.cost,
-            baseline_cost_usd: self.baseline,
-            saved_usd: self.saved,
+            cost_complete: self.billed_rounds == self.successful_rounds,
+            baseline_cost_usd: match request_delta_estimate {
+                tt_client::RequestDeltaEstimate::Measured {
+                    baseline_cost_usd, ..
+                } => Some(baseline_cost_usd),
+                tt_client::RequestDeltaEstimate::Unmeasured => None,
+            },
+            legacy_saved_usd: (self.successful_rounds > 0
+                && self.legacy_saved_rounds == self.successful_rounds)
+                .then_some(self.legacy_saved),
+            request_delta_estimate,
             input_tokens: self.in_tok,
             output_tokens: self.out_tok,
             cached_tokens: 0,
@@ -164,15 +208,11 @@ async fn send_round(
         .unwrap_or_else(|| conv.model.clone());
     let calls = out.tool_calls().to_vec();
     let content = out.text().unwrap_or_default().to_string();
-    let usage = out.cost.cost_usd.map(|c| {
-        usage_from_parts(
-            c,
-            out.cost.saved_usd.unwrap_or(0.0),
-            out.cost.baseline_cost_usd,
-            out.response.usage.prompt_tokens,
-            out.response.usage.completion_tokens,
-        )
-    });
+    let usage = usage_from_headers(
+        &out.cost,
+        out.response.usage.prompt_tokens,
+        out.response.usage.completion_tokens,
+    );
     let assistant_msg = out.response.choices.first().map(|ch| ch.message.clone());
     Ok(Round {
         served_model,
@@ -204,14 +244,7 @@ fn finish_turn(
     if turn.billed_rounds > 0 {
         let u = turn.as_usage();
         ledger.add(&u);
-        let mut footer = format_turn_footer(
-            served_model,
-            u.input_tokens,
-            u.output_tokens,
-            u.cost_usd,
-            u.saved_usd,
-            u.baseline_cost_usd,
-        );
+        let mut footer = format_turn_footer(served_model, &u);
         if trimmed > 0 {
             footer.push_str(
                 &ui::muted()
@@ -220,6 +253,11 @@ fn finish_turn(
             );
         }
         println!("{footer}");
+    } else if turn.successful_rounds > 0 {
+        // A completed response with no parseable cost must not disappear from
+        // the session or masquerade as a zero-cost turn.
+        ledger.add_unmeasured_direct_turn();
+        println!("{}", format_unmeasured_turn_footer(served_model));
     }
 }
 
@@ -256,9 +294,7 @@ pub async fn run_tool_turn(
                 return false;
             }
         };
-        if let Some(u) = &round.usage {
-            turn.add(u);
-        }
+        turn.add_round(round.usage.as_ref());
         if round.calls.is_empty() {
             let Round {
                 served_model,
@@ -311,9 +347,7 @@ pub async fn run_tool_turn(
     ui::warn("tool loop hit the round cap — requesting a final answer");
     match send_round(client, conv, &tools, true).await {
         Ok(round) => {
-            if let Some(u) = &round.usage {
-                turn.add(u);
-            }
+            turn.add_round(round.usage.as_ref());
             let Round {
                 served_model,
                 content,
@@ -340,15 +374,98 @@ mod tests {
     use super::*;
 
     #[test]
-    fn usage_baseline_from_header_or_derived() {
-        // no baseline header → cost + saved
-        let u = usage_from_parts(0.001, 0.003, None, 10, 20);
-        assert!((u.baseline_cost_usd - 0.004).abs() < 1e-9);
+    fn usage_from_headers_never_derives_a_delta_from_legacy_saved() {
+        let legacy_only = tt_client::CostInfo {
+            cost_usd: Some(0.001),
+            saved_usd: Some(0.003),
+            provider_cache_saved_usd: Some(0.0),
+            cache_bust_usd: Some(0.0),
+            summarizer_tax_usd: Some(0.0),
+            ..tt_client::CostInfo::default()
+        };
+        let u = usage_from_headers(&legacy_only, 10, 20).expect("known served cost");
+        assert_eq!(u.baseline_cost_usd, None);
+        assert_eq!(u.legacy_saved_usd, Some(0.003));
+        assert_eq!(
+            u.request_delta_estimate,
+            tt_client::RequestDeltaEstimate::Unmeasured
+        );
         assert_eq!(u.input_tokens, 10);
         assert_eq!(u.output_tokens, 20);
-        // explicit (authoritative) baseline header wins
-        let u2 = usage_from_parts(0.001, 0.003, Some(0.005), 1, 1);
-        assert!((u2.baseline_cost_usd - 0.005).abs() < 1e-9);
+
+        let complete = tt_client::CostInfo {
+            cost_usd: Some(0.001),
+            baseline_cost_usd: Some(0.0015),
+            provider_cache_saved_usd: Some(0.0002),
+            cache_bust_usd: Some(0.0001),
+            summarizer_tax_usd: Some(0.0003),
+            ..tt_client::CostInfo::default()
+        };
+        let u2 = usage_from_headers(&complete, 1, 1).expect("known served cost");
+        assert!(matches!(
+            u2.request_delta_estimate,
+            tt_client::RequestDeltaEstimate::Measured { signed_usd, regression_usd, .. }
+                if (signed_usd + 0.0001).abs() < 1e-12
+                    && (regression_usd - 0.0001).abs() < 1e-12
+        ));
+    }
+
+    #[test]
+    fn turn_totals_marks_partial_or_missing_successful_rounds_unmeasured() {
+        let complete = usage_from_headers(
+            &tt_client::CostInfo {
+                cost_usd: Some(0.0001),
+                baseline_cost_usd: Some(0.0004),
+                provider_cache_saved_usd: Some(0.0001),
+                cache_bust_usd: Some(0.0),
+                summarizer_tax_usd: Some(0.0),
+                ..tt_client::CostInfo::default()
+            },
+            10,
+            2,
+        )
+        .expect("known served cost");
+        let partial = usage_from_headers(
+            &tt_client::CostInfo {
+                cost_usd: Some(0.0001),
+                baseline_cost_usd: Some(0.0004),
+                provider_cache_saved_usd: Some(0.0001),
+                cache_bust_usd: Some(0.0),
+                // Missing one raw tuple member must not be zero-filled.
+                summarizer_tax_usd: None,
+                ..tt_client::CostInfo::default()
+            },
+            8,
+            1,
+        )
+        .expect("known served cost");
+
+        let mut partial_turn = TurnTotals::default();
+        partial_turn.add_round(Some(&complete));
+        partial_turn.add_round(Some(&partial));
+        let combined = partial_turn.as_usage();
+        assert_eq!(
+            combined.request_delta_estimate,
+            tt_client::RequestDeltaEstimate::Unmeasured
+        );
+        assert!((combined.cost_usd - 0.0002).abs() < 1e-12);
+        // Missing delta components do not erase the fact that both served
+        // costs were received, so the cost total remains complete even though
+        // the signed delta is unmeasured.
+        assert!(combined.cost_complete);
+
+        // A successful response without a parseable served cost is also an
+        // accounted round, so it poisons the whole turn's signed estimate.
+        let mut missing_cost_turn = TurnTotals::default();
+        missing_cost_turn.add_round(Some(&complete));
+        missing_cost_turn.add_round(None);
+        let combined = missing_cost_turn.as_usage();
+        assert_eq!(
+            combined.request_delta_estimate,
+            tt_client::RequestDeltaEstimate::Unmeasured
+        );
+        assert!((combined.cost_usd - 0.0001).abs() < 1e-12);
+        assert!(!combined.cost_complete);
     }
 
     #[test]
@@ -381,6 +498,10 @@ mod tests {
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")
                 .header("x-tokentrimmer-cost-usd", "0.0001")
                 .header("x-tokentrimmer-saved-usd", "0.0003")
+                .header("x-tokentrimmer-baseline-cost-usd", "0.0004")
+                .header("x-tokentrimmer-provider-cache-saved-usd", "0.0001")
+                .header("x-tokentrimmer-cache-bust-usd", "0.0")
+                .header("x-tokentrimmer-summarizer-tax-usd", "0.0")
                 .json_body(json!({
                     "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
                     "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Use Haiku." } }],
@@ -427,7 +548,63 @@ mod tests {
         assert!(
             matches!(&conv.messages[3], Message::Assistant { content: Some(MessageContent::Text(t)), .. } if t == "Use Haiku.")
         );
-        assert_eq!(ledger.turns, 1); // only the final round carried cost headers
+        // The final response is fully measurable, but the preceding successful
+        // response lacked a parseable cost. That makes the whole tool turn
+        // unmeasured rather than silently aggregating the final round alone.
+        assert_eq!(ledger.turns, 1);
+        assert!((ledger.cost_usd - 0.0001).abs() < 1e-12);
+        assert_eq!(ledger.measured_request_deltas, 0);
+        assert_eq!(ledger.unmeasured_request_deltas, 1);
+        assert_eq!(ledger.unknown_direct_cost_turns, 1);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_with_no_cost_headers_records_an_unmeasured_turn() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_includes("\"role\":\"tool\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .json_body(json!({
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": { "role": "assistant", "content": "No cost headers." } }],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16 }
+                }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .json_body(json!({
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": {
+                        "role": "assistant", "content": null,
+                        "tool_calls": [{ "id": "c1", "type": "function",
+                            "function": { "name": "find_route_for",
+                                "arguments": "{\"task_description\":\"classify sentiment\"}" } }]
+                    }}],
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6 }
+                }));
+        });
+
+        let mut conv = Conversation::new("gpt-4o-mini".into(), None);
+        conv.push_user("what model for sentiment?".into());
+        let reg = build_registry();
+        let mut ledger = Ledger::default();
+        let client = tt_client::Client::new(server.base_url(), "k");
+
+        assert!(run_tool_turn(&client, &mut conv, &reg, &mut ledger, true).await);
+        assert_eq!(ledger.turns, 1);
+        assert_eq!(ledger.cost_usd, 0.0, "unknown cost is never zero-filled");
+        assert_eq!(ledger.unmeasured_request_deltas, 1);
+        assert_eq!(ledger.unknown_direct_cost_turns, 1);
+        let summary = ledger.summary();
+        assert!(summary.contains("known spend"), "{summary}");
+        assert!(summary.contains("cost not measured"), "{summary}");
     }
 
     #[tokio::test]
@@ -443,6 +620,10 @@ mod tests {
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")
                 .header("x-tokentrimmer-cost-usd", "0.0001")
                 .header("x-tokentrimmer-saved-usd", "0.0002")
+                .header("x-tokentrimmer-baseline-cost-usd", "0.0004")
+                .header("x-tokentrimmer-provider-cache-saved-usd", "0.0001")
+                .header("x-tokentrimmer-cache-bust-usd", "0.0")
+                .header("x-tokentrimmer-summarizer-tax-usd", "0.0")
                 .json_body(json!({
                     "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
                     "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Final answer." } }],
@@ -450,7 +631,8 @@ mod tests {
                 }));
         });
         // Every normal request keeps requesting a tool (never converges); each
-        // round carries cost headers so we can prove N rounds → 1 ledger turn.
+        // round carries a complete accounting tuple so we can prove N rounds →
+        // 1 measured ledger turn.
         server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200)
@@ -458,6 +640,10 @@ mod tests {
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")
                 .header("x-tokentrimmer-cost-usd", "0.0001")
                 .header("x-tokentrimmer-saved-usd", "0.0002")
+                .header("x-tokentrimmer-baseline-cost-usd", "0.0004")
+                .header("x-tokentrimmer-provider-cache-saved-usd", "0.0001")
+                .header("x-tokentrimmer-cache-bust-usd", "0.0")
+                .header("x-tokentrimmer-summarizer-tax-usd", "0.0")
                 .json_body(json!({
                     "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
                     "choices": [{ "index": 0, "message": {
@@ -491,6 +677,13 @@ mod tests {
             (ledger.cost_usd - 0.0007).abs() < 1e-9,
             "cost = {}",
             ledger.cost_usd
+        );
+        assert_eq!(ledger.measured_request_deltas, 1);
+        assert_eq!(ledger.unmeasured_request_deltas, 0);
+        assert!(
+            (ledger.signed_request_delta_usd - 0.0014).abs() < 1e-12,
+            "request delta = {}",
+            ledger.signed_request_delta_usd
         );
     }
 
