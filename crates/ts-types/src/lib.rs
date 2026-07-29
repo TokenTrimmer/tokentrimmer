@@ -576,7 +576,7 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
         .collect::<Vec<_>>();
     let manifest = json!({
         "contract": "tokentrimmer.product-contracts.v1",
-        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, and gateway capability response type",
+        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, and gateway capability response type",
         "typescript": PRODUCT_TS_PATH,
         "contracts": [
             {
@@ -609,6 +609,13 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
                 "versions": [1],
                 "schema": "docs/workflow-contract/workflow-write.schema.json",
                 "write": "POST /v1/workflows"
+            },
+            {
+                "family": "models",
+                "id": "tokentrimmer.models.v1",
+                "versions": [tt_shared::MODELS_SCHEMA_VERSION],
+                "schema": "docs/model-contract/models-response.schema.json",
+                "read": "GET /v1/models"
             },
             {
                 "family": "gateway_capabilities",
@@ -693,6 +700,7 @@ mod tests {
         assert!(product_types.contains("export type Node = {\n  id: string;\n} & ("));
         assert!(product_types.contains("max_output_tokens?: number | null;"));
         assert!(product_types.contains("export type RouteWriteRequest ="));
+        assert!(product_types.contains("export type ModelsResponse ="));
         assert!(product_types.contains("export type GatewayCapabilitiesDocument ="));
     }
 }

@@ -1,0 +1,258 @@
+{
+  "$comment": "Structural GET /v1/models response generated from the exact tt_shared::ModelsResponse wire type. Runtime semantic validation, authorization, readiness, and execution remain separate gates.",
+  "$defs": {
+    "Capability": {
+      "enum": [
+        "text",
+        "vision",
+        "audio",
+        "tools",
+        "json_mode",
+        "streaming",
+        "reasoning",
+        "prompt_caching"
+      ],
+      "type": "string"
+    },
+    "ModelCatalogLimitations": {
+      "properties": {
+        "fleet_consistency": {
+          "const": "not_attested",
+          "type": "string"
+        },
+        "provider_credentials": {
+          "const": "not_inspected",
+          "type": "string"
+        },
+        "provider_health": {
+          "const": "not_probed",
+          "type": "string"
+        },
+        "request_acceptance": {
+          "const": "not_negotiated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fleet_consistency",
+        "provider_credentials",
+        "provider_health",
+        "request_acceptance"
+      ],
+      "type": "object"
+    },
+    "ModelEntry": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "object": {
+          "const": "model",
+          "type": "string"
+        },
+        "owned_by": {
+          "type": "string"
+        },
+        "tokentrimmer": {
+          "$ref": "#/$defs/ModelTokenTrimmerMeta"
+        }
+      },
+      "required": [
+        "id",
+        "object",
+        "owned_by",
+        "tokentrimmer"
+      ],
+      "type": "object"
+    },
+    "ModelPricing": {
+      "properties": {
+        "batch_input_per_million": {
+          "description": "USD per 1M batch (async) input tokens. Providers with a batch tier (OpenAI / Anthropic / Gemini) bill async requests at ~50% of standard input. `None` for providers with no batch tier.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "batch_output_per_million": {
+          "description": "USD per 1M batch (async) output tokens (~50% of standard output). `None` for providers with no batch tier.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cache_write_per_million": {
+          "description": "USD per 1M cache-creation (cache-write) input tokens. Anthropic charges ~1.25× the base input rate for tokens written to the prompt cache. `None` for providers with no documented write premium (cost path unchanged).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cached_input_per_million": {
+          "description": "USD per 1M cached input tokens (Anthropic 10%, OpenAI 10%, Gemini 10%).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "effective_at": {
+          "description": "When this pricing took effect (for historical replay).",
+          "format": "date-time",
+          "type": "string"
+        },
+        "flex_input_per_million": {
+          "description": "USD per 1M input tokens under OpenAI's **Flex** service tier (`service_tier: \"flex\"`) — a synchronous-but-slower tier billed at Batch API rates (~50% of standard). `None` for models/providers with no Flex tier; **presence is the eligibility gate** (only models that carry a Flex rate may be opted into `service_tier=flex`). See developers.openai.com/api/docs/guides/flex-processing.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "flex_output_per_million": {
+          "description": "USD per 1M output tokens under the Flex service tier (~50% of standard output). `None` when the model has no Flex tier.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "input_per_million": {
+          "description": "USD per 1M input tokens.",
+          "format": "double",
+          "type": "number"
+        },
+        "output_per_million": {
+          "description": "USD per 1M output tokens.",
+          "format": "double",
+          "type": "number"
+        },
+        "prompt_cache_min_tokens": {
+          "description": "Provider minimum prefix length, in tokens, before a `cache_control` breakpoint actually caches (shorter prefixes silently don't cache). Anthropic varies this by model (2048–4096); `None` when not documented.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "batch_input_per_million",
+        "batch_output_per_million",
+        "cache_write_per_million",
+        "cached_input_per_million",
+        "effective_at",
+        "flex_input_per_million",
+        "flex_output_per_million",
+        "input_per_million",
+        "output_per_million",
+        "prompt_cache_min_tokens"
+      ],
+      "type": "object"
+    },
+    "ModelTokenTrimmerMeta": {
+      "properties": {
+        "capabilities": {
+          "items": {
+            "$ref": "#/$defs/Capability"
+          },
+          "type": "array"
+        },
+        "max_input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelPricing"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capabilities",
+        "max_input_tokens",
+        "max_output_tokens",
+        "pricing",
+        "provider"
+      ],
+      "type": "object"
+    },
+    "ModelsDocumentMeta": {
+      "description": "Provenance and explicit limitations for one responding process's catalog.",
+      "properties": {
+        "limitations": {
+          "$ref": "#/$defs/ModelCatalogLimitations"
+        },
+        "schema_version": {
+          "const": 1,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "snapshot_scope": {
+          "const": "responding_process",
+          "type": "string"
+        },
+        "snapshot_sha256": {
+          "description": "SHA-256 over the deterministic JSON serialization of the sorted `data` array. It identifies this exact responder snapshot; it is not a signed release revision or fleet-consistency claim.",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "source": {
+          "const": "registered_provider_catalog",
+          "type": "string"
+        }
+      },
+      "required": [
+        "limitations",
+        "schema_version",
+        "snapshot_scope",
+        "snapshot_sha256",
+        "source"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:tokentrimmer:models:response-schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "data": {
+      "items": {
+        "$ref": "#/$defs/ModelEntry"
+      },
+      "type": "array"
+    },
+    "object": {
+      "const": "list",
+      "type": "string"
+    },
+    "tokentrimmer": {
+      "$ref": "#/$defs/ModelsDocumentMeta"
+    }
+  },
+  "required": [
+    "data",
+    "object",
+    "tokentrimmer"
+  ],
+  "title": "TokenTrimmer model catalog response",
+  "type": "object"
+}
