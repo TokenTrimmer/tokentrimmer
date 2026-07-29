@@ -21,6 +21,8 @@ export type BudgetPolicy = {
   on_exceed?: OnExceed;
 };
 
+export type Capability = "text" | "vision" | "audio" | "tools" | "json_mode" | "streaming" | "reasoning" | "prompt_caching";
+
 export type CapabilityReason = {
   code: string;
   message: string;
@@ -63,6 +65,33 @@ export type GatewayFeatures = {
   fusion: FusionCapability;
 };
 
+export type ModelCatalogLimitations = {
+  fleet_consistency: "not_attested";
+  provider_credentials: "not_inspected";
+  provider_health: "not_probed";
+  request_acceptance: "not_negotiated";
+};
+
+export type ModelEntry = {
+  id: string;
+  object: "model";
+  owned_by: string;
+  tokentrimmer: ModelTokenTrimmerMeta;
+};
+
+export type ModelPricing = {
+  batch_input_per_million: number | null;
+  batch_output_per_million: number | null;
+  cache_write_per_million: number | null;
+  cached_input_per_million: number | null;
+  effective_at: string;
+  flex_input_per_million: number | null;
+  flex_output_per_million: number | null;
+  input_per_million: number;
+  output_per_million: number;
+  prompt_cache_min_tokens: number | null;
+};
+
 export type ModelSelection = {
   model: string;
   type: "model";
@@ -71,6 +100,22 @@ export type ModelSelection = {
   type: "route";
 } | {
   type: "auto";
+};
+
+export type ModelTokenTrimmerMeta = {
+  capabilities: Array<Capability>;
+  max_input_tokens: number;
+  max_output_tokens: number;
+  pricing: ModelPricing | null;
+  provider: string;
+};
+
+export type ModelsDocumentMeta = {
+  limitations: ModelCatalogLimitations;
+  schema_version: 1;
+  snapshot_scope: "responding_process";
+  snapshot_sha256: string;
+  source: "registered_provider_catalog";
 };
 
 export type Node = {
@@ -273,6 +318,12 @@ export type WorkflowWriteRequest = {
   nodes: Array<Node>;
   triggers?: Array<WorkflowTrigger>;
   version?: number | null;
+};
+
+export type ModelsResponse = {
+  data: Array<ModelEntry>;
+  object: "list";
+  tokentrimmer: ModelsDocumentMeta;
 };
 
 export type GatewayCapabilitiesDocument = {
