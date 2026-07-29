@@ -10,12 +10,15 @@
 //!     request-delta evidence, and optional quality verdict.
 //!   - an **ARR receipt** (`arr:v1|…` / `arr:v2|…`) — top-level agent-run cost
 //!     and request-delta evidence.
+//!   - a **Chat dispatch receipt** (`ctdr:v1|…`) — frozen TokenTrimmer gateway
+//!     accounting for one durable private-Chat provider dispatch.
 //!
 //! The sign side of each lives in the cloud mint-on-demand endpoint
 //! (`POST /v1/admin/requests/{trace_id}/{compression,l2}-receipt/sign`, which
 //! calls `tt_telemetry::vcr::sign` / `tt_telemetry::l2_receipt::sign`; and
 //! `POST /v1/admin/workflow-runs/{run_id}/receipt/sign` for wfr; and
-//! `POST /v1/admin/agent-runs/{run_id}/receipt/sign` for arr). This CLI takes
+//! `POST /v1/admin/agent-runs/{run_id}/receipt/sign` for arr; and
+//! `POST /v1/admin/chat-dispatch-receipts/{receipt_id}/sign` for ctdr). This CLI takes
 //! a receipt JSON + the customer's out-of-band verifying-key hex + asserts the
 //! Ed25519 signature is valid over the canonical payload — proving the figure
 //! was attested by the key holder, offline, with no network or DB.
@@ -32,63 +35,15 @@ use anyhow::Context;
 
 use tt_telemetry::vcr::VcrReceipt;
 
+mod chat_dispatch;
+mod family;
+mod issuer_registry;
 mod run_receipt;
 
+use chat_dispatch::verify_chat_dispatch_receipt;
+use family::{receipt_family, ReceiptFamily};
+use issuer_registry::verify_registry_pin;
 use run_receipt::{verify_arr_receipt, verify_wfr_receipt};
-
-/// Fields unique to the L2 receipt family. Any one of these claims L2 family
-/// ownership before the permissive VCR deserializer gets a chance to ignore it.
-const L2_RECEIPT_MARKERS: [&str; 5] = [
-    "matched_entry_id",
-    "similarity",
-    "verdict",
-    "served_cost_usd",
-    "baseline_cost_usd",
-];
-
-/// The receipt family selected from owned JSON discriminator fields. Keep the
-/// run-receipt variants separate: both ARR and WFR carry `canonical_version`,
-/// but only WFR carries a `workflow_id` (and its v2/v4 `quality_verdict`).
-/// Every canonical-version-bearing object is reserved by one of these two
-/// paths so serde's permissive VCR parser can never silently ignore it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReceiptFamily {
-    Bundle,
-    Wfr,
-    Arr,
-    L2,
-    Vcr,
-}
-
-fn receipt_family(peek: &serde_json::Value) -> ReceiptFamily {
-    let Some(object) = peek.as_object() else {
-        return ReceiptFamily::Vcr;
-    };
-
-    if object.contains_key("plan_input") || object.contains_key("expected_result") {
-        return ReceiptFamily::Bundle;
-    }
-
-    if object.contains_key("canonical_version") {
-        // WFR owns its workflow relationship and its v2/v4 field even when
-        // those values are malformed. Everything else in the canonical-version
-        // namespace is routed to ARR. Both parsers fail closed on malformed or
-        // future shapes; neither can fall through to VCR.
-        if object.contains_key("workflow_id") || object.contains_key("quality_verdict") {
-            return ReceiptFamily::Wfr;
-        }
-        return ReceiptFamily::Arr;
-    }
-
-    if L2_RECEIPT_MARKERS
-        .iter()
-        .any(|field| object.contains_key(*field))
-    {
-        return ReceiptFamily::L2;
-    }
-
-    ReceiptFamily::Vcr
-}
 
 /// `tt verify-receipt --receipt <path> --key-hex <hex>` entry point. Reads the
 /// receipt JSON, dispatches to the right family by field-presence,
@@ -100,6 +55,17 @@ fn receipt_family(peek: &serde_json::Value) -> ReceiptFamily {
 /// cannot be read/parsed, the key hex is malformed, or the signature does not
 /// verify (tampered fields, wrong key, unknown schema version).
 pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<()> {
+    run_verify_receipt_with_registry(receipt_path, key_hex, None, None)
+}
+
+/// Verify a receipt and optionally require that its selected key is active in
+/// a complete issuer keyset whose manifest SHA-256 was obtained independently.
+pub fn run_verify_receipt_with_registry(
+    receipt_path: &str,
+    key_hex: &str,
+    issuer_registry_path: Option<&str>,
+    registry_sha256: Option<&str>,
+) -> anyhow::Result<()> {
     use anyhow::Context;
 
     let raw = std::fs::read_to_string(receipt_path)
@@ -107,10 +73,11 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
 
     // Family dispatch by field-presence (the JSON fields are the dispatch key;
     // the signed canonical payload's prefix — `vcr:v1|` / `l2:v1|` / `wfr:v1|`
-    // / `arr:v1|` — is the disjointness guarantee). Order matters:
+    // / `arr:v1|` / `ctdr:v1|` — is the disjointness guarantee). Order matters:
     //   - A savings bundle carries `plan_input` or `expected_result`; it belongs
     //     to `tt verify-bundle`, never this receipt verifier.
-    //   - The run-receipt namespace reserves any own `canonical_version` field.
+    //   - Chat reserves its evidence-scope/receipt-id namespace before the
+    //     run-receipt namespace reserves any own `canonical_version` field.
     //     WFR claims `workflow_id` / `quality_verdict`; ARR claims every other
     //     canonical-version-bearing object. Malformed or future variants never
     //     reach VCR's permissive deserializer.
@@ -128,10 +95,23 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
         ReceiptFamily::Bundle => anyhow::bail!(
             "receipt appears to be a savings bundle; verify it with `tt verify-bundle {receipt_path}`"
         ),
+        ReceiptFamily::Ctdr => verify_chat_dispatch_receipt(&raw, key_hex),
         ReceiptFamily::Wfr => verify_wfr_receipt(&raw, &peek, key_hex),
         ReceiptFamily::Arr => verify_arr_receipt(&raw, &peek, key_hex),
         ReceiptFamily::L2 => verify_l2_receipt(&raw, &peek, key_hex),
         ReceiptFamily::Vcr => verify_vcr_receipt(&raw, &peek, key_hex),
+    }?;
+    match (issuer_registry_path, registry_sha256) {
+        (None, None) => {
+            crate::ui::note(
+                "issuer registry: not checked (signature integrity is not issuer identity)",
+            );
+            Ok(())
+        }
+        (Some(registry_path), Some(manifest_sha256)) => {
+            verify_registry_pin(registry_path, manifest_sha256, key_hex)
+        }
+        _ => anyhow::bail!("--issuer-registry and --registry-sha256 must be supplied together"),
     }
 }
 
@@ -198,6 +178,7 @@ fn read_receipt(path: &Path) -> anyhow::Result<VcrReceipt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use tt_telemetry::vcr::{sign, verifying_key_hex, VcrReceipt};
     use uuid::Uuid;
 
@@ -253,6 +234,49 @@ mod tests {
         let path = write_test_receipt(dir.path(), "receipt.json", &sign_receipt());
         // run_verify_receipt prints + returns Ok on PASS.
         run_verify_receipt(path.to_str().unwrap(), &key_hex()).expect("a valid receipt verifies");
+    }
+
+    #[test]
+    fn verify_receipt_can_require_an_independently_pinned_active_issuer_keyset() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt_path = write_test_receipt(dir.path(), "receipt.json", &sign_receipt());
+        let public_key = key_hex();
+        let public_bytes = hex::decode(&public_key).unwrap();
+        let kid = format!(
+            "ed25519-sha256:{}",
+            hex::encode(Sha256::digest(&public_bytes))
+        );
+        let keyset = format!(
+            concat!(
+                "{{\"schema\":\"tokentrimmer.receipt-issuer-keyset.v1\",",
+                "\"revision\":1,\"issuer_id\":\"tokentrimmer.test\",",
+                "\"keys\":[{{\"kid\":\"{kid}\",\"algorithm\":\"Ed25519\",",
+                "\"public_key_hex\":\"{public_key}\",\"state\":\"active\",",
+                "\"valid_from\":\"2026-01-01T00:00:00Z\",",
+                "\"valid_until\":null,\"revoked_at\":null,",
+                "\"revocation_reason_code\":null}}]}}"
+            ),
+            kid = kid,
+            public_key = public_key,
+        );
+        let manifest_sha = hex::encode(Sha256::digest(keyset.as_bytes()));
+        let registry_path = dir.path().join("issuer-keyset.json");
+        std::fs::write(&registry_path, keyset).unwrap();
+
+        run_verify_receipt_with_registry(
+            receipt_path.to_str().unwrap(),
+            &public_key,
+            Some(registry_path.to_str().unwrap()),
+            Some(&manifest_sha),
+        )
+        .expect("signature and independently pinned active issuer key must both pass");
+        run_verify_receipt_with_registry(
+            receipt_path.to_str().unwrap(),
+            &public_key,
+            Some(registry_path.to_str().unwrap()),
+            Some(&"0".repeat(64)),
+        )
+        .expect_err("a correct signature must not hide a wrong issuer manifest pin");
     }
 
     #[test]

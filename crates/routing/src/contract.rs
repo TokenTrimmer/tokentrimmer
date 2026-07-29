@@ -407,7 +407,8 @@ fn validate_existing_rule(
     };
     let field = match &error {
         ValidationError::InvalidPauseFloor { .. } => "then.pause_floor_pass_rate",
-        ValidationError::InvalidPauseMinVerdicts => "then.pause_min_verdicts",
+        ValidationError::InvalidPauseMinVerdicts
+        | ValidationError::UnreachablePauseMinVerdicts { .. } => "then.pause_min_verdicts",
         ValidationError::InvalidReasoningEffortCap { .. } => "then.reasoning_max_effort",
         ValidationError::InvalidThinkingBudgetCap { .. } => "then.reasoning_budget_tokens",
         ValidationError::InvalidFormatSwitch { .. } => "then.format_switch",
@@ -579,7 +580,8 @@ mod tests {
             "when": { "content_type": "binary" },
             "then": {
                 "target_model": "gpt-4o-mini",
-                "traffic_pct": 101
+                "traffic_pct": 101,
+                "pause_min_verdicts": 101
             }
         }))
         .expect_err("runtime clamp/no-match values are rejected at write time");
@@ -588,6 +590,9 @@ mod tests {
             .iter()
             .any(|error| error.field == "when.content_type"));
         assert!(errors.iter().any(|error| error.field == "then.traffic_pct"));
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "then.pause_min_verdicts"));
     }
 
     #[test]

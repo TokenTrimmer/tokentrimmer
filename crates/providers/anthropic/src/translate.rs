@@ -335,6 +335,8 @@ pub(crate) fn forwards_enabled_thinking(req: &tt_shared::ChatCompletionRequest) 
 pub fn translate_request(
     req: tt_shared::ChatCompletionRequest,
 ) -> Result<AnthropicRequest, ProviderError> {
+    tt_shared::validate_chat_media_inputs(&req)
+        .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
     // Extended-thinking passthrough: resolved BEFORE the move-heavy message
     // translation below (it reads `extra` + the max_tokens fields). An
     // ENABLED forwarded config makes Anthropic reject temperature/top_p
@@ -714,6 +716,12 @@ fn translate_content_blocks(
                                 AnthropicImageSource::Base64 { media_type, data }
                             }
                             tt_shared::messages::DocumentSource::Url { url } => {
+                                if url.starts_with("file-") {
+                                    return Err(ProviderError::Unsupported(
+                                        "OpenAI document file_id is not supported by the Anthropic adapter"
+                                            .to_string(),
+                                    ));
+                                }
                                 match tt_shared::messages::parse_data_url(&url) {
                                     Some((media_type, data)) => {
                                         AnthropicImageSource::Base64 { media_type, data }

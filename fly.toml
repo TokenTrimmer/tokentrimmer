@@ -7,7 +7,7 @@
 # Required secrets (set with `fly secrets set KEY=value`):
 #   DATABASE_URL        Neon Postgres connection string
 #   REDIS_URL           Upstash Redis URL
-#   TT_MASTER_KEY       Hex-encoded XChaCha20-Poly1305 root key (provider creds at rest)
+#   TT_MASTER_KEY       Shared 32-byte encryption/HMAC root; rotate only via docs/SECRETS.md
 #   OTEL_EXPORTER_OTLP_ENDPOINT  (optional) — enables OTLP tracing export
 #
 # Deploy: `fly deploy`

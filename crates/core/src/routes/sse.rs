@@ -804,13 +804,13 @@ impl TrackedEventStream {
         //   - Get the streamed arbiter cost by repricing the accumulated usage.
         //   - Pass it through `arbiter_cost_plan.finalize` (Known discards it).
         //   - Sum with `leg_cost_total`.
+        let streamed_arbiter_usage = {
+            let guard = self.inner.lock().expect("tracking stream mutex poisoned");
+            partial_to_usage(&guard.snapshot())
+        };
         let streamed_arbiter_cost: Option<f64> = if let Some(pricing) = self.pricing.as_ref() {
-            let usage = {
-                let guard = self.inner.lock().expect("tracking stream mutex poisoned");
-                guard.snapshot()
-            };
             let breakdown = crate::routes::chat::compute_cost_full(
-                &partial_to_usage(&usage),
+                &streamed_arbiter_usage,
                 Some(pricing),
                 self.baseline_pricing.as_ref(),
                 self.fee_multiplier,
@@ -834,8 +834,11 @@ impl TrackedEventStream {
             &p.arbiter_detail,
             p.quorum_required,
             p.quorum_met,
-            total_cost_usd,
-            arbiter_cost_usd,
+            crate::routes::panel::PanelTerminalAccounting {
+                total_cost_usd,
+                arbiter_cost_usd,
+                arbiter_usage: Some(&streamed_arbiter_usage),
+            },
         );
         match serde_json::to_string(&value) {
             Ok(json) => Some(Event::default().event("tokentrimmer.panel").data(json)),
@@ -1768,16 +1771,13 @@ fn attach_sse_headers(mut response: Response, trace_id_str: &str, provider_id: &
 fn partial_to_usage(u: &PartialUsage) -> Usage {
     let prompt = u.input_tokens.max(0) as u64;
     let completion = u.output_tokens.max(0) as u64;
-    let cache_creation = u.cache_creation_tokens.unwrap_or(0).max(0) as u64;
     Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: prompt + completion,
         cached_tokens: u.cached_tokens.max(0) as u64,
-        cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation),
-        // The cost math consumes only the folds above; the raw Option is not
-        // threaded here (the request_logs row takes it from the snapshot).
-        cache_read_input_tokens: None,
+        cache_creation_input_tokens: u.cache_creation_tokens.map(|value| value.max(0) as u64),
+        cache_read_input_tokens: u.cache_read_tokens.map(|value| value.max(0) as u64),
     }
 }
 

@@ -153,6 +153,18 @@ jobs:
       # is itself one of the ignored tests we want covered, and it's idempotent.
       - name: Apply migrations (tt-core migrate_only)
         run: cargo test -p tt-core --test migrations -- --include-ignored migrate_only_applies_schema
+      # Exercise the complete production request-log INSERT bind chain against
+      # the migrated schema, including nonzero itemized cost components.
+      - name: tt-core request-log cost breakdown PostgreSQL round trip (ignored)
+        run: >-
+          cargo test -p tt-core --test migrations
+          request_logs_insert_round_trips_against_postgres
+          -- --include-ignored --exact
+      # Canonical route persistence: exact canonical JSON reaches PostgreSQL,
+      # management readback retains the active hash, and the production
+      # PostgreSQL runtime store feeds the real matcher.
+      - name: tt-core canonical route PostgreSQL round trip (ignored)
+        run: cargo test -p tt-core --test routes_pg -- --include-ignored
       # Exact retained-definition reads, newest-first history, value-free
       # comparison inputs, and conditional immutable appends must stay bounded,
       # concurrency-safe, and tenant-scoped against the migrated schema.

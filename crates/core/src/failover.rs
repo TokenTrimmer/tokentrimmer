@@ -1107,6 +1107,7 @@ mod tests {
             "cost-primary",
             "cost-fallback",
             "cost-final",
+            "audio-prov",
             "openai",
             "gemini",
             "prov",
@@ -1960,6 +1961,7 @@ mod tests {
                 image_url: tt_shared::messages::ImageUrl {
                     url: "data:image/png;base64,abc".into(),
                     detail: None,
+                    media_type: None,
                 },
             }]),
             name: None,
@@ -1992,6 +1994,65 @@ mod tests {
             "text-only model must be skipped"
         );
         assert_eq!(resp.model, "vision-model");
+    }
+
+    /// Audio is an independent capability: a Vision-only candidate is skipped
+    /// in favor of a model that explicitly advertises Audio.
+    #[tokio::test]
+    async fn audio_request_skips_vision_only_candidate_uses_audio_model() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(CapMockProvider {
+            id: "vision-prov",
+            info: model_info_with(
+                "vision-model",
+                vec![Capability::Text, Capability::Vision],
+                128_000,
+            ),
+        }));
+        reg.register(Arc::new(CapMockProvider {
+            id: "audio-prov",
+            info: model_info_with(
+                "audio-model",
+                vec![Capability::Text, Capability::Audio],
+                128_000,
+            ),
+        }));
+
+        let breaker = CircuitBreaker::default();
+        let mut audio_req = req("vision-model");
+        audio_req.messages = vec![Message::User {
+            content: tt_shared::MessageContent::Parts(vec![tt_shared::ContentPart::InputAudio {
+                input_audio: tt_shared::messages::InputAudio {
+                    data: "UklGRiYAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQIAAAAAAA==".into(),
+                    format: "wav".into(),
+                },
+            }]),
+            name: None,
+        }];
+        let required = tt_shared::RequiredCapabilities::from_request(&audio_req);
+        assert!(required.audio, "should detect audio requirement");
+        assert!(!required.vision, "audio must not imply vision");
+
+        let candidates = vec!["vision-model".to_string(), "audio-model".to_string()];
+        let (provider, resp) = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &audio_req,
+            &ctx(),
+            &all_creds(),
+            now(),
+            Some(CapCheck {
+                required: &required,
+                estimated_tokens: 0,
+            }),
+            None,
+        )
+        .await
+        .expect("audio-model should serve");
+        assert_eq!(provider.id(), "audio-prov");
+        assert_eq!(resp.model, "audio-model");
     }
 
     /// (b) A request whose estimated input exceeds a candidate's max_input_tokens
@@ -2191,7 +2252,7 @@ mod tests {
         let plain = req("capable-model");
         let required = tt_shared::RequiredCapabilities::from_request(&plain);
         // plain request has no special requirements
-        assert!(!required.vision && !required.tools && !required.json_mode);
+        assert!(!required.vision && !required.audio && !required.tools && !required.json_mode);
 
         let candidates = vec!["capable-model".to_string()];
         let (provider, resp) = dispatch_with_failover(

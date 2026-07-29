@@ -214,8 +214,12 @@ export function validateDeployWorkflowTopology({ ci, deploy, workflows }) {
   const verifyTrust = deployJobs ? directEntry(deployLines, deployJobs, "verify-trust") : null;
   const preflight = deployJobs ? directEntry(deployLines, deployJobs, "preflight") : null;
   const staging = deployJobs ? directEntry(deployLines, deployJobs, "staging") : null;
-  if (!verifyTrust || !preflight || !staging) {
-    errors.push(`${DEPLOY_WORKFLOW_PATH}: verify-trust, preflight, and staging jobs are all required`);
+  const productionApproval = deployJobs
+    ? directEntry(deployLines, deployJobs, "verify-production-approval")
+    : null;
+  const prod = deployJobs ? directEntry(deployLines, deployJobs, "prod") : null;
+  if (!verifyTrust || !preflight || !staging || !productionApproval || !prod) {
+    errors.push(`${DEPLOY_WORKFLOW_PATH}: verify-trust, preflight, staging, verify-production-approval, and prod jobs are all required`);
   } else {
     if (directEntry(deployLines, verifyTrust, "if")?.value !== "github.event_name == 'push' && github.ref == 'refs/heads/main'") {
       errors.push(`${DEPLOY_WORKFLOW_PATH}: verify-trust must be restricted to a main push`);
@@ -242,6 +246,38 @@ export function validateDeployWorkflowTopology({ ci, deploy, workflows }) {
     }
     if (directEntry(deployLines, staging, "if")?.value !== "needs.preflight.outputs.enabled == 'true'") {
       errors.push(`${DEPLOY_WORKFLOW_PATH}: staging must require an enabled preflight`);
+    }
+    if (directEntry(deployLines, productionApproval, "needs")?.value !== "staging") {
+      errors.push(`${DEPLOY_WORKFLOW_PATH}: verify-production-approval must depend on staging`);
+    }
+    if (directEntry(deployLines, productionApproval, "if")?.value !== "needs.staging.result == 'success'") {
+      errors.push(`${DEPLOY_WORKFLOW_PATH}: verify-production-approval must require successful staging`);
+    }
+    validateReadOnlyPermissions(
+      deployLines,
+      productionApproval,
+      `${DEPLOY_WORKFLOW_PATH}: verify-production-approval`,
+      errors,
+    );
+    const approvalSource = sourceBlock(deployLines, productionApproval);
+    if (/\bsecrets\./.test(approvalSource)) {
+      errors.push(`${DEPLOY_WORKFLOW_PATH}: verify-production-approval must not read repository secrets`);
+    }
+    if (
+      !approvalSource.includes('gh api "repos/$REPOSITORY/environments/production"')
+      || !approvalSource.includes("required_reviewers")
+      || !approvalSource.includes("prevent_self_review !== true")
+      || !approvalSource.includes("environment.can_admins_bypass !== false")
+      || !approvalSource.includes("branchPolicy.protected_branches !== true")
+      || !approvalSource.includes("branchPolicy.custom_branch_policies !== false")
+    ) {
+      errors.push(`${DEPLOY_WORKFLOW_PATH}: verify-production-approval must inspect required reviewers, self-review prevention, admin bypass, and protected-branch policy`);
+    }
+    if (directEntry(deployLines, prod, "needs")?.value !== "[staging, verify-production-approval]") {
+      errors.push(`${DEPLOY_WORKFLOW_PATH}: prod must depend on staging and verify-production-approval`);
+    }
+    if (directEntry(deployLines, prod, "environment")?.value !== "production") {
+      errors.push(`${DEPLOY_WORKFLOW_PATH}: prod must retain environment: production`);
     }
   }
 

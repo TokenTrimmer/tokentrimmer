@@ -712,7 +712,7 @@ pub(crate) struct StoredRun {
 }
 
 /// L1 key for a run record, scoped by org so a fetch with the wrong org misses.
-fn run_key(org_id: uuid::Uuid, run_id: uuid::Uuid) -> String {
+pub(crate) fn run_key(org_id: uuid::Uuid, run_id: uuid::Uuid) -> String {
     format!("tt:runs:{org_id}:{run_id}")
 }
 
@@ -1782,11 +1782,20 @@ pub async fn submit_tool_outputs(
         )
     })?;
 
-    // (3) Fetch scoped by (org, id); a wrong-org caller cleanly misses → 404.
+    // (3) Single-flight before the read: transcript deletion uses the same key,
+    // so no resume may read a record, lose the fence to a delete, and then
+    // resurrect the deleted transcript with a later write.
+    let sf_key = run_key(org, id);
+    let _guard = state
+        .single_flight
+        .try_become_leader(&sf_key)
+        .map_err(|_| ApiError::Conflict(format!("run {id} is already being resumed or deleted")))?;
+
+    // (4) Fetch scoped by (org, id); a wrong-org caller cleanly misses → 404.
     let mut stored = fetch_run(l1.cache.as_ref(), org, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no run with id {id}")))?;
-    // (4) Only a paused (`requires_action`) run accepts tool outputs.
+    // (5) Only a paused (`requires_action`) run accepts tool outputs.
     if stored.status != RunStatus::RequiresAction {
         return Err(ApiError::Conflict(format!(
             "run {id} is {:?}, not awaiting tool outputs",
@@ -1794,7 +1803,7 @@ pub async fn submit_tool_outputs(
         )));
     }
 
-    // (5) The submitted ids must EXACTLY cover the pending client tool_calls.
+    // (6) The submitted ids must EXACTLY cover the pending client tool_calls.
     let pending_ids: std::collections::HashSet<&str> = stored
         .pending_tool_calls
         .iter()
@@ -1810,15 +1819,6 @@ pub async fn submit_tool_outputs(
             "tool_outputs must cover exactly the pending tool_call ids {pending_ids:?}"
         )));
     }
-
-    // (6) Single-flight: only one resume drives a given run at a time. The guard
-    // is held across the resume so a concurrent caller (loser) is rejected for
-    // the run's whole resume rather than racing into a second loop.
-    let sf_key = run_key(org, id);
-    let _guard = state
-        .single_flight
-        .try_become_leader(&sf_key)
-        .map_err(|_| ApiError::Conflict(format!("run {id} is already being resumed")))?;
 
     // Append each submitted output as a Tool message answering its pending
     // client tool_call (gateway results were appended at pause, so every

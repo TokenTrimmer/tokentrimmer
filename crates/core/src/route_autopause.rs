@@ -55,7 +55,7 @@ pub const DEFAULT_PAUSE_FLOOR_PASS_RATE: f64 = 0.90;
 pub const DEFAULT_PAUSE_MIN_VERDICTS: u32 = 20;
 
 /// Most recent classified verdicts considered (the rolling window).
-pub const PAUSE_WINDOW_MAX_VERDICTS: u32 = 100;
+pub const PAUSE_WINDOW_MAX_VERDICTS: u32 = tt_routing::PAUSE_MIN_VERDICTS_MAX;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WindowError {

@@ -357,6 +357,8 @@ pub fn validate_model_id(model: &str) -> Result<(), ProviderError> {
 pub fn translate_request(
     req: tt_shared::ChatCompletionRequest,
 ) -> Result<GeminiRequest, ProviderError> {
+    tt_shared::validate_chat_media_inputs(&req)
+        .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
     let mut system_parts: Vec<GeminiTextPart> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
 
@@ -537,7 +539,8 @@ fn translate_user_content(content: MessageContent) -> Result<Vec<GeminiPart>, Pr
                     }
                     ContentPart::ImageUrl { image_url } => {
                         // A base64 `data:` URI is sent as inlineData; a remote
-                        // URL is sent as fileData.
+                        // URL is sent as fileData. Extensionless private object
+                        // references carry an exact TokenTrimmer-only MIME hint.
                         match tt_shared::messages::parse_data_url(&image_url.url) {
                             Some((mime_type, data)) => {
                                 gemini_parts.push(GeminiPart::InlineData(GeminiInlineData {
@@ -546,7 +549,9 @@ fn translate_user_content(content: MessageContent) -> Result<Vec<GeminiPart>, Pr
                                 }));
                             }
                             None => {
-                                let mime_type = guess_mime_from_url(&image_url.url);
+                                let mime_type = image_url
+                                    .effective_media_type()
+                                    .unwrap_or_else(|| guess_mime_from_url(&image_url.url));
                                 gemini_parts.push(GeminiPart::FileData(GeminiFileData {
                                     mime_type,
                                     file_uri: image_url.url,
@@ -554,10 +559,23 @@ fn translate_user_content(content: MessageContent) -> Result<Vec<GeminiPart>, Pr
                             }
                         }
                     }
-                    ContentPart::InputAudio { .. } => {
-                        return Err(ProviderError::Unsupported(
-                            "audio input is not supported by the Gemini adapter".to_string(),
-                        ));
+                    ContentPart::InputAudio { input_audio } => {
+                        // Canonical audio validation has already closed format
+                        // to wav/mp3 and data to standard base64. Gemini accepts
+                        // inline audio bytes with an explicit MIME type.
+                        let mime_type = match input_audio.format.as_str() {
+                            "wav" => "audio/wav",
+                            "mp3" => "audio/mpeg",
+                            _ => {
+                                return Err(ProviderError::InvalidRequest(
+                                    "input_audio format must be wav or mp3".to_string(),
+                                ));
+                            }
+                        };
+                        gemini_parts.push(GeminiPart::InlineData(GeminiInlineData {
+                            mime_type: mime_type.to_string(),
+                            data: input_audio.data,
+                        }));
                     }
                     // Document Lane (D4a): a document part maps to Gemini's
                     // inline_data (base64 bytes, e.g. a PDF) or file_data (remote
@@ -572,6 +590,12 @@ fn translate_user_content(content: MessageContent) -> Result<Vec<GeminiPart>, Pr
                             }));
                         }
                         tt_shared::messages::DocumentSource::Url { url } => {
+                            if url.starts_with("file-") {
+                                return Err(ProviderError::Unsupported(
+                                    "OpenAI document file_id is not supported by the Gemini adapter"
+                                        .to_string(),
+                                ));
+                            }
                             match tt_shared::messages::parse_data_url(&url) {
                                 Some((mime_type, data)) => {
                                     gemini_parts.push(GeminiPart::InlineData(GeminiInlineData {
@@ -598,7 +622,11 @@ fn translate_user_content(content: MessageContent) -> Result<Vec<GeminiPart>, Pr
 
 /// Guess a MIME type from a URL's extension. Falls back to `"image/jpeg"`.
 fn guess_mime_from_url(url: &str) -> String {
-    let lower = url.to_lowercase();
+    let lower = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
     if lower.ends_with(".png") {
         "image/png".to_string()
     } else if lower.ends_with(".gif") {

@@ -236,10 +236,12 @@ null/absent on legacy receipts. Any party with the share URL can reconstruct the
 canonical string + check the Ed25519 signature with that key — offline, no
 TokenTrimmer network call beyond fetching the receipt.
 
-`tt verify-receipt` verifies all four currently supported families offline:
+`tt verify-receipt` verifies all five currently supported signed families
+offline:
 **compression** (`vcr:v1|`), **cache-hit** (`l2:v1|`), **workflow-run**
 (`wfr:v1|` through `wfr:v4|`), and top-level **agent-run** (`arr:v1|` /
-`arr:v2|`). ARR
+`arr:v2|`), plus Cloud-minted **Chat dispatch** (`ctdr:v1|`) gateway-accounting
+artifacts. ARR
 deliberately has no `workflow_id`; see
 [`07-agent-runs-api-reference.md`](07-agent-runs-api-reference.md) for its
 canonical fields and mint boundary. Supply a verifying key obtained and trusted
@@ -259,6 +261,13 @@ public canonical builder and `tt verify-receipt`; they pin JSON field names,
 canonical bytes, and Ed25519 encoding without asserting anything about the
 issuer or provider-invoice evidence. Rust generation drift and an independent
 JavaScript forged-fixture verifier are blocking CI checks.
+
+The standalone
+[CTDR v1 interoperability vector](receipt-spec/ctdr-v1.golden.json) is consumed
+by the public CLI but intentionally is not part of the generated public-core
+manifest: the Cloud product owns that artifact's signer and schema. Its public
+verifier fails closed on unknown fields and replays the signed
+`tt.request-delta-estimate.v1` formula when all components are present.
 
 ## Example
 

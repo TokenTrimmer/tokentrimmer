@@ -2,6 +2,38 @@
 //! tests added later; here we just verify the migrator compiles and references
 //! the expected version.
 
+/// Public owns `request_logs`, while the shared Cloud schema adds its
+/// production `request_logs.org_id -> orgs.id` tenant predicate. Keep these
+/// Public writer round trips valid in both layouts without making the gateway
+/// migrator own or depend on the Cloud `orgs` table.
+async fn seed_shared_cloud_org_if_present(pool: &sqlx::PgPool, org_id: uuid::Uuid) -> bool {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('public.orgs') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .expect("inspect optional shared Cloud orgs table");
+    if exists {
+        sqlx::query(
+            "INSERT INTO public.orgs (id, name) VALUES ($1, 'Public migration writer fixture') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .expect("seed shared Cloud org parent");
+    }
+    exists
+}
+
+async fn cleanup_shared_cloud_org(pool: &sqlx::PgPool, org_id: uuid::Uuid, seeded: bool) {
+    if seeded {
+        sqlx::query("DELETE FROM public.orgs WHERE id = $1")
+            .bind(org_id)
+            .execute(pool)
+            .await
+            .expect("cleanup shared Cloud org parent");
+    }
+}
+
 #[test]
 fn migrator_includes_first_migration() {
     let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
@@ -391,6 +423,27 @@ fn migrator_includes_versioned_workflow_environment_variables() {
     }
 }
 
+#[test]
+fn migrator_includes_master_key_rotation_fence() {
+    let migration = tt_core::db::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 46)
+        .expect("migration version 46 not found");
+    assert!(
+        migration.description.contains("master key rotation"),
+        "migration 0046 description is '{}', expected master-key rotation semantics",
+        migration.description
+    );
+    let up = include_str!("../migrations/0046_master_key_rotation.up.sql");
+    let down = include_str!("../migrations/0046_master_key_rotation.down.sql");
+    assert!(up.contains("CREATE TABLE IF NOT EXISTS public.master_key_rotation"));
+    assert!(up.contains("'in_progress'"));
+    assert!(up.contains("'awaiting_promotion'"));
+    assert!(up.contains("new_key_fingerprint <> old_key_fingerprint"));
+    assert!(!up.contains("TT_NEW_MASTER_KEY"));
+    assert!(down.contains("DROP TABLE IF EXISTS public.master_key_rotation"));
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -514,10 +567,12 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
     tt_core::migrate_only(&url).await.expect("migrate");
     let pool = tt_core::connect(&url, 2).await.expect("connect");
     let writer = PostgresRequestLogWriter::new(pool.clone());
+    let org_id = Uuid::new_v4();
+    let shared_cloud_org = seed_shared_cloud_org_if_present(&pool, org_id).await;
 
     let base = RequestLogRow {
         id: Uuid::now_v7(),
-        org_id: Uuid::nil(),
+        org_id,
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
@@ -624,6 +679,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         .execute(&pool)
         .await
         .expect("cleanup");
+    cleanup_shared_cloud_org(&pool, org_id, shared_cloud_org).await;
 }
 
 /// DB-gated: a real `PostgresRequestLogWriter` INSERT against the migrated
@@ -644,11 +700,13 @@ async fn request_log_insert_round_trips_batch_columns() {
     tt_core::migrate_only(&url).await.expect("migrate");
     let pool = tt_core::connect(&url, 2).await.expect("connect");
     let writer = PostgresRequestLogWriter::new(pool.clone());
+    let org_id = Uuid::new_v4();
+    let shared_cloud_org = seed_shared_cloud_org_if_present(&pool, org_id).await;
 
     let marked = RequestLogRow {
         route_paused: false,
         id: Uuid::now_v7(),
-        org_id: Uuid::nil(),
+        org_id,
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
@@ -743,6 +801,7 @@ async fn request_log_insert_round_trips_batch_columns() {
         .execute(&pool)
         .await
         .expect("cleanup");
+    cleanup_shared_cloud_org(&pool, org_id, shared_cloud_org).await;
 }
 
 /// DB-gated T0: the FULL `PostgresRequestLogWriter::write` bind chain executes
@@ -767,10 +826,12 @@ async fn request_logs_insert_round_trips_against_postgres() {
     tt_core::migrate_only(&url).await.expect("migrate");
     let pool = tt_core::connect(&url, 2).await.expect("connect");
     let writer = PostgresRequestLogWriter::new(pool.clone());
+    let org_id = Uuid::new_v4();
+    let shared_cloud_org = seed_shared_cloud_org_if_present(&pool, org_id).await;
 
     let row = RequestLogRow {
         id: Uuid::now_v7(),
-        org_id: Uuid::nil(),
+        org_id,
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
@@ -920,6 +981,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
         .execute(&pool)
         .await
         .expect("cleanup");
+    cleanup_shared_cloud_org(&pool, org_id, shared_cloud_org).await;
 }
 
 /// DB-gated: a real `PostgresRequestLogWriter` INSERT against the migrated
@@ -941,10 +1003,12 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
     tt_core::migrate_only(&url).await.expect("migrate");
     let pool = tt_core::connect(&url, 2).await.expect("connect");
     let writer = PostgresRequestLogWriter::new(pool.clone());
+    let org_id = Uuid::new_v4();
+    let shared_cloud_org = seed_shared_cloud_org_if_present(&pool, org_id).await;
 
     let shaped = RequestLogRow {
         id: Uuid::now_v7(),
-        org_id: Uuid::nil(),
+        org_id,
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
@@ -1049,4 +1113,5 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         .execute(&pool)
         .await
         .expect("cleanup");
+    cleanup_shared_cloud_org(&pool, org_id, shared_cloud_org).await;
 }

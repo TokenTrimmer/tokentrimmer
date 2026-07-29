@@ -418,3 +418,49 @@ async fn download_file_content_401_unauthorized() {
         "expected Unauthorized, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn delete_file_requires_exact_confirmation() {
+    let server = MockServer::start();
+    let deletion = server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/files/file-output456")
+            .header("authorization", "Bearer test-key");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "id": "file-output456",
+                "object": "file",
+                "deleted": true
+            }));
+    });
+    let ctx = make_ctx(&server.base_url());
+    let result = provider()
+        .delete_file("file-output456", &ctx)
+        .await
+        .expect("exact deletion confirmation");
+    deletion.assert();
+    assert_eq!(result.id, "file-output456");
+    assert!(result.deleted);
+}
+
+#[tokio::test]
+async fn delete_file_rejects_mismatched_success_body() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(DELETE).path("/files/file-output456");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "id": "file-other",
+                "object": "file",
+                "deleted": true
+            }));
+    });
+    let ctx = make_ctx(&server.base_url());
+    let error = provider()
+        .delete_file("file-output456", &ctx)
+        .await
+        .expect_err("mismatched confirmation must fail closed");
+    assert!(matches!(error, ProviderError::Deserialize(_)));
+}

@@ -172,6 +172,14 @@ pub fn build_router_with_retrieval(
         // distinct from `/v1/models`: catalog metadata does not prove gateway
         // feature gates, credential readiness, or provider acceptance.
         .route("/v1/capabilities", get(routes::capabilities::handler))
+        .route(
+            "/v1/capabilities/preflight",
+            post(routes::request_preflight::handler),
+        )
+        .route(
+            "/v1/capabilities/preflight/batch",
+            post(routes::request_preflight::batch_handler),
+        )
         .route("/v1/embeddings", post(routes::embeddings::handler))
         // POST creates a new run; GET lists the caller's runs (org-scoped,
         // newest-first, durable Postgres view — no transcript). The bare list
@@ -183,6 +191,11 @@ pub fn build_router_with_retrieval(
             post(routes::agent_run::create_run).get(routes::agent_run::list_runs),
         )
         .route("/v1/agent/runs/:id", get(routes::agent_run::get_run))
+        .route(
+            "/v1/agent/runs/:id/transcript",
+            get(routes::agent_run_transcript::export_transcript)
+                .delete(routes::agent_run_transcript::delete_transcript),
+        )
         .route(
             "/v1/agent/runs/:id/tool_outputs",
             post(routes::agent_run::submit_tool_outputs),
@@ -210,7 +223,9 @@ pub fn build_router_with_retrieval(
         // cap. Same auth seam; backs the MCP `set_cost_limit` tool.
         .route("/v1/spend/limit", post(routes::spend_api::set_spend_limit))
         // Batch Lane (slice 2): OpenAI-compatible submit/status + file proxy.
-        // Non-streaming, so the short timeout tier. The slice-3 worker owns
+        // Control handlers establish their responses on the short timeout
+        // tier; file content then streams through the response body without
+        // gateway/provider/client accumulation. The slice-3 worker owns
         // long-running polling; these handlers only proxy + persist.
         .route("/v1/files", post(routes::batches::upload_file))
         .route(
@@ -317,10 +332,19 @@ pub fn build_router_with_retrieval(
         )),
     };
 
-    base.layer(axum::middleware::from_fn_with_state(
+    let base = base.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         middleware::auth::middleware,
-    ))
+    ));
+
+    // This cleanup executor is not a tenant API route. Adding it after the
+    // bearer-auth layer keeps that global bearer out of the trust boundary;
+    // the handler requires its own short-lived, domain-separated HMAC
+    // capability and fails closed unless boot explicitly wires it.
+    base.route(
+        "/internal/v1/account-purge/l1",
+        post(routes::account_purge::purge_l1),
+    )
     .layer(axum::middleware::from_fn(middleware::trace::middleware))
     .layer(TraceLayer::new_for_http())
     // Request timeouts are applied per-route above (ARCH-4), not as a single
@@ -354,7 +378,8 @@ mod tests {
     use crate::ProviderRegistry;
 
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{header, Request, StatusCode};
+    use sha2::{Digest, Sha256};
     use tower::util::ServiceExt;
 
     // ── Mock provider ──────────────────────────────────────────────────────────
@@ -616,6 +641,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
 
         let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
             .await
@@ -623,6 +659,32 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["object"], "list");
         assert_eq!(body["data"].as_array().unwrap().len(), 0);
+        assert_eq!(body["tokentrimmer"]["schema_version"], 1);
+        assert_eq!(body["tokentrimmer"]["snapshot_scope"], "responding_process");
+        assert_eq!(
+            body["tokentrimmer"]["source"],
+            "registered_provider_catalog"
+        );
+        assert_eq!(
+            body["tokentrimmer"]["limitations"]["provider_credentials"],
+            "not_inspected"
+        );
+        assert_eq!(
+            body["tokentrimmer"]["limitations"]["provider_health"],
+            "not_probed"
+        );
+        assert_eq!(
+            body["tokentrimmer"]["limitations"]["request_acceptance"],
+            "not_negotiated"
+        );
+        assert_eq!(
+            body["tokentrimmer"]["limitations"]["fleet_consistency"],
+            "not_attested"
+        );
+        let digest = body["tokentrimmer"]["snapshot_sha256"]
+            .as_str()
+            .expect("snapshot digest");
+        assert_eq!(digest, hex::encode(Sha256::digest(b"[]")));
     }
 
     #[tokio::test]
@@ -662,6 +724,14 @@ mod tests {
             .find(|m| m["id"] == "gpt-4o")
             .expect("gpt-4o present");
         assert_eq!(gpt4o["tokentrimmer"]["provider"], "openai");
+        assert!(
+            gpt4o["tokentrimmer"]["capabilities"]
+                .as_array()
+                .expect("capabilities")
+                .iter()
+                .any(|capability| capability == "json_mode"),
+            "multiword capability names must retain their snake_case wire form"
+        );
 
         // Anthropic models should appear too once the adapter registers.
         for expected in ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"] {

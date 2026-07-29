@@ -19,10 +19,14 @@
 //!
 //! Wire into Axum via [`axum::middleware::from_fn`]:
 //!
-//! ```rust,ignore
-//! Router::new()
+//! ```rust,no_run
+//! use axum::Router;
+//! use tt_core::middleware::trace;
+//!
+//! let app = Router::<()>::new()
 //!     /* …routes… */
-//!     .layer(axum::middleware::from_fn(crate::middleware::trace::middleware))
+//!     .layer(axum::middleware::from_fn(trace::middleware));
+//! # let _ = app;
 //! ```
 //!
 //! [`traceparent`]: https://www.w3.org/TR/trace-context/
@@ -40,15 +44,24 @@ use uuid::Uuid;
 
 /// Response header injected into every HTTP response.
 pub const TRACE_ID_HEADER: HeaderName = HeaderName::from_static("x-tokentrimmer-trace-id");
+/// OpenTelemetry attribute carrying the same gateway request-correlation UUID.
+///
+/// This is deliberately not the W3C/OpenTelemetry trace ID: it joins exported
+/// spans back to TokenTrimmer request logs, response headers, and receipts.
+pub const OTEL_TRACE_ID_ATTRIBUTE: &str = "tokentrimmer.trace_id";
 
 /// Request extension that makes the trace-id available to inner handlers
 /// without requiring them to parse the response header.
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// use axum::{extract::Extension, response::IntoResponse};
+/// use tt_core::middleware::trace::TraceId;
+///
 /// async fn my_handler(Extension(trace): Extension<TraceId>) -> impl IntoResponse {
 ///     println!("handling request {}", trace.0);
+///     "ok"
 /// }
 /// ```
 #[derive(Clone, Debug)]
@@ -73,6 +86,9 @@ pub async fn middleware(mut req: Request, next: Next) -> Response {
         method = %req.method(),
         path = %req.uri().path(),
     );
+    // Keep the product correlation UUID explicit and backend-queryable. The
+    // OTel trace/span identity remains owned by the active trace context.
+    span.set_attribute(OTEL_TRACE_ID_ATTRIBUTE, trace_id.clone());
 
     // Honour an inbound W3C `traceparent`: continue the caller's distributed
     // trace by parenting this span on the extracted remote context. No-op when

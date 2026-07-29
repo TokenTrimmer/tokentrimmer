@@ -8,8 +8,12 @@
 //! - [`OpenAiProvider::create_batch`] — `POST /batches` → [`Batch`].
 //! - [`OpenAiProvider::get_batch`] — `GET /batches/{id}` → [`Batch`].
 //! - [`OpenAiProvider::cancel_batch`] — `POST /batches/{id}/cancel` → [`Batch`].
-//! - [`OpenAiProvider::download_file_content`] — `GET /files/{id}/content` →
-//!   the raw result/error JSONL bytes.
+//! - [`OpenAiProvider::stream_file_content`] — `GET /files/{id}/content` →
+//!   a bounded-memory stream of the raw result/error JSONL bytes.
+//! - [`OpenAiProvider::download_file_content`] — compatibility helper that
+//!   collects that stream into one byte buffer.
+//! - [`OpenAiProvider::delete_file`] — `DELETE /files/{id}` → a strict
+//!   [`DeletedFile`] confirmation.
 //!
 //! All methods reuse the adapter's existing [`reqwest::Client`], bearer auth,
 //! `base_url` resolution + SSRF validation, extra-header forwarding, and the
@@ -17,13 +21,20 @@
 //! behaviour matches the chat/embeddings paths exactly. This module is purely a
 //! client capability: it does **not** touch the gateway dispatch.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::{stream::BoxStream, StreamExt as _};
 use reqwest::multipart;
 use serde::Deserialize;
 use tracing::instrument;
 use tt_shared::{filter_extra_headers, validate_provider_url, ProviderError, RequestContext};
 
 use crate::{errors, OpenAiProvider};
+
+/// Maximum provider error-body bytes retained while establishing a file
+/// content stream. Successful file bytes are not accumulated by
+/// [`OpenAiProvider::stream_file_content`].
+const FILE_ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+const BATCH_JSON_BODY_MAX_BYTES: usize = 1024 * 1024;
 
 /// Status of an OpenAI batch, mirroring the API's `status` field.
 ///
@@ -103,6 +114,17 @@ struct FileObject {
     id: String,
 }
 
+/// Provider confirmation returned after deleting one file.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeletedFile {
+    /// The exact provider file id that was deleted.
+    pub id: String,
+    /// Must be the OpenAI wire discriminator `"file"`.
+    pub object: String,
+    /// Must be `true`; a false success body fails closed.
+    pub deleted: bool,
+}
+
 impl OpenAiProvider {
     /// Resolve + validate the base URL for a batch call, mirroring the chat path.
     fn batch_base_url<'a>(&self, ctx: &'a RequestContext) -> Result<&'a str, ProviderError> {
@@ -132,9 +154,8 @@ impl OpenAiProvider {
         builder
     }
 
-    /// Read the response status + `Retry-After`, returning the body text and
-    /// mapping any HTTP ≥ 400 to a [`ProviderError`] — identical to the
-    /// chat/embeddings paths.
+    /// Read the response status + `Retry-After`, returning a bounded metadata
+    /// body and mapping any HTTP ≥ 400 to a [`ProviderError`].
     async fn read_response(response: reqwest::Response) -> Result<String, ProviderError> {
         let status = response.status().as_u16();
         let retry_after = response
@@ -143,7 +164,20 @@ impl OpenAiProvider {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let response_text = response.text().await.map_err(errors::map_reqwest_error)?;
+        let mut body = BytesMut::new();
+        let mut oversized = false;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(errors::map_reqwest_error)?;
+            let remaining = BATCH_JSON_BODY_MAX_BYTES.saturating_sub(body.len());
+            if chunk.len() > remaining {
+                body.extend_from_slice(&chunk[..remaining]);
+                oversized = true;
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let response_text = String::from_utf8_lossy(&body).into_owned();
 
         if status >= 400 {
             return Err(errors::map_response_error(
@@ -151,6 +185,11 @@ impl OpenAiProvider {
                 &response_text,
                 retry_after.as_deref(),
             ));
+        }
+        if oversized {
+            return Err(ProviderError::Deserialize(format!(
+                "provider Batch metadata response exceeded {BATCH_JSON_BODY_MAX_BYTES} bytes"
+            )));
         }
         Ok(response_text)
     }
@@ -261,17 +300,19 @@ impl OpenAiProvider {
         serde_json::from_str(&resp_body).map_err(|e| ProviderError::Deserialize(e.to_string()))
     }
 
-    /// Download the raw content of a file via `GET /files/{file_id}/content`.
+    /// Stream the raw content of a file via `GET /files/{file_id}/content`.
     ///
     /// Used to fetch a batch's result/error JSONL (the `output_file_id` /
-    /// `error_file_id` from a completed [`Batch`]). Returns the raw bytes;
-    /// callers parse the JSONL.
+    /// `error_file_id` from a completed [`Batch`]). The successful response is
+    /// not accumulated here. An HTTP error body is retained only up to
+    /// [`FILE_ERROR_BODY_MAX_BYTES`] before it is mapped to a
+    /// [`ProviderError`].
     #[instrument(skip(self, ctx), fields(provider = "openai", file_id = file_id))]
-    pub async fn download_file_content(
+    pub async fn stream_file_content(
         &self,
         file_id: &str,
         ctx: &RequestContext,
-    ) -> Result<Bytes, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
         let base_url = self.batch_base_url(ctx)?;
         let url = format!("{base_url}/files/{file_id}/content");
 
@@ -280,7 +321,8 @@ impl OpenAiProvider {
         let response = builder.send().await.map_err(errors::map_reqwest_error)?;
 
         // File-content responses are not JSON; map HTTP errors (which *are*
-        // JSON-enveloped) the same way, then return the raw body bytes.
+        // normally JSON-enveloped) the same way, but never retain an
+        // arbitrarily large error body.
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -289,14 +331,76 @@ impl OpenAiProvider {
             .map(|s| s.to_string());
 
         if status >= 400 {
-            let text = response.text().await.map_err(errors::map_reqwest_error)?;
+            let mut body = BytesMut::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(errors::map_reqwest_error)?;
+                let remaining = FILE_ERROR_BODY_MAX_BYTES.saturating_sub(body.len());
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if remaining <= chunk.len() {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&body);
             return Err(errors::map_response_error(
                 status,
-                &text,
+                text.as_ref(),
                 retry_after.as_deref(),
             ));
         }
 
-        response.bytes().await.map_err(errors::map_reqwest_error)
+        Ok(response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(errors::map_reqwest_error))
+            .boxed())
+    }
+
+    /// Download a file into one byte buffer.
+    ///
+    /// This compatibility helper intentionally collects
+    /// [`Self::stream_file_content`]. HTTP response paths and other
+    /// bounded-memory consumers should use the streaming method directly.
+    #[instrument(skip(self, ctx), fields(provider = "openai", file_id = file_id))]
+    pub async fn download_file_content(
+        &self,
+        file_id: &str,
+        ctx: &RequestContext,
+    ) -> Result<Bytes, ProviderError> {
+        let mut stream = self.stream_file_content(file_id, ctx).await?;
+        let mut body = BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk?);
+        }
+        Ok(body.freeze())
+    }
+
+    /// Delete one provider file via `DELETE /files/{file_id}`.
+    ///
+    /// This adapter capability makes no account-purge claim. Callers must bind
+    /// the file to an authorized local record, durably audit the actor and
+    /// outcome, and retain a usable upstream credential through retry before
+    /// exposing a destructive workflow.
+    #[instrument(skip(self, ctx), fields(provider = "openai", file_id = file_id))]
+    pub async fn delete_file(
+        &self,
+        file_id: &str,
+        ctx: &RequestContext,
+    ) -> Result<DeletedFile, ProviderError> {
+        let base_url = self.batch_base_url(ctx)?;
+        let url = format!("{base_url}/files/{file_id}");
+        let response = self
+            .apply_auth(self.client.delete(&url), ctx)
+            .send()
+            .await
+            .map_err(errors::map_reqwest_error)?;
+        let body = Self::read_response(response).await?;
+        let deleted: DeletedFile = serde_json::from_str(&body)
+            .map_err(|error| ProviderError::Deserialize(error.to_string()))?;
+        if deleted.id != file_id || deleted.object != "file" || !deleted.deleted {
+            return Err(ProviderError::Deserialize(
+                "provider file deletion confirmation did not match the requested file".to_string(),
+            ));
+        }
+        Ok(deleted)
     }
 }

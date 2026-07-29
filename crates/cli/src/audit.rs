@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -16,8 +17,8 @@ pub(crate) enum AuditAction {
     Verify {
         /// Path to the JSONL chain. Defaults to `.claude/AUDIT-CHAIN.jsonl`.
         path: Option<String>,
-        /// Filter to a specific org UUID (recorded but not yet enforced — all
-        /// entries in the file are verified regardless).
+        /// Assert the checkpoint org when using `--customer-checkpoint`.
+        /// Otherwise recorded only; every entry in the file is still verified.
         #[arg(long)]
         org: Option<String>,
         /// Path to a file containing the hex-encoded Ed25519 verifying key.
@@ -37,7 +38,51 @@ pub(crate) enum AuditAction {
         /// whole file.
         #[arg(long)]
         expected_tip: Option<String>,
+        /// Customer-co-signed checkpoint JSON. The checkpoint's expected tip,
+        /// organization, and TokenTrimmer audit key must all match this chain.
+        /// Requires an independently obtained customer verifying key.
+        #[arg(long, conflicts_with = "expected_tip")]
+        customer_checkpoint: Option<String>,
+        /// File containing the 64-lowercase-hex customer verifying key.
+        #[arg(
+            long,
+            requires = "customer_checkpoint",
+            conflicts_with = "customer_key_hex"
+        )]
+        customer_key: Option<String>,
+        /// 64-lowercase-hex customer verifying key supplied out of band.
+        #[arg(
+            long,
+            requires = "customer_checkpoint",
+            conflicts_with = "customer_key"
+        )]
+        customer_key_hex: Option<String>,
     },
+    /// Co-sign an out-of-band audit tip with a customer-controlled Ed25519 key.
+    CreateCheckpoint {
+        /// Organization UUID whose audit tip is being checkpointed.
+        #[arg(long)]
+        org: String,
+        /// TokenTrimmer audit verifying key bound to the checkpoint.
+        #[arg(long)]
+        audit_key_hex: String,
+        /// Exact out-of-band chain tip as `<seq>:<64-lowercase-hex-hash>`.
+        #[arg(long)]
+        expected_tip: String,
+        /// Mode-0600 file containing a 32-byte Ed25519 seed as lowercase hex.
+        #[arg(long)]
+        customer_signing_key: String,
+        /// New checkpoint JSON path. Existing files are never overwritten.
+        #[arg(long)]
+        output: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CustomerCheckpointInputs<'a> {
+    pub path: Option<&'a str>,
+    pub key_path: Option<&'a str>,
+    pub key_hex: Option<&'a str>,
 }
 
 /// Implement `tt audit verify`.
@@ -56,7 +101,25 @@ pub(crate) fn run_audit_verify(
     key_path: Option<&str>,
     key_hex_inline: Option<&str>,
     expected_tip: Option<&str>,
+    customer_checkpoint_inputs: CustomerCheckpointInputs<'_>,
 ) -> anyhow::Result<()> {
+    let customer_checkpoint = match customer_checkpoint_inputs.path {
+        Some(path) => Some(super::audit_checkpoint::load_and_verify_checkpoint(
+            path,
+            customer_checkpoint_inputs.key_path,
+            customer_checkpoint_inputs.key_hex,
+        )?),
+        None => {
+            if customer_checkpoint_inputs.key_path.is_some()
+                || customer_checkpoint_inputs.key_hex.is_some()
+            {
+                anyhow::bail!(
+                    "--customer-key and --customer-key-hex require --customer-checkpoint"
+                );
+            }
+            None
+        }
+    };
     let chain_path_str = path.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
     let chain_path = Path::new(chain_path_str);
     if !chain_path.exists() {
@@ -64,9 +127,9 @@ pub(crate) fn run_audit_verify(
         // expected tip, treat the absent file as a verification FAILURE (this is
         // the whole-chain-deletion case the anchor exists to catch). Without an
         // anchor, an absent file is still just an informational no-op.
-        if expected_tip.is_some() {
+        if expected_tip.is_some() || customer_checkpoint.is_some() {
             anyhow::bail!(
-                "chain verification FAILED: --expected-tip was supplied but chain file {} \
+                "chain verification FAILED: an expected tip was supplied but chain file {} \
                  does not exist (possible whole-chain deletion)",
                 chain_path.display()
             );
@@ -109,6 +172,35 @@ pub(crate) fn run_audit_verify(
         .map_err(|_| anyhow::anyhow!("verifying key must be exactly 32 bytes (64 hex chars)"))?;
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
         .map_err(|e| anyhow::anyhow!("invalid Ed25519 verifying key: {e}"))?;
+    let normalized_key_hex = hex::encode(key_array);
+
+    if let Some(checkpoint) = customer_checkpoint.as_ref() {
+        if normalized_key_hex != checkpoint.audit_verifying_key_hex {
+            anyhow::bail!(
+                "chain verification FAILED: customer checkpoint audit key does not match the selected chain key"
+            );
+        }
+        if parsed.entries.is_empty()
+            || parsed
+                .entries
+                .iter()
+                .any(|entry| entry.org_id != checkpoint.organization_id)
+        {
+            anyhow::bail!(
+                "chain verification FAILED: customer checkpoint organization does not match every chain entry"
+            );
+        }
+        if let Some(requested_org) = org {
+            let requested_org = requested_org
+                .parse::<uuid::Uuid>()
+                .context("--org must be a canonical UUID when using a customer checkpoint")?;
+            if requested_org != checkpoint.organization_id {
+                anyhow::bail!(
+                    "chain verification FAILED: --org does not match customer checkpoint organization"
+                );
+            }
+        }
+    }
 
     tt_cli::ui::note(&format!("loaded {} entries", parsed.entries.len()));
 
@@ -118,16 +210,26 @@ pub(crate) fn run_audit_verify(
         ));
     }
 
-    let result = match expected_tip {
-        Some(tip_str) => {
-            let anchor = parse_expected_tip(tip_str)?;
-            tt_telemetry::audit::verify_chain_with_anchor(&parsed.entries, &verifying_key, &anchor)
+    let supplied_anchor = if let Some(checkpoint) = customer_checkpoint.as_ref() {
+        Some(checkpoint.anchor.clone())
+    } else {
+        expected_tip.map(parse_expected_tip).transpose()?
+    };
+    let result = match supplied_anchor.as_ref() {
+        Some(anchor) => {
+            tt_telemetry::audit::verify_chain_with_anchor(&parsed.entries, &verifying_key, anchor)
         }
         None => tt_telemetry::audit::verify_chain(&parsed.entries, &verifying_key),
     };
     match result {
         Ok(()) => {
-            let tip_note = if expected_tip.is_some() {
+            let tip_note = if let Some(checkpoint) = customer_checkpoint.as_ref() {
+                tt_cli::ui::note(&format!(
+                    "customer checkpoint signature matched out-of-band key {}",
+                    checkpoint.customer_key_id
+                ));
+                " (customer-co-signed tip matched)"
+            } else if expected_tip.is_some() {
                 " (tip anchor matched)"
             } else {
                 ""
@@ -149,7 +251,7 @@ pub(crate) fn run_audit_verify(
 /// `seq` must be a non-negative integer; `hash` must be 64 hex chars (a BLAKE3
 /// hash), normalized to lowercase. Returns a clear error before verification so
 /// a malformed anchor doesn't surface as a confusing TruncatedChain.
-fn parse_expected_tip(s: &str) -> anyhow::Result<tt_telemetry::audit::TipAnchor> {
+pub(crate) fn parse_expected_tip(s: &str) -> anyhow::Result<tt_telemetry::audit::TipAnchor> {
     let (seq_str, hash) = s
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("--expected-tip must be `<seq>:<hash>` (missing ':')"))?;
@@ -280,7 +382,7 @@ mod audit_verify_tests {
 
 #[cfg(test)]
 mod expected_tip_tests {
-    use super::{parse_expected_tip, run_audit_verify};
+    use super::{parse_expected_tip, run_audit_verify, CustomerCheckpointInputs};
 
     const HASH64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -333,6 +435,7 @@ mod expected_tip_tests {
             None,
             None,
             Some("5:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            CustomerCheckpointInputs::default(),
         );
         assert!(res.is_err(), "missing file + expected_tip must error");
     }
@@ -346,10 +449,119 @@ mod expected_tip_tests {
             None,
             None,
             None,
+            CustomerCheckpointInputs::default(),
         );
         assert!(
             res.is_ok(),
             "missing file without expected_tip must stay Ok"
         );
+    }
+}
+
+#[cfg(test)]
+mod customer_checkpoint_tests {
+    use super::{run_audit_verify, CustomerCheckpointInputs};
+    use chrono::{TimeZone as _, Utc};
+    use ed25519_dalek::SigningKey;
+    use tt_telemetry::audit::{build_entry, Actor, TipAnchor};
+    use uuid::Uuid;
+
+    #[test]
+    fn customer_checkpoint_verifies_a_real_chain_and_binds_its_org() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chain_path = dir.path().join("audit.jsonl");
+        let checkpoint_path = dir.path().join("checkpoint.json");
+        let wrong_org_checkpoint_path = dir.path().join("wrong-org-checkpoint.json");
+
+        let audit_signing_key = SigningKey::from_bytes(&[21; 32]);
+        let customer_signing_key = SigningKey::from_bytes(&[22; 32]);
+        let organization_id = Uuid::from_u128(23);
+        let entry = build_entry(
+            &audit_signing_key,
+            None,
+            organization_id,
+            Actor::System,
+            "checkpoint.test".to_string(),
+            serde_json::json!({"bounded": true}),
+        )
+        .expect("build signed audit entry");
+        let audit_key_hex = hex::encode(audit_signing_key.verifying_key().to_bytes());
+        let chain = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "meta": true,
+                // Exercise canonical key comparison: legacy audit verification
+                // accepts uppercase key hex in an export preamble.
+                "verifying_key": audit_key_hex.to_uppercase(),
+                "entry_count": 1
+            }),
+            serde_json::to_string(&entry).expect("serialize audit entry")
+        );
+        std::fs::write(&chain_path, chain).expect("write chain");
+
+        let anchor = TipAnchor::from_entry(&entry);
+        let checkpointed_at = Utc
+            .with_ymd_and_hms(2026, 7, 27, 12, 0, 0)
+            .single()
+            .expect("fixed timestamp");
+        let checkpoint = crate::audit_checkpoint::create_checkpoint(
+            organization_id,
+            &audit_key_hex,
+            &anchor,
+            checkpointed_at,
+            &customer_signing_key,
+        )
+        .expect("create checkpoint");
+        std::fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&checkpoint).expect("serialize checkpoint"),
+        )
+        .expect("write checkpoint");
+
+        let customer_key_hex = hex::encode(customer_signing_key.verifying_key().to_bytes());
+        run_audit_verify(
+            chain_path.to_str(),
+            Some(&organization_id.to_string()),
+            None,
+            None,
+            None,
+            CustomerCheckpointInputs {
+                path: checkpoint_path.to_str(),
+                key_path: None,
+                key_hex: Some(&customer_key_hex),
+            },
+        )
+        .expect("chain reaches the customer-co-signed checkpoint");
+
+        let wrong_org_checkpoint = crate::audit_checkpoint::create_checkpoint(
+            Uuid::from_u128(24),
+            &audit_key_hex,
+            &anchor,
+            checkpointed_at,
+            &customer_signing_key,
+        )
+        .expect("create wrong-org checkpoint");
+        std::fs::write(
+            &wrong_org_checkpoint_path,
+            serde_json::to_vec_pretty(&wrong_org_checkpoint)
+                .expect("serialize wrong-org checkpoint"),
+        )
+        .expect("write wrong-org checkpoint");
+        let error = run_audit_verify(
+            chain_path.to_str(),
+            None,
+            None,
+            None,
+            None,
+            CustomerCheckpointInputs {
+                path: wrong_org_checkpoint_path.to_str(),
+                key_path: None,
+                key_hex: Some(&customer_key_hex),
+            },
+        )
+        .expect_err("checkpoint must bind every chain entry to the same organization");
+        assert!(error
+            .to_string()
+            .contains("checkpoint organization does not match every chain entry"));
     }
 }

@@ -95,6 +95,36 @@ test("deployment containment rejects an unsafe trigger or inherited secrets", ()
     /preflight must require a main push and trusted re-verification/,
   );
 
+  const missingApproval = deploymentSources();
+  missingApproval.deploy = missingApproval.deploy.replace(
+    "needs: [staging, verify-production-approval]",
+    "needs: staging",
+  );
+  assert.match(
+    validateDeployWorkflowTopology(missingApproval).join("\n"),
+    /prod must depend on staging and verify-production-approval/,
+  );
+
+  const weakenedApproval = deploymentSources();
+  weakenedApproval.deploy = weakenedApproval.deploy.replace(
+    "            reviewerRule.prevent_self_review !== true ||\n",
+    "",
+  );
+  assert.match(
+    validateDeployWorkflowTopology(weakenedApproval).join("\n"),
+    /must inspect required reviewers, self-review prevention, admin bypass, and protected-branch policy/,
+  );
+
+  const missingBranchPolicy = deploymentSources();
+  missingBranchPolicy.deploy = missingBranchPolicy.deploy.replace(
+    "            branchPolicy.protected_branches !== true ||\n",
+    "",
+  );
+  assert.match(
+    validateDeployWorkflowTopology(missingBranchPolicy).join("\n"),
+    /must inspect required reviewers, self-review prevention, admin bypass, and protected-branch policy/,
+  );
+
   const unsafeCiSecret = deploymentSources();
   unsafeCiSecret.ci = unsafeCiSecret.ci.replace(
     "  fmt-and-clippy:\n",

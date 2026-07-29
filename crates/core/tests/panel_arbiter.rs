@@ -3,7 +3,7 @@
 //!   cargo test -p tt-core --test panel_arbiter
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -182,6 +182,7 @@ struct MockJudge {
     id: &'static str,
     model: &'static str,
     judge_response: &'static str,
+    seen_requests: Option<Arc<Mutex<Vec<ChatCompletionRequest>>>>,
 }
 
 #[async_trait]
@@ -221,6 +222,12 @@ impl Provider for MockJudge {
         req: ChatCompletionRequest,
         _ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
+        if let Some(seen_requests) = &self.seen_requests {
+            seen_requests
+                .lock()
+                .expect("judge request capture lock")
+                .push(req.clone());
+        }
         Ok(ChatCompletionResponse {
             id: "chatcmpl-judge".into(),
             object: "chat.completion".into(),
@@ -328,15 +335,17 @@ fn make_ok_leg(leg_index: usize, answer: &str) -> LegResult {
 // BestOfN tests
 // ---------------------------------------------------------------------------
 
-/// Judge returns "2\nCandidate 2 is the most complete." — must pick leg at
-/// position 1 in the legs slice (candidate 2 = answers[1]).
+/// Judge returns candidate 2, which must map from the fresh blind ordering back
+/// to the correct original leg rather than assuming member position 1.
 #[tokio::test]
 async fn best_of_n_judge_picks_candidate_2() {
     let mut registry = ProviderRegistry::new();
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
     registry.register(Arc::new(MockJudge {
         id: "mock-provider-judge",
         model: "mock-judge",
         judge_response: "2\nCandidate 2 is the most complete.",
+        seen_requests: Some(Arc::clone(&seen_requests)),
     }));
 
     let state = AppState::new(registry);
@@ -362,7 +371,31 @@ async fn best_of_n_judge_picks_candidate_2() {
         .await
         .expect("BestOfN should succeed");
 
-    // The returned response must be the ORIGINAL leg 1 response text.
+    let candidate_2_text = {
+        let requests = seen_requests.lock().expect("judge request capture lock");
+        let request = requests.first().expect("one judge request");
+        request
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                Message::User {
+                    content: MessageContent::Text(text),
+                    name: Some(name),
+                } if name == "fusion_candidate_2" => {
+                    let encoded = text.strip_prefix("UNTRUSTED_FUSION_CANDIDATE_DATA\n")?;
+                    serde_json::from_str::<serde_json::Value>(encoded)
+                        .ok()?
+                        .get("content")?
+                        .as_str()
+                        .map(str::to_string)
+                }
+                _ => None,
+            })
+            .expect("candidate 2 untrusted-data envelope")
+    };
+
+    // The returned response must be the original response represented by the
+    // request-local candidate 2 label.
     let chosen_text = outcome
         .response
         .choices
@@ -377,13 +410,30 @@ async fn best_of_n_judge_picks_candidate_2() {
         .expect("chosen response must have assistant text");
 
     assert_eq!(
-        chosen_text, "Answer from leg 1 — the best one",
-        "returned text must be the original leg 1 answer"
+        chosen_text, candidate_2_text,
+        "returned text must match the original leg behind randomized candidate 2"
     );
+    let expected_leg = legs
+        .iter()
+        .find(|leg| {
+            leg.response
+                .as_ref()
+                .and_then(|response| response.choices.first())
+                .is_some_and(|choice| {
+                    matches!(
+                        &choice.message,
+                        Message::Assistant {
+                            content: Some(MessageContent::Text(text)),
+                            ..
+                        } if text == &candidate_2_text
+                    )
+                })
+        })
+        .expect("candidate text must identify one original test leg");
     assert_eq!(
         outcome.detail.chosen_leg,
-        Some(1),
-        "chosen_leg must be leg_index of leg 1"
+        Some(expected_leg.leg_index),
+        "chosen_leg must map randomized candidate 2 back to its original leg"
     );
     assert!(
         outcome
@@ -409,6 +459,7 @@ async fn best_of_n_requires_explicit_arbiter_credential() {
         id: "mock-provider-judge",
         model: "mock-judge",
         judge_response: "1",
+        seen_requests: None,
     }));
 
     let state = AppState::new(registry);
@@ -677,6 +728,7 @@ async fn best_of_n_garbage_judge_falls_back_to_first_leg() {
         id: "mock-provider-judge",
         model: "mock-judge",
         judge_response: "banana",
+        seen_requests: None,
     }));
 
     let state = AppState::new(registry);

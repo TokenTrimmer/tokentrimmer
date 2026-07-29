@@ -16,7 +16,7 @@
 pub mod batch;
 pub mod pricing;
 
-pub use batch::{Batch, BatchRequestCounts, BatchStatus};
+pub use batch::{Batch, BatchRequestCounts, BatchStatus, DeletedFile};
 
 // The OpenAI-wire machinery now lives in `tt-provider-compat`. The native
 // adapter builds on it; these re-exports preserve the historical

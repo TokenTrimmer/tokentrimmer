@@ -124,7 +124,7 @@
     },
     {
       "path": "docs/receipt-spec/savings-bundle.schema.json",
-      "sha256": "05785e0d9da60295f88943b6ba2f1a6aaf0ea8f35dc2130433af4460d3f8ef04"
+      "sha256": "ba3cc6b4b381279aefa99b5bb4d48997dafc58fdad7117f688d50ccbfe69ca94"
     },
     {
       "path": "docs/receipt-spec/vcr-receipt.schema.json",

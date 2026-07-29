@@ -457,10 +457,12 @@ impl ResponsesImageUrl {
             ResponsesImageUrl::Url(url) => ImageUrl {
                 url,
                 detail: fallback_detail,
+                media_type: None,
             },
             ResponsesImageUrl::Object { url, detail } => ImageUrl {
                 url,
                 detail: detail.or(fallback_detail),
+                media_type: None,
             },
         }
     }

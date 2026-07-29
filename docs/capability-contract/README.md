@@ -4,11 +4,29 @@ This directory publishes a generated structural schema plus a small versioned
 compatibility corpus for the public gateway's authenticated
 `GET /v1/capabilities` document. `gateway-capabilities.schema.json` comes from
 the exact Rust `GatewayCapabilitiesDocument` response type; its matching
-TypeScript is in `bindings/product-contracts.generated.ts`.
+TypeScript is in `bindings/product-contracts.generated.ts`, and the Python SDK
+uses the generated frozen dataclasses in
+`sdk-python/tokentrimmer/product_contracts_generated.py`.
 
 `tokentrimmer.gateway-capabilities.v1.corpus.json` remains the semantic parser
 drift guard. Neither artifact is a second runtime validator or readiness
 evidence.
+
+`request-preflight-response.schema.json` separately describes the authenticated
+`POST /v1/capabilities/preflight` response. That endpoint performs no provider
+I/O: it reports request-specific provider resolution, exact catalog capability
+and caller-declared-token comparisons, organization credential-record presence
+without decrypting the stored secret, and an explicitly bounded standard-rate
+catalog cost projection when priceable, while keeping provider health and
+request acceptance unknown. The cost interval is not live provider pricing,
+tokenization, readiness, a quote, reservation, settlement, invoice, or
+enforced budget.
+
+`request-preflight-batch-response.schema.json` wraps 1–9 of those declarations
+and responses in one ordered, single-responder document with one generated-at
+marker. It removes cross-process drift for a role set but explicitly does not
+make credential/configuration reads transactional or establish provider
+readiness, executable panel admission, reservation, or execution.
 
 The public CLI test consumes the authoritative copy. Hosted consumers should
 vendor its exact bytes with the public revision they pin, then run their own

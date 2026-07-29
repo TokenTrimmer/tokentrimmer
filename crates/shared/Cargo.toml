@@ -23,6 +23,7 @@ reqwest.workspace = true
 async-stream.workspace = true
 tracing.workspace = true
 toml.workspace = true
+base64 = "0.22"
 
 [lints]
 workspace = true

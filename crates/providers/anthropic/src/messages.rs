@@ -315,6 +315,7 @@ fn translate_inbound_message(
                                     }
                                 },
                                 detail: None,
+                                media_type: None,
                             },
                         });
                     }

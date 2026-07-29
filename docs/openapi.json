@@ -29,6 +29,40 @@
     "/v1/models": {
       "get": { "summary": "List the served model catalog", "responses": { "200": { "description": "The model list." } } }
     },
+    "/v1/capabilities": {
+      "get": { "summary": "Read responder-scoped gateway capability evidence", "description": "Requires a verified tt_live_* key. Returns private/no-store facts enforced by this responding process; it does not inspect credentials, probe providers, establish model readiness, reserve work, or attest fleet convergence.", "responses": { "200": { "description": "Gateway capability evidence v1." }, "401": { "description": "Missing or non-live key." } } }
+    },
+    "/v1/capabilities/preflight": {
+      "post": {
+        "summary": "Preflight one model request without provider I/O",
+        "description": "Requires a verified tt_live_* key. Resolves responder catalog facts, checks credential-record existence without decrypting the secret, and compares caller-declared token values with catalog metadata. Provider health and request acceptance remain unknown; this is not tokenization, hard-limit, reservation, readiness, or execution evidence.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["schema_version", "model", "provider", "required_capabilities", "declared_input_tokens", "requested_max_output_tokens"],
+                "properties": {
+                  "schema_version": { "type": "integer", "enum": [1] },
+                  "model": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "provider": { "type": "string", "nullable": true, "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9_-]+$" },
+                  "required_capabilities": { "type": "array", "maxItems": 8, "uniqueItems": true, "items": { "type": "string", "enum": ["text", "vision", "audio", "tools", "json_mode", "streaming"] } },
+                  "declared_input_tokens": { "type": "integer", "nullable": true, "minimum": 0, "maximum": 4294967295 },
+                  "requested_max_output_tokens": { "type": "integer", "nullable": true, "minimum": 1, "maximum": 4294967295 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Private/no-store request-preflight evidence v1. See docs/capability-contract/request-preflight-response.schema.json." },
+          "400": { "description": "Malformed or unsupported request-preflight declaration." },
+          "401": { "description": "Missing or non-live key." }
+        }
+      }
+    },
     "/v1/embeddings": {
       "post": { "summary": "Embeddings (routed + cached)", "responses": { "200": { "description": "The embeddings response." } } }
     },
@@ -79,7 +113,7 @@
       "post": { "summary": "Upload a file (Batch Lane)", "responses": { "200": { "description": "The file id." } } }
     },
     "/v1/files/{id}/content": {
-      "get": { "summary": "Download file content", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ], "responses": { "200": { "description": "The file content." } } }
+      "get": { "summary": "Stream provider-held Batch Lane file content", "description": "Requires the exact file id on one of the authenticated organization's retained batch rows before upstream I/O, then streams the successful provider response without accumulating it. Availability also depends on the provider still retaining the file and the organization retaining both a live gateway key and the matching upstream credential; this is not a retention guarantee.", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ], "responses": { "200": { "description": "The streamed JSONL file content." }, "404": { "description": "The file id is not present on this organization's retained batch rows." } } }
     },
     "/v1/batches": {
       "post": { "summary": "Create a batch", "responses": { "200": { "description": "The batch." } } },

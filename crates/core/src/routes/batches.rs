@@ -378,11 +378,12 @@ pub async fn cancel_batch(
 
 // ── GET /v1/files/{id}/content ────────────────────────────────────────────────
 
-/// `GET /v1/files/{id}/content` — proxy `download_file_content` and stream the
-/// raw result/error JSONL bytes back to the caller. Org-scoping note: the file
-/// id is a provider handle, not stored per-org in slice 2; the per-org OpenAI
-/// credential gates access — a caller can only fetch files their own OpenAI key
-/// can read upstream. Returns the bytes as `application/jsonl`.
+/// `GET /v1/files/{id}/content` — proxy `stream_file_content` without
+/// accumulating the successful provider body, and stream the raw result/error
+/// JSONL bytes back to the caller. The exact file id must first appear on one of
+/// the authenticated organization's durable batch rows; a provider credential
+/// alone is not an ownership boundary because organizations can share an
+/// upstream account. Returns the bytes as `application/jsonl`.
 pub async fn download_file_content(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,
@@ -390,18 +391,26 @@ pub async fn download_file_content(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     let (org_id, api_key_id) = require_org(ctx)?;
+    let store = store(&state)?.clone();
+    let owns_file = store
+        .owns_file(org_id, &id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("checking batch file ownership: {e}")))?;
+    if !owns_file {
+        return Err(ApiError::NotFound("batch file not found".to_string()));
+    }
     let provider = openai(&state)?;
     let request_ctx = batch_ctx(&state, org_id, api_key_id, &headers).await?;
 
-    let bytes = provider
-        .download_file_content(&id, &request_ctx)
+    let stream = provider
+        .stream_file_content(&id, &request_ctx)
         .await
         .map_err(ApiError::from)?;
 
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/jsonl")],
-        Body::from(bytes),
+        Body::from_stream(stream),
     )
         .into_response())
 }

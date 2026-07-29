@@ -69,6 +69,25 @@ stays verbatim + routes to the vision model as before. No behavior change on
 the default path (a route that didn't opt into `document_lane` is byte-
 identical).
 
+## Parser and transport bounds
+
+Parsing remains out of process. The sidecar accepts only the shared
+PDF/PNG/JPEG/GIF/WebP/BMP/TIFF contract, preflights base64 before decoding,
+caps decoded input at 20 MiB, and re-runs the shared container, image-dimension,
+and animation-frame validation even when called directly. At most two
+extractions execute concurrently; a saturated queue fails quickly, and each
+handler waits at most four seconds before returning an empty fail-soft result.
+A timed-out blocking parser retains its slot until its thread exits, so a
+pathological file cannot cause unbounded parser-thread growth.
+
+The sidecar parses the PDF page tree before text extraction and refuses more
+than 100 pages. Successful output is capped at 1,000,000 Unicode scalar values,
+4 MiB of UTF-8 text, and 100 spans/pages. The gateway client independently
+streams and caps the complete JSON response at 4 MiB plus 64 KiB of envelope
+overhead, then requires bounded, unique, in-range page evidence before any
+substitution. A limit, malformed response, timeout, panic, or transport error
+therefore leaves the original media verbatim.
+
 ## Related
 
 - `crates/core/src/document_lane/mod.rs` — the D4a substrate + the `DocDistillGate` + `SpanFidelity`.

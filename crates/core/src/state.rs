@@ -28,6 +28,9 @@ pub const DEFAULT_L2_THRESHOLD: f32 = 0.92;
 /// Default L1 TTL — 24 hours. Spec §8.4 caps this per-tier; gateway-level
 /// default is conservative until tier resolution lands with auth.
 pub const DEFAULT_L1_TTL_SECS: u64 = 24 * 60 * 60;
+/// Hard ceiling for tenant-owned L1 material. This bounds the account-purge
+/// rollout drain and stays aligned with the longest Scale-tier cache window.
+pub const MAX_L1_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Default FP-tolerance pct for the L2 verify gate's adaptive ratchet (COST-5).
 /// Matches the `with_l2_verify` / `TT_L2_FP_TOLERANCE_PCT` default; clamped to
@@ -123,6 +126,10 @@ pub struct AppState {
     /// Optional L1 exact-match cache. `None` disables L1 lookup (tests,
     /// dev environments without Redis).
     pub l1: Option<L1Config>,
+    /// Optional verifier for the cloud account-purge cleanup capability. The
+    /// internal route is unavailable unless production explicitly wires the
+    /// domain-separated `TT_MASTER_KEY` derivative at boot.
+    pub gateway_purge_authorizer: Option<Arc<crate::GatewayPurgeAuthorizer>>,
     /// Optional L2 semantic cache. `None` disables L2 lookup (Free tier,
     /// tests, dev environments without an embedding backend).
     pub l2: Option<L2Config>,
@@ -366,6 +373,7 @@ impl AppState {
         Self {
             registry: Arc::new(registry),
             l1: None,
+            gateway_purge_authorizer: None,
             l2: None,
             key_store: None,
             credential_store: None,
@@ -467,6 +475,16 @@ impl AppState {
             cache,
             ttl_secs: ttl_secs.unwrap_or(DEFAULT_L1_TTL_SECS),
         });
+        self
+    }
+
+    /// Arm the signed cloud-to-gateway account-purge capability.
+    #[must_use]
+    pub fn with_gateway_purge_authorizer(
+        mut self,
+        authorizer: Arc<crate::GatewayPurgeAuthorizer>,
+    ) -> Self {
+        self.gateway_purge_authorizer = Some(authorizer);
         self
     }
 

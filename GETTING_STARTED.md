@@ -143,10 +143,10 @@ Every external dependency is best-effort: if it's missing or unreachable, the Ga
 | `TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND` | Set to `1` to allow a non-loopback bind **without** a key store (unauthenticated BYO-key passthrough) | A non-loopback `TT_BIND_ADDR` without `DATABASE_URL` refuses to start |
 | `DATABASE_URL` | Postgres: API-key verification, request logs, routing rules, provider-credential store | Runs without persistence; `tt_live_*` keys pass through **unverified** (dev mode), binds loopback by default, and env provider keys are never served |
 | `REDIS_URL` | L1 exact-match cache (use `rediss://` native, **not** an HTTP REST URL) | L1 cache disabled |
-| `TT_MASTER_KEY` | XChaCha20-Poly1305 root key for the Postgres provider-credential store. Generate with `openssl rand -hex 32` | Postgres credential store disabled; **no** provider credentials are served unless `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` restores the env-only dogfood mode |
+| `TT_MASTER_KEY` | Shared 32-byte root for persistent credential/secret/capture/cache encryption and deletion HMAC capabilities. Generate with `openssl rand -hex 32`; rotate only through the journaled cross-service procedure in `docs/SECRETS.md` | Postgres credential store disabled; **no** provider credentials are served unless `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` restores the env-only dogfood mode |
 | `TT_ALLOW_ENV_CREDENTIAL_FALLBACK` | Set to `1` to serve the operator's env provider keys (below) to orgs with no stored credential — **single-tenant self-host / dogfood only**. On a multi-tenant gateway this lets every org spend on the operator's keys (provider-ToS / resale exposure) | **BYO-only (default):** with `DATABASE_URL` + `TT_MASTER_KEY` configured, an org with no stored credential for the requested provider gets an actionable `missing_provider_credential` error — never the operator's env keys |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `OPENROUTER_API_KEY` | Upstream provider credentials (single-tenant fallback; only served when `DATABASE_URL` configures a key store **and** `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` is set) | That provider can't be reached (callers can still pass their own key as the Bearer token) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT`, `SENTRY_DSN` | Observability | Disabled |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `SENTRY_DSN` | Operator observability. OTLP is one process-wide self-hosted gateway destination, not hosted per-org fanout. | Disabled |
 | `RUST_LOG` | Log filter, e.g. `info,tt_core=debug` | Default tracing filter |
 
 Copy `.env.example` to `.env.local` and fill in what you need. **Never commit real secrets** — `.env.*` (except `.env.example`) is gitignored.
@@ -430,6 +430,7 @@ These are two different things, easy to confuse:
 - **Architecture:** `docs/tokentrimmer-architecture-spec-v1.md`
 - **Gateway API reference:** `docs/04-gateway-api-reference.md`
 - **Integrations (n8n, LangChain, LangGraph, Dify):** `docs/integrations.md`
+- **Observability, correlation, and Langfuse/LangSmith composition boundaries:** `docs/observability/README.md`
 - **Cost Preview API:** `docs/04-cost-preview-api-reference.md`
 - **Inspect rule catalog:** `docs/01-inspect-rule-catalog.md`
 - **Provider adapter guide:** `docs/02-provider-adapter-guide.md`

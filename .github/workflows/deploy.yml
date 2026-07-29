@@ -4,7 +4,7 @@
 # Flow (per cloud/docs/superpowers/specs/2026-06-02-local-staging-prod-pipeline-design.md):
 #   protected main push ─▶ CI jobs + deploy trust policy ─▶ this reusable workflow
 #                         job `staging`: migrate staging DB → deploy staging
-#                         job `prod`: needs staging + MANUAL APPROVAL (GH Environment)
+#                         job `prod`: needs staging + verified manual-approval Environment
 #                                     migrate prod DB → deploy prod
 #
 #   This workflow intentionally has no `workflow_run`, `pull_request`, or manual
@@ -29,9 +29,9 @@
 #        Generate a deploy-scoped token:  fly tokens deploy
 #        (org `personal`; covers tokentrimmer + tokentrimmer-staging).
 #   2. GitHub Environment `production`  (Settings ▸ Environments ▸ New environment)
-#        Add a "Required reviewers" protection rule so the `prod` job pauses for a
-#        manual approval. WITHOUT this gate prod auto-deploys — do not remove
-#        `environment: production` from the prod job.
+#        Add a "Required reviewers" protection rule with self-review prevention
+#        so the `prod` job pauses for a manual approval. The workflow verifies
+#        that live setting before prod can read migration/deploy secrets.
 #   3. DB migrate secrets (repo secrets), each the Neon DIRECT / non-pooled URL:
 #        STAGING_DATABASE_URL_DIRECT  → Neon `staging` branch, direct host.
 #        PROD_DATABASE_URL_DIRECT     → Neon `production` branch, direct host.
@@ -39,7 +39,7 @@
 #       also applies the gateway's migrations — the public repo keeps its
 #       throwaway-Postgres service container in ci.yml and needs no Neon secrets.)
 #
-# Never auto-deploy prod without the `production` environment gate.
+# Never auto-deploy prod without a verified `production` environment reviewer gate.
 # ─────────────────────────────────────────────────────────────────────────────
 name: deploy (gateway)
 
@@ -162,12 +162,57 @@ jobs:
           curl -sf --retry 8 --retry-all-errors --retry-delay 5 \
             https://tokentrimmer-staging.fly.dev/health
 
+  # ── PROD APPROVAL GATE ──────────────────────────────────────────────────────
+  # Fail closed if the live GitHub Environment is missing required reviewers.
+  # `environment: production` alone is not enough: an Environment with no
+  # protection rules does not pause, and would auto-deploy prod after staging.
+  verify-production-approval:
+    name: verify production approval gate
+    needs: staging
+    if: needs.staging.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify required reviewer protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          environment_json="$(gh api "repos/$REPOSITORY/environments/production")"
+          ENVIRONMENT_JSON="$environment_json" node - <<'NODE'
+          const environment = JSON.parse(process.env.ENVIRONMENT_JSON || '{}');
+          const rules = Array.isArray(environment.protection_rules)
+            ? environment.protection_rules
+            : [];
+          const reviewerRule = rules.find((rule) => rule.type === 'required_reviewers');
+          const reviewers = Array.isArray(reviewerRule?.reviewers)
+            ? reviewerRule.reviewers
+            : [];
+          const branchPolicy = environment.deployment_branch_policy || {};
+          if (
+            !reviewerRule ||
+            reviewers.length < 1 ||
+            reviewerRule.prevent_self_review !== true ||
+            environment.can_admins_bypass !== false ||
+            branchPolicy.protected_branches !== true ||
+            branchPolicy.custom_branch_policies !== false
+          ) {
+            console.error(
+              'production Environment must have required reviewers, prevent self-review, disable admin bypass, and allow only protected branches before prod deploy can read sensitive credentials.',
+            );
+            process.exit(1);
+          }
+          console.log(`production Environment protection verified for ${reviewers.length} reviewer(s).`);
+          NODE
+
   # ── PROD ─────────────────────────────────────────────────────────────────────
-  # Gated by the `production` GitHub Environment → requires a manual approval
-  # before this job starts. A failed staging deploy blocks it via `needs`.
+  # Gated by verified live `production` Environment reviewer protection. A failed
+  # staging deploy or missing Environment rule blocks it via `needs`.
   prod:
     name: prod (migrate → deploy)
-    needs: staging
+    needs: [staging, verify-production-approval]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production

@@ -26,7 +26,7 @@
 //! The DB-backed store (XChaCha20-Poly1305 encrypted, `TT_MASTER_KEY` derived
 //! per-row) lives in [`crate::postgres`] behind the `postgres` feature.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -72,6 +72,37 @@ pub fn env_credential_fallback_opted_in() -> bool {
 /// [`CredentialError::Store`].
 #[async_trait]
 pub trait ProviderCredentialStore: Send + Sync {
+    /// Return whether a credential is configured for `(org_id, provider_id)`
+    /// without returning its secret material.
+    ///
+    /// Implementations must not decrypt a stored credential merely to answer
+    /// this metadata question.
+    async fn is_configured(&self, org_id: Uuid, provider_id: &str)
+        -> Result<bool, CredentialError>;
+
+    /// Capture configured/missing metadata for a bounded provider set without
+    /// returning or decrypting secret material.
+    ///
+    /// The default implementation freezes the completed results into one
+    /// request-local set, but may read providers sequentially. Stores with a
+    /// stronger primitive should override this: the in-memory implementation
+    /// holds one map lock and Postgres uses one MVCC statement. Composite
+    /// stores may still combine independently captured source snapshots, so
+    /// callers must not describe this as a cross-store transaction.
+    async fn configured_snapshot(
+        &self,
+        org_id: Uuid,
+        provider_ids: &[String],
+    ) -> Result<HashSet<String>, CredentialError> {
+        let mut configured = HashSet::with_capacity(provider_ids.len());
+        for provider_id in provider_ids {
+            if self.is_configured(org_id, provider_id).await? {
+                configured.insert(provider_id.clone());
+            }
+        }
+        Ok(configured)
+    }
+
     /// Return the credential, or `None` if the org has not configured one for
     /// this provider. `provider_id` is the lowercase string matching
     /// [`tt_shared::Provider::id`], e.g. `"openai"`, `"anthropic"`.
@@ -149,6 +180,34 @@ impl InMemoryProviderCredentialStore {
 
 #[async_trait]
 impl ProviderCredentialStore for InMemoryProviderCredentialStore {
+    async fn is_configured(
+        &self,
+        org_id: Uuid,
+        provider_id: &str,
+    ) -> Result<bool, CredentialError> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|e| CredentialError::Store(e.to_string()))?;
+        Ok(g.contains_key(&(org_id, provider_id.to_string())))
+    }
+
+    async fn configured_snapshot(
+        &self,
+        org_id: Uuid,
+        provider_ids: &[String],
+    ) -> Result<HashSet<String>, CredentialError> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|e| CredentialError::Store(e.to_string()))?;
+        Ok(provider_ids
+            .iter()
+            .filter(|provider_id| g.contains_key(&(org_id, (*provider_id).clone())))
+            .cloned()
+            .collect())
+    }
+
     async fn get(
         &self,
         org_id: Uuid,
@@ -253,6 +312,21 @@ impl EnvProviderCredentialStore {
 
 #[async_trait]
 impl ProviderCredentialStore for EnvProviderCredentialStore {
+    async fn is_configured(
+        &self,
+        _org_id: Uuid,
+        provider_id: &str,
+    ) -> Result<bool, CredentialError> {
+        let Some(var) = Self::env_var_for(provider_id) else {
+            return Ok(false);
+        };
+        Ok(std::env::var(var)
+            .ok()
+            .as_deref()
+            .and_then(Self::normalize_key)
+            .is_some())
+    }
+
     async fn get(
         &self,
         _org_id: Uuid,
@@ -316,6 +390,34 @@ where
     A: ProviderCredentialStore,
     B: ProviderCredentialStore,
 {
+    async fn is_configured(
+        &self,
+        org_id: Uuid,
+        provider_id: &str,
+    ) -> Result<bool, CredentialError> {
+        if self.primary.is_configured(org_id, provider_id).await? {
+            return Ok(true);
+        }
+        self.fallback.is_configured(org_id, provider_id).await
+    }
+
+    async fn configured_snapshot(
+        &self,
+        org_id: Uuid,
+        provider_ids: &[String],
+    ) -> Result<HashSet<String>, CredentialError> {
+        let mut configured = self
+            .primary
+            .configured_snapshot(org_id, provider_ids)
+            .await?;
+        configured.extend(
+            self.fallback
+                .configured_snapshot(org_id, provider_ids)
+                .await?,
+        );
+        Ok(configured)
+    }
+
     async fn get(
         &self,
         org_id: Uuid,
@@ -378,9 +480,31 @@ mod tests {
     async fn in_memory_returns_inserted_credential() {
         let store = InMemoryProviderCredentialStore::new();
         let org = Uuid::now_v7();
+        assert!(!store.is_configured(org, "openai").await.unwrap());
         store.insert(org, "openai", creds("sk-abc"));
+        assert!(store.is_configured(org, "openai").await.unwrap());
+        assert!(!store.is_configured(org, "anthropic").await.unwrap());
+        assert!(!store.is_configured(Uuid::now_v7(), "openai").await.unwrap());
         let got = store.get(org, "openai").await.unwrap().unwrap();
         assert_eq!(got.api_key.expose(), "sk-abc");
+    }
+
+    #[tokio::test]
+    async fn in_memory_configured_snapshot_is_exact_and_secret_free() {
+        let store = InMemoryProviderCredentialStore::new();
+        let org = Uuid::now_v7();
+        let other_org = Uuid::now_v7();
+        store.insert(org, "openai", creds("openai-secret"));
+        store.insert(other_org, "anthropic", creds("other-secret"));
+
+        let providers = vec![
+            "anthropic".to_string(),
+            "openai".to_string(),
+            "gemini".to_string(),
+        ];
+        let snapshot = store.configured_snapshot(org, &providers).await.unwrap();
+        assert_eq!(snapshot, HashSet::from(["openai".to_string()]));
+        assert!(!format!("{snapshot:?}").contains("secret"));
     }
 
     #[tokio::test]
@@ -434,6 +558,7 @@ mod tests {
         // Test runs are serialized via #[cfg(test)] in this file alone.
         std::env::set_var("OPENAI_API_KEY", "sk-env-test");
         let store = EnvProviderCredentialStore::new();
+        assert!(store.is_configured(Uuid::nil(), "openai").await.unwrap());
         let got = store.get(Uuid::nil(), "openai").await.unwrap().unwrap();
         assert_eq!(got.api_key.expose(), "sk-env-test");
         std::env::remove_var("OPENAI_API_KEY");

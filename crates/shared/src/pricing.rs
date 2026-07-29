@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct ModelPricing {
     /// USD per 1M input tokens.
     pub input_per_million: f64,
@@ -152,7 +152,7 @@ pub struct ModelInfo {
     pub max_output_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     Text,

@@ -310,18 +310,9 @@ fn validate_with_schedule_floor(
     for node in &def.nodes {
         if let NodeKind::Document { source, cache_key } = &node.kind {
             match source {
-                tt_shared::messages::DocumentSource::Base64 { media_type, data } => {
-                    if media_type.trim().is_empty() {
-                        errors.push(format!(
-                            "node \"{}\": document source media_type must be non-empty",
-                            node.id
-                        ));
-                    }
-                    if data.trim().is_empty() {
-                        errors.push(format!(
-                            "node \"{}\": document source data must be non-empty base64",
-                            node.id
-                        ));
+                tt_shared::messages::DocumentSource::Base64 { .. } => {
+                    if let Err(error) = source.validate() {
+                        errors.push(format!("node \"{}\": {error}", node.id));
                     }
                 }
                 tt_shared::messages::DocumentSource::Url { .. } => {
@@ -1747,6 +1738,27 @@ mod tests {
             combined.contains("data") && combined.contains("base64"),
             "expected empty-data rejection; got: {combined}"
         );
+    }
+
+    #[test]
+    fn document_node_rejects_malformed_base64_or_unsupported_media_type() {
+        for source in [
+            tt_shared::messages::DocumentSource::Base64 {
+                media_type: "application/pdf".into(),
+                data: "not base64!".into(),
+            },
+            tt_shared::messages::DocumentSource::Base64 {
+                media_type: "text/html".into(),
+                data: "PGgxPg==".into(),
+            },
+        ] {
+            let errs = validate(&doc_def(source), &any_model).unwrap_err();
+            let combined = errs.join("\n");
+            assert!(
+                combined.contains("document") && combined.contains("must"),
+                "expected closed document-source rejection; got: {combined}"
+            );
+        }
     }
 
     /// Build a minimal Trigger → Document → Output flow with the given source.

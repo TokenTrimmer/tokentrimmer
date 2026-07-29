@@ -8,7 +8,7 @@ use tt_provider_gemini::translate::{
 };
 use tt_shared::{
     messages::{
-        ContentPart, DocumentPart, DocumentSource, ImageUrl, Message, MessageContent,
+        ContentPart, DocumentPart, DocumentSource, ImageUrl, InputAudio, Message, MessageContent,
         ResponseFormat, Tool, ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction,
         ToolFunction,
     },
@@ -42,14 +42,52 @@ fn make_request(model: &str, messages: Vec<Message>) -> ChatCompletionRequest {
 }
 
 #[test]
+fn canonical_audio_becomes_native_inline_data_with_exact_mime() {
+    for (format, mime_type, data) in [
+        (
+            "wav",
+            "audio/wav",
+            "UklGRiYAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQIAAAAAAA==",
+        ),
+        ("mp3", "audio/mpeg", "//MQZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    ] {
+        let req = make_request(
+            "gemini-future-audio-model",
+            vec![Message::User {
+                content: MessageContent::Parts(vec![ContentPart::InputAudio {
+                    input_audio: InputAudio {
+                        data: data.into(),
+                        format: format.into(),
+                    },
+                }]),
+                name: None,
+            }],
+        );
+        let body = translate_request(req).expect("valid audio should translate");
+        let encoded = serde_json::to_value(body).unwrap();
+        assert_eq!(
+            encoded["contents"][0]["parts"][0],
+            serde_json::json!({
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": data
+                }
+            }),
+            "unexpected Gemini mapping for {format}"
+        );
+    }
+}
+
+#[test]
 fn data_url_image_becomes_inline_data_not_file_data() {
     let req = make_request(
         "gemini-3.1-pro",
         vec![Message::User {
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                    url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=".into(),
                     detail: None,
+                    media_type: None,
                 },
             }]),
             name: None,
@@ -59,7 +97,10 @@ fn data_url_image_becomes_inline_data_not_file_data() {
     let s = serde_json::to_string(&body).unwrap();
     assert!(s.contains(r#""inlineData""#), "expected inlineData: {s}");
     assert!(s.contains(r#""mimeType":"image/png""#), "{s}");
-    assert!(s.contains(r#""data":"iVBORw0KGgo=""#), "{s}");
+    assert!(
+        s.contains(r#""data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"#),
+        "{s}"
+    );
     assert!(!s.contains(r#""fileData""#), "must not be fileData: {s}");
 }
 
@@ -70,8 +111,9 @@ fn remote_url_image_stays_file_data() {
         vec![Message::User {
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/cat.png".into(),
+                    url: "https://objects.example.com/private/digest?X-Amz-Signature=abc".into(),
                     detail: None,
+                    media_type: Some("image/png".into()),
                 },
             }]),
             name: None,
@@ -80,7 +122,53 @@ fn remote_url_image_stays_file_data() {
     let body = translate_request(req).expect("translate ok");
     let s = serde_json::to_string(&body).unwrap();
     assert!(s.contains(r#""fileData""#), "expected fileData: {s}");
-    assert!(s.contains("https://example.com/cat.png"), "{s}");
+    assert!(
+        s.contains("https://objects.example.com/private/digest?X-Amz-Signature=abc"),
+        "{s}"
+    );
+    assert!(s.contains(r#""mimeType":"image/png""#), "{s}");
+}
+
+#[test]
+fn signed_url_extension_is_parsed_before_its_query_when_no_hint_is_present() {
+    let req = make_request(
+        "gemini-3.1-pro",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/cat.webp?X-Amz-Signature=abc".into(),
+                    detail: None,
+                    media_type: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(s.contains(r#""mimeType":"image/webp""#), "{s}");
+}
+
+#[test]
+fn mismatched_data_url_media_hint_is_rejected_before_native_translation() {
+    let req = make_request(
+        "gemini-3.1-pro",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=".into(),
+                    detail: None,
+                    media_type: Some("image/jpeg".into()),
+                },
+            }]),
+            name: None,
+        }],
+    );
+    assert!(matches!(
+        translate_request(req),
+        Err(tt_shared::ProviderError::InvalidRequest(message))
+            if message == "image media type hint does not match the data URL media type"
+    ));
 }
 
 #[test]
@@ -129,6 +217,26 @@ fn remote_url_document_becomes_file_data() {
     let s = serde_json::to_string(&body).unwrap();
     assert!(s.contains(r#""fileData""#), "expected fileData: {s}");
     assert!(s.contains("https://example.com/report.pdf"), "{s}");
+}
+
+#[test]
+fn openai_file_id_is_rejected_instead_of_misrepresented_as_gemini_uri() {
+    let req = make_request(
+        "gemini-3.1-pro",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::Document {
+                document: DocumentPart {
+                    source: DocumentSource::Url {
+                        url: "file-abc_123".into(),
+                    },
+                    filename: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let error = translate_request(req).expect_err("provider-specific file id must fail closed");
+    assert!(error.to_string().contains("file_id is not supported"));
 }
 
 #[test]
@@ -339,6 +447,7 @@ fn translate_multimodal_image_url_to_file_data() {
                 image_url: ImageUrl {
                     url: "https://example.com/cat.jpg".to_string(),
                     detail: None,
+                    media_type: None,
                 },
             },
         ]),

@@ -16,7 +16,11 @@
 
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use serde::Deserialize;
+use tt_shared::{
+    MAX_DOCUMENT_EXTRACTED_TEXT_BYTES, MAX_DOCUMENT_EXTRACTED_TEXT_CHARS, MAX_DOCUMENT_PAGES,
+};
 
 use super::SpanFidelity;
 
@@ -30,6 +34,7 @@ pub const SIDECAR_URL_ENV: &str = "TT_DOC_SIDECAR_URL";
 /// its own `reqwest::Client` with the same bound (a single source of truth for
 /// the fail-open timeout).
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SIDECAR_RESPONSE_BYTES: usize = MAX_DOCUMENT_EXTRACTED_TEXT_BYTES + 64 * 1024;
 
 /// One extracted span, with its fidelity resolved onto D4a's [`SpanFidelity`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +129,26 @@ async fn request_extraction(
     if !response.status().is_success() {
         return None;
     }
-    let wire = response.json::<WireResponse>().await.ok()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SIDECAR_RESPONSE_BYTES as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if body
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > MAX_SIDECAR_RESPONSE_BYTES)
+        {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let wire = serde_json::from_slice::<WireResponse>(&body).ok()?;
     wire.into_extraction()
 }
 
@@ -162,9 +186,22 @@ impl WireResponse {
         if self.text.trim().is_empty()
             || self.spans.is_empty()
             || self.pages == 0
+            || self.pages > MAX_DOCUMENT_PAGES
+            || self.spans.len() != usize::try_from(self.pages).ok()?
+            || self.text.len() > MAX_DOCUMENT_EXTRACTED_TEXT_BYTES
+            || self.text.chars().count() > MAX_DOCUMENT_EXTRACTED_TEXT_CHARS
             || !self.spans.iter().any(|span| span.chars > 0)
         {
             return None;
+        }
+        let mut seen_pages = vec![false; self.spans.len()];
+        for span in &self.spans {
+            let index = usize::try_from(span.page).ok()?;
+            let seen = seen_pages.get_mut(index)?;
+            if *seen || span.chars > MAX_DOCUMENT_EXTRACTED_TEXT_CHARS {
+                return None;
+            }
+            *seen = true;
         }
 
         Some(Extraction {
@@ -291,6 +328,33 @@ mod tests {
                     chars: 0,
                 }],
                 pages: 1,
+            },
+            WireResponse {
+                text: "text".to_string(),
+                spans: (0..=MAX_DOCUMENT_PAGES)
+                    .map(|page| WireSpan {
+                        kind: "lossless".to_string(),
+                        page,
+                        chars: 1,
+                    })
+                    .collect(),
+                pages: MAX_DOCUMENT_PAGES + 1,
+            },
+            WireResponse {
+                text: "text".to_string(),
+                spans: vec![
+                    WireSpan {
+                        kind: "lossless".to_string(),
+                        page: 0,
+                        chars: 1,
+                    },
+                    WireSpan {
+                        kind: "lossless".to_string(),
+                        page: 0,
+                        chars: 1,
+                    },
+                ],
+                pages: 2,
             },
         ];
 
@@ -458,6 +522,29 @@ mod tests {
         )
         .await;
         assert!(got.is_none(), "an undecodable body must fail open to None");
+    }
+
+    #[tokio::test]
+    async fn oversized_response_body_fails_open_before_json_allocation_can_grow_unbounded() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/extract");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("x".repeat(MAX_SIDECAR_RESPONSE_BYTES + 1));
+        });
+
+        let got = extract(
+            &client(),
+            Some(&server.base_url()),
+            "application/pdf",
+            "AAAA",
+        )
+        .await;
+        assert!(
+            got.is_none(),
+            "an oversized sidecar response must fail open"
+        );
     }
 
     #[test]

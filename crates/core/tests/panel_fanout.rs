@@ -21,7 +21,7 @@ use tt_core::{
 };
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
-    messages::{Choice, Message, MessageContent},
+    messages::{Choice, ContentPart, ImageUrl, InputAudio, Message, MessageContent},
     pricing::Capability,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
@@ -37,6 +37,96 @@ struct Mock {
     input_price: f64,
     output_price: f64,
     fail: bool,
+}
+
+struct CapturingMediaMock {
+    id: &'static str,
+    model: &'static str,
+    vision: bool,
+    audio: bool,
+    seen: Arc<Mutex<Vec<ChatCompletionRequest>>>,
+}
+
+#[async_trait]
+impl Provider for CapturingMediaMock {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model.into(),
+            provider: self.id.into(),
+            capabilities: std::iter::once(Capability::Text)
+                .chain(self.vision.then_some(Capability::Vision))
+                .chain(self.audio.then_some(Capability::Audio))
+                .collect(),
+            max_input_tokens: 4096,
+            max_output_tokens: 4096,
+        }]
+    }
+
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        (model == self.model).then(|| ModelPricing {
+            input_per_million: 5.0,
+            output_per_million: 15.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        })
+    }
+
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.seen.lock().expect("capture lock").push(req.clone());
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-media".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("media answer".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                total_tokens: 20,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        })
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
 }
 
 #[async_trait]
@@ -156,11 +246,291 @@ fn base_req(model: &str) -> ChatCompletionRequest {
     }
 }
 
+fn media_req(model: &str) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model.into(),
+        messages: vec![Message::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "describe this".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://private.example/image.png?capability=fixture".into(),
+                        detail: Some("auto".into()),
+                        media_type: Some("image/png".into()),
+                    },
+                },
+            ]),
+            name: None,
+        }],
+        stream: false,
+        max_tokens: Some(100),
+        ..Default::default()
+    }
+}
+
+fn audio_req(model: &str) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model.into(),
+        messages: vec![Message::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "transcribe this".into(),
+                },
+                ContentPart::InputAudio {
+                    input_audio: InputAudio {
+                        data: "UklGRiYAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQIAAAAAAA=="
+                            .into(),
+                        format: "wav".into(),
+                    },
+                },
+            ]),
+            name: None,
+        }],
+        stream: false,
+        max_tokens: Some(100),
+        ..Default::default()
+    }
+}
+
 /// Exercise the public engine through the same opaque admission proof that
 /// production direct Rust callers must obtain before `run_panel` can fan out.
 fn admission(state: &AppState, cfg: &PanelConfig, req: &ChatCompletionRequest) -> PanelAdmission {
     admit_panel_request(state, cfg, req, Some(999.0))
         .expect("priced test panel should pass its explicit admission budget")
+}
+
+#[test]
+fn media_admission_requires_exact_vision_evidence_for_the_llm_arbiter() {
+    let member_seen = Arc::new(Mutex::new(Vec::new()));
+    let arbiter_seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CapturingMediaMock {
+        id: "media-member-provider",
+        model: "media-member",
+        vision: true,
+        audio: false,
+        seen: member_seen,
+    }));
+    registry.register(Arc::new(CapturingMediaMock {
+        id: "text-arbiter-provider",
+        model: "text-arbiter",
+        vision: false,
+        audio: false,
+        seen: arbiter_seen,
+    }));
+    let state = AppState::new(registry);
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Synthesize,
+        members: vec![ModelRef {
+            model: "media-member".into(),
+            provider: None,
+        }],
+        arbiter_model: ModelRef {
+            model: "text-arbiter".into(),
+            provider: None,
+        },
+        quorum: Some(1),
+        max_cost_usd: None,
+    };
+
+    let error = match admit_panel_request(&state, &cfg, &media_req("media-member"), Some(999.0)) {
+        Ok(_) => panic!("a text-only arbiter must not receive a private image reference"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("vision support for arbiter model"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn audio_admission_requires_audio_not_vision_evidence_for_every_recipient() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CapturingMediaMock {
+        id: "vision-only-provider",
+        model: "vision-only-member",
+        vision: true,
+        audio: false,
+        seen: seen.clone(),
+    }));
+    let state = AppState::new(registry);
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Majority,
+        members: vec![ModelRef {
+            model: "vision-only-member".into(),
+            provider: None,
+        }],
+        // Majority never sends the original media to its configured arbiter.
+        arbiter_model: ModelRef {
+            model: "configured-only-arbiter".into(),
+            provider: None,
+        },
+        quorum: Some(1),
+        max_cost_usd: None,
+    };
+
+    let error =
+        match admit_panel_request(&state, &cfg, &audio_req("vision-only-member"), Some(999.0)) {
+            Ok(_) => panic!("Vision alone must not admit an audio recipient"),
+            Err(error) => error,
+        };
+    assert!(
+        error.to_string().contains("audio support for member model"),
+        "unexpected error: {error}"
+    );
+    assert!(seen.lock().expect("capture lock").is_empty());
+}
+
+#[test]
+fn media_admission_rejects_malformed_image_inputs_before_fanout() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CapturingMediaMock {
+        id: "media-provider",
+        model: "media-model",
+        vision: true,
+        audio: false,
+        seen: seen.clone(),
+    }));
+    let state = AppState::new(registry);
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Majority,
+        members: vec![ModelRef {
+            model: "media-model".into(),
+            provider: None,
+        }],
+        arbiter_model: ModelRef {
+            model: "configured-only-arbiter".into(),
+            provider: None,
+        },
+        quorum: Some(1),
+        max_cost_usd: None,
+    };
+    let mut request = media_req("media-model");
+    let Message::User {
+        content: MessageContent::Parts(parts),
+        ..
+    } = &mut request.messages[0]
+    else {
+        panic!("media fixture must contain typed user parts");
+    };
+    let ContentPart::ImageUrl { image_url } = &mut parts[1] else {
+        panic!("media fixture must contain an image part");
+    };
+    image_url.media_type = Some("image/svg+xml".into());
+
+    let error = match admit_panel_request(&state, &cfg, &request, Some(999.0)) {
+        Ok(_) => panic!("unsupported MIME hint must fail before panel admission"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("image media type must be image/jpeg"),
+        "unexpected error: {error}"
+    );
+    assert!(seen.lock().expect("capture lock").is_empty());
+
+    let Message::User {
+        content: MessageContent::Parts(parts),
+        ..
+    } = &mut request.messages[0]
+    else {
+        panic!("media fixture must contain typed user parts");
+    };
+    let ContentPart::ImageUrl { image_url } = &mut parts[1] else {
+        panic!("media fixture must contain an image part");
+    };
+    image_url.media_type = None;
+    image_url.url = "data:image/png;base64,not-base64!".into();
+    let error = match admit_panel_request(&state, &cfg, &request, Some(999.0)) {
+        Ok(_) => panic!("malformed inline image must fail before panel admission"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("valid standard base64"),
+        "unexpected error: {error}"
+    );
+    assert!(seen.lock().expect("capture lock").is_empty());
+}
+
+#[tokio::test]
+async fn media_request_reaches_every_member_and_synthesis_arbiter_unchanged() {
+    let member_seen = Arc::new(Mutex::new(Vec::new()));
+    let arbiter_seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CapturingMediaMock {
+        id: "media-member-provider",
+        model: "media-member",
+        vision: true,
+        audio: false,
+        seen: member_seen.clone(),
+    }));
+    registry.register(Arc::new(CapturingMediaMock {
+        id: "media-arbiter-provider",
+        model: "media-arbiter",
+        vision: true,
+        audio: false,
+        seen: arbiter_seen.clone(),
+    }));
+    let state = AppState::new(registry);
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Synthesize,
+        members: vec![ModelRef {
+            model: "media-member".into(),
+            provider: None,
+        }],
+        arbiter_model: ModelRef {
+            model: "media-arbiter".into(),
+            provider: None,
+        },
+        quorum: Some(1),
+        max_cost_usd: None,
+    };
+    let request = media_req("media-member");
+    let admission = admit_panel_request(&state, &cfg, &request, Some(999.0))
+        .expect("every actual media recipient has exact vision evidence");
+    let creds = HashMap::from([
+        (
+            "media-member-provider".to_string(),
+            test_creds("member-key"),
+        ),
+        (
+            "media-arbiter-provider".to_string(),
+            test_creds("arbiter-key"),
+        ),
+    ]);
+
+    run_panel(
+        &state,
+        &test_ctx(),
+        &request,
+        &creds,
+        &cfg,
+        &admission,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("vision panel should complete");
+
+    let member_requests = member_seen.lock().expect("member capture lock");
+    let arbiter_requests = arbiter_seen.lock().expect("arbiter capture lock");
+    assert_eq!(member_requests.len(), 1);
+    assert_eq!(arbiter_requests.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&member_requests[0].messages).unwrap(),
+        serde_json::to_value(&request.messages).unwrap(),
+    );
+    assert_eq!(
+        serde_json::to_value(&arbiter_requests[0].messages[..request.messages.len()]).unwrap(),
+        serde_json::to_value(&request.messages).unwrap(),
+        "arbiter must retain the caller's original typed media messages before its synthesis additions",
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -41,7 +41,7 @@ pub use store::{
 pub use validate::{
     validate_agentic_budget, validate_auto_pause, validate_capability, validate_output_shaping,
     validate_panel, validate_route_has_effect, validate_shadow_model, validate_workflow,
-    ValidationError, PANEL_STRATEGY_VALUES,
+    ValidationError, PANEL_STRATEGY_VALUES, PAUSE_MIN_VERDICTS_MAX,
 };
 
 use serde::{Deserialize, Serialize};
@@ -356,9 +356,11 @@ pub struct RouteAction {
     /// `None` (the default) = 100% of matched requests take the route
     /// (unconditional rewrite, today's behavior). `Some(0)` = 0% canary (the
     /// route never rewrites, only its `shadow_model`/side-effects could fire).
-    /// Values above 100 are clamped to 100 by the split function. Omitted from
-    /// JSON when `None` (back-compat with existing rows).
+    /// Route validation rejects values above 100; the split function still
+    /// clamps them defensively for direct library callers. Omitted from JSON
+    /// when `None` (back-compat with existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "contract-schema", schemars(range(min = 0, max = 100)))]
     pub traffic_pct: Option<u32>,
     /// Shadow-mode candidate model. When `Some(model)`, the gateway ALSO
     /// dispatches the matched request to `model` as a **shadow** (non-streaming,
@@ -393,9 +395,11 @@ pub struct RouteAction {
     pub pause_floor_pass_rate: Option<f64>,
     /// Minimum classified verdicts (acceptable + degraded) in-window before
     /// the floor can trigger. `None` = the gateway default
-    /// (`DEFAULT_PAUSE_MIN_VERDICTS` = 20 in tt-core). Omitted from JSON
+    /// (`DEFAULT_PAUSE_MIN_VERDICTS` = 20 in tt-core). Explicit values are
+    /// bounded to the evaluator's finite 100-verdict window. Omitted from JSON
     /// when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "contract-schema", schemars(range(min = 1, max = 100)))]
     pub pause_min_verdicts: Option<u32>,
     /// Opt matched traffic into **minified-JSON output steering** (research
     /// Phase 3.1): the gateway appends a deterministic, conditionally-phrased
@@ -429,6 +433,7 @@ pub struct RouteAction {
     /// it. Minimum 1024 (Anthropic's floor). Same class gate / $0 booking as
     /// `reasoning_max_effort`. `None` = off (default); omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "contract-schema", schemars(range(min = 1024)))]
     pub reasoning_budget_tokens: Option<u32>,
     /// Opt the matched (loop) traffic into the agentic context budget — the
     /// route-grained mode that brings the CLI's loop-aware levers server-side.
@@ -521,6 +526,7 @@ pub struct RoutePanel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arbiter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "contract-schema", schemars(range(min = 1)))]
     pub quorum: Option<usize>,
     /// Fusion pre-dispatch admission budget (USD) for the static fan-out and
     /// arbitration estimate. This is not a runtime spending or invoice cap.
@@ -1103,6 +1109,7 @@ mod tests {
             image_url: ImageUrl {
                 url: "data:image/png;base64,abc".into(),
                 detail: None,
+                media_type: None,
             },
         }
     }

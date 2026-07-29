@@ -68,9 +68,10 @@ Notes that change behavior in practice:
   the engine's general "unknown data → don't match" stance.
 - **`has_images` / `has_audio` are capability-aware.** Creating a route that
   requires image or audio input (`has_images: true` / `has_audio: true`) is
-  rejected at create time (`400`) if the `target_model` lacks the `vision`
-  capability — you can't route a vision request to a text-only model. An unknown
-  target is permissive.
+  rejected at create time (`400`) if the `target_model` lacks the corresponding
+  capability: `vision` for images, `audio` for audio. The two are independent;
+  Vision support is not evidence of Audio input support. An unknown target is
+  permissive.
 - **`prompt_contains_any_of` is case-insensitive** and matches any one of the
   keywords. It is useful for keeping sensitive topics on a local/private model.
 - **`upstream_latency_ms_p95_gt` is backed by a live, in-process signal.** The

@@ -167,7 +167,7 @@ fn image_request(model: &str, bearer: &str) -> Request<Body> {
         "model": model,
         "messages": [{ "role": "user", "content": [
             { "type": "text", "text": "what is this?" },
-            { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgo=" } }
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=" } }
         ]}],
         "stream": false,
     });

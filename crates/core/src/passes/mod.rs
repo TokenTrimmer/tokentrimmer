@@ -783,6 +783,7 @@ mod tests {
                         image_url: tt_shared::messages::ImageUrl {
                             url: "https://example.com/huge.png".into(),
                             detail: None,
+                            media_type: None,
                         },
                     },
                 ]);

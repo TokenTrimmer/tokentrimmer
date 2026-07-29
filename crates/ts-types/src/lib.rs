@@ -27,6 +27,8 @@ use uuid::Uuid;
 const GENERATED_TS_PATH: &str = "bindings/receipt-contracts.generated.ts";
 const MANIFEST_PATH: &str = "docs/receipt-spec/receipt-contracts.manifest.json";
 const PRODUCT_TS_PATH: &str = "bindings/product-contracts.generated.ts";
+const SDK_PRODUCT_TS_PATH: &str = "sdk-typescript/src/product-contracts.generated.ts";
+const SDK_PRODUCT_PY_PATH: &str = "sdk-python/tokentrimmer/product_contracts_generated.py";
 const PRODUCT_MANIFEST_PATH: &str = "docs/contracts/product-contracts.manifest.json";
 const ROUTE_PREVIEW_V2_PATH: &str =
     "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json";
@@ -65,9 +67,18 @@ pub fn generate_artifacts() -> Result<Vec<GeneratedArtifact>> {
     for contract in &product_schemas {
         product_artifacts.push(json_artifact(contract.relative_path, &contract.value)?);
     }
+    let product_typescript = schema::render_product_typescript(&product_schemas)?.into_bytes();
     product_artifacts.push(GeneratedArtifact {
         relative_path: PRODUCT_TS_PATH.into(),
-        bytes: schema::render_product_typescript(&product_schemas)?.into_bytes(),
+        bytes: product_typescript.clone(),
+    });
+    product_artifacts.push(GeneratedArtifact {
+        relative_path: SDK_PRODUCT_TS_PATH.into(),
+        bytes: product_typescript,
+    });
+    product_artifacts.push(GeneratedArtifact {
+        relative_path: SDK_PRODUCT_PY_PATH.into(),
+        bytes: schema::render_gateway_python(&product_schemas)?.into_bytes(),
     });
     product_artifacts.push(typed_json_artifact(
         "docs/workflow-contract/workflow-definition-v1.golden.json",
@@ -576,8 +587,10 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
         .collect::<Vec<_>>();
     let manifest = json!({
         "contract": "tokentrimmer.product-contracts.v1",
-        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, and gateway capability response type",
+        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, and request-preflight response type",
         "typescript": PRODUCT_TS_PATH,
+        "typescript_sdk": SDK_PRODUCT_TS_PATH,
+        "python_sdk": SDK_PRODUCT_PY_PATH,
         "contracts": [
             {
                 "family": "route",
@@ -613,10 +626,24 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
             {
                 "family": "gateway_capabilities",
                 "id": "tokentrimmer.gateway-capabilities.v1",
-                "versions": [tt_core::routes::capabilities::CAPABILITIES_SCHEMA_VERSION],
+                "versions": [tt_shared::CAPABILITIES_SCHEMA_VERSION],
                 "schema": "docs/capability-contract/gateway-capabilities.schema.json",
                 "compatibility_corpus": "docs/capability-contract/tokentrimmer.gateway-capabilities.v1.corpus.json",
                 "read": "GET /v1/capabilities"
+            },
+            {
+                "family": "request_preflight",
+                "id": "tokentrimmer.request-preflight.v1",
+                "versions": [tt_shared::REQUEST_PREFLIGHT_SCHEMA_VERSION],
+                "schema": "docs/capability-contract/request-preflight-response.schema.json",
+                "read": "POST /v1/capabilities/preflight"
+            },
+            {
+                "family": "models",
+                "id": "tokentrimmer.models.v1",
+                "versions": [tt_shared::MODELS_SCHEMA_VERSION],
+                "schema": "docs/model-contract/models-response.schema.json",
+                "read": "GET /v1/models"
             }
         ],
         "files": files
@@ -631,6 +658,29 @@ mod tests {
     #[test]
     fn checked_in_contracts_match_generator() {
         check_artifacts(&repository_root()).expect("generated proof contracts must not drift");
+    }
+
+    #[test]
+    fn generated_route_schema_carries_semantic_action_bounds() {
+        let artifacts = generate_artifacts().expect("generate artifacts");
+        let route_schema = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.relative_path == "docs/route-contract/route-write.schema.json"
+            })
+            .expect("generated route schema");
+        let route_schema: Value =
+            serde_json::from_slice(&route_schema.bytes).expect("parse generated route schema");
+        let action = &route_schema["$defs"]["RouteAction"]["properties"];
+        assert_eq!(action["traffic_pct"]["minimum"], json!(0.0));
+        assert_eq!(action["traffic_pct"]["maximum"], json!(100.0));
+        assert_eq!(action["pause_min_verdicts"]["minimum"], json!(1.0));
+        assert_eq!(action["pause_min_verdicts"]["maximum"], json!(100.0));
+        assert_eq!(action["reasoning_budget_tokens"]["minimum"], json!(1024.0));
+        assert_eq!(
+            route_schema["$defs"]["RoutePanel"]["properties"]["quorum"]["minimum"],
+            json!(1.0)
+        );
     }
 
     #[test]
@@ -693,6 +743,15 @@ mod tests {
         assert!(product_types.contains("export type Node = {\n  id: string;\n} & ("));
         assert!(product_types.contains("max_output_tokens?: number | null;"));
         assert!(product_types.contains("export type RouteWriteRequest ="));
+        assert!(product_types.contains("export type ModelsResponse ="));
         assert!(product_types.contains("export type GatewayCapabilitiesDocument ="));
+        assert!(product_types.contains("export type RequestPreflightResponse ="));
+
+        let python_types = std::str::from_utf8(get(SDK_PRODUCT_PY_PATH)).expect("product Python");
+        assert!(python_types.contains("class ModelsResponse:"));
+        assert!(python_types.contains("class GatewayCapabilitiesDocument:"));
+        assert!(python_types.contains("class ModelTokenTrimmerMeta:"));
+        assert!(python_types.contains("class CapabilityReason:"));
+        assert!(python_types.contains("class RequestPreflightResponse:"));
     }
 }

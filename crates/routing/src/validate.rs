@@ -7,6 +7,11 @@ use tt_shared::pricing::{Capability, ModelInfo};
 
 use crate::{RouteAction, RouteConditions};
 
+/// The auto-pause evaluator never reads more classified verdicts than this.
+/// A larger configured minimum can therefore never trigger and must fail at
+/// route-write time instead of becoming a silent no-op.
+pub const PAUSE_MIN_VERDICTS_MAX: u32 = 100;
+
 // `Eq` dropped (not just `PartialEq`) because `InvalidPauseFloor` carries the
 // rejected f64; no caller relied on `Eq`.
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -22,6 +27,10 @@ pub enum ValidationError {
     InvalidPauseFloor { got: f64 },
     #[error("pause_min_verdicts must be >= 1")]
     InvalidPauseMinVerdicts,
+    #[error(
+        "pause_min_verdicts must be <= {max} because the evaluator retains at most that many classified verdicts, got {got}"
+    )]
+    UnreachablePauseMinVerdicts { got: u32, max: u32 },
     #[error("reasoning_max_effort must be \"low\" or \"medium\", got {got:?}")]
     InvalidReasoningEffortCap { got: String },
     #[error("reasoning_budget_tokens must be >= 1024 (Anthropic's documented minimum), got {got}")]
@@ -63,6 +72,15 @@ pub fn validate_auto_pause(then: &RouteAction) -> Result<(), ValidationError> {
     }
     if then.pause_min_verdicts == Some(0) {
         return Err(ValidationError::InvalidPauseMinVerdicts);
+    }
+    if let Some(got) = then
+        .pause_min_verdicts
+        .filter(|minimum| *minimum > PAUSE_MIN_VERDICTS_MAX)
+    {
+        return Err(ValidationError::UnreachablePauseMinVerdicts {
+            got,
+            max: PAUSE_MIN_VERDICTS_MAX,
+        });
     }
     Ok(())
 }
@@ -207,9 +225,10 @@ pub fn validate_workflow(then: &RouteAction) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// When the route requires image or audio input, the target must be
-/// `Vision`-capable (the runtime guard sets `vision=true` for both). An unknown
-/// target (`lookup` returns `None`) is permissive, matching the runtime guard.
+/// When the route requires image input, the target must be `Vision`-capable;
+/// when it requires audio input, the target must independently be
+/// `Audio`-capable. An unknown target (`lookup` returns `None`) is permissive,
+/// matching the runtime guard.
 ///
 /// `has_documents` is DELIBERATELY excluded from `needs_vision`: a document
 /// route's whole purpose is to target a TEXT model (the Document Lane distills
@@ -221,8 +240,9 @@ pub fn validate_capability(
     then: &RouteAction,
     lookup: impl Fn(&str) -> Option<ModelInfo>,
 ) -> Result<(), ValidationError> {
-    let needs_vision = when.has_images == Some(true) || when.has_audio == Some(true);
-    if !needs_vision {
+    let needs_vision = when.has_images == Some(true);
+    let needs_audio = when.has_audio == Some(true);
+    if !needs_vision && !needs_audio {
         return Ok(());
     }
     // A modifier-only route (`target_model == None`) has no rewrite target to
@@ -233,10 +253,16 @@ pub fn validate_capability(
         return Ok(());
     };
     if let Some(info) = lookup(tm) {
-        if !info.capabilities.contains(&Capability::Vision) {
+        if needs_vision && !info.capabilities.contains(&Capability::Vision) {
             return Err(ValidationError::MissingCapability {
                 target: tm.to_string(),
                 capability: "vision",
+            });
+        }
+        if needs_audio && !info.capabilities.contains(&Capability::Audio) {
+            return Err(ValidationError::MissingCapability {
+                target: tm.to_string(),
+                capability: "audio",
             });
         }
     }
@@ -337,6 +363,15 @@ mod tests {
             max_output_tokens: 1000,
         }
     }
+    fn audio_model(id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            provider: "p".into(),
+            capabilities: vec![Capability::Text, Capability::Audio],
+            max_input_tokens: 1000,
+            max_output_tokens: 1000,
+        }
+    }
 
     #[test]
     fn has_images_requires_vision_target() {
@@ -354,6 +389,31 @@ mod tests {
         assert!(validate_capability(&when, &action("vis"), lookup).is_ok());
         assert!(validate_capability(&when, &action("txt"), lookup).is_err());
         // Unknown target is permissive (mirrors runtime guard).
+        assert!(validate_capability(&when, &action("unknown"), lookup).is_ok());
+    }
+
+    #[test]
+    fn has_audio_requires_audio_not_vision_target() {
+        let when = RouteConditions {
+            has_audio: Some(true),
+            ..Default::default()
+        };
+        let lookup = |m: &str| -> Option<ModelInfo> {
+            match m {
+                "audio" => Some(audio_model("audio")),
+                "vision" => Some(vision_model("vision")),
+                _ => None,
+            }
+        };
+        assert!(validate_capability(&when, &action("audio"), lookup).is_ok());
+        assert_eq!(
+            validate_capability(&when, &action("vision"), lookup),
+            Err(ValidationError::MissingCapability {
+                target: "vision".into(),
+                capability: "audio",
+            })
+        );
+        // Unknown target remains permissive, matching runtime dispatch.
         assert!(validate_capability(&when, &action("unknown"), lookup).is_ok());
     }
 
@@ -410,8 +470,9 @@ mod tests {
     }
 
     /// Auto-pause config bounds: the floor must be a fraction in (0, 1] (NaN
-    /// rejected), `pause_min_verdicts` must be >= 1 — validated even when
-    /// `auto_pause` is false (bad config is bad config).
+    /// rejected), and `pause_min_verdicts` must fit the evaluator's 1–100
+    /// classified-verdict window — validated even when `auto_pause` is false
+    /// (bad config is bad config).
     #[test]
     fn validate_auto_pause_bounds() {
         // No auto-pause config at all → OK.
@@ -444,6 +505,16 @@ mod tests {
         );
         b.pause_min_verdicts = Some(1);
         assert!(validate_auto_pause(&b).is_ok());
+        b.pause_min_verdicts = Some(PAUSE_MIN_VERDICTS_MAX);
+        assert!(validate_auto_pause(&b).is_ok());
+        b.pause_min_verdicts = Some(PAUSE_MIN_VERDICTS_MAX + 1);
+        assert_eq!(
+            validate_auto_pause(&b),
+            Err(ValidationError::UnreachablePauseMinVerdicts {
+                got: PAUSE_MIN_VERDICTS_MAX + 1,
+                max: PAUSE_MIN_VERDICTS_MAX,
+            })
+        );
         b.pause_min_verdicts = None;
         assert!(validate_auto_pause(&b).is_ok());
         // Validated even when auto_pause itself is off.

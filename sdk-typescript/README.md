@@ -76,7 +76,53 @@ console.log(`cache ${response.tt.cache}`);
 console.log(`trace ${response.tt.traceId}`);
 ```
 
-The class is an `openai.OpenAI` subclass — every other method (`embeddings`, `models`, tools, vision) works unchanged.
+The class is an `openai.OpenAI` subclass — inherited methods (`embeddings`,
+`models`, tools, vision) work unchanged. For TokenTrimmer's responder-scoped,
+runtime-validated metadata extensions, use `client.gateway`:
+
+```ts
+// Anonymous catalog metadata. No configured bearer is sent.
+const catalog = await client.gateway.models();
+console.log(catalog.data[0]?.tokentrimmer.max_input_tokens);
+
+// Requires a tt_live_* key; evidence from one responding gateway process.
+const capabilities = await client.gateway.capabilities();
+console.log(capabilities.features.fusion.limits.member_models_max.value);
+
+// Local responder preflight only: no provider request, tokenization, or
+// credential-validity/readiness claim.
+const preflight = await client.gateway.preflight({
+  schema_version: 1,
+  model: 'gpt-4o-mini',
+  provider: null,
+  required_capabilities: ['text', 'tools', 'streaming'],
+  declared_input_tokens: 12_000,
+  requested_max_output_tokens: 4_096,
+});
+console.log(preflight.actions);
+console.log(preflight.catalog_cost); // explicit standard-rate token/cost interval or unknown
+
+// One responder and generated-at marker for 1–9 ordered role declarations.
+const batch = await client.gateway.preflightBatch({
+  schema_version: 1,
+  requests: [preflight.request],
+});
+console.log(batch.documents);
+```
+
+These operations use Rust-generated wire types, no automatic redirects, one
+five-second timeout, streamed body ceilings (256 KiB models / 64 KiB
+capabilities and preflight), strict no-store/nosniff and semantic validation, and model
+snapshot-digest recomputation. They do not prove credentials, provider health,
+model/modality readiness, live pricing, request acceptance, fleet convergence,
+a quote/reservation, enforced budget, settlement, invoice, or later execution.
+The optional catalog cost interval is standard-rate arithmetic over explicit
+token assumptions only. Successful reason messages are bounded responder copy;
+use the stable reason codes and actual request result for machine decisions.
+The batch removes cross-process drift and freezes resolved configured/missing
+values from one secret-free credential-store snapshot before constructing role
+documents. Composite stores and runtime configuration are still not one
+transaction, and this is not executable panel admission or a reservation.
 
 ### `openai` version compatibility
 

@@ -379,12 +379,12 @@ fn effective_ttl_secs(
     default: u64,
 ) -> u64 {
     if let Some(secs) = request_override {
-        return secs;
+        return secs.clamp(1, crate::state::MAX_L1_TTL_SECS);
     }
     if let Some(t) = tier {
-        return t.ttl_secs();
+        return t.ttl_secs().min(crate::state::MAX_L1_TTL_SECS);
     }
-    default
+    default.clamp(1, crate::state::MAX_L1_TTL_SECS)
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,6 +1580,9 @@ async fn complete_once_with_retry_policy(
     //     circuit breaker is open; otherwise dispatch the single provider
     //     with retry. `provider` is rebound to whichever provider actually
     //     served the request so cost/headers/telemetry below reflect it.
+    if route_fallbacks.is_empty() {
+        validate_exact_model_media_capabilities(provider.as_ref(), &req.model, &req)?;
+    }
     let __primary = provider.id();
     let primary_dispatch = with_request_timeout(request_timeout, async {
         if route_fallbacks.is_empty() {
@@ -2405,6 +2408,11 @@ pub async fn handler(
     // Wall-clock start — fed into `request_logs.latency_ms`.
     let request_started = Instant::now();
     let retrieval_telemetry = retrieval.map(|Extension(v)| v).unwrap_or_default();
+
+    // Validate canonical image/audio inputs before model resolution, sandbox
+    // short-circuiting, routing, caching, or Fusion fan-out.
+    tt_shared::validate_chat_media_inputs(&req)
+        .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
 
     // 1. Resolve provider — 404 for unknown models. (May be re-resolved inside
     //    `prepare` after routing rewrites req.model.) `resolve` falls back to
@@ -4421,6 +4429,9 @@ async fn handle_streaming(
         // mid-stream error cannot move to another provider); otherwise retry
         // the single provider. `provider`/`served_model` are rebound to whoever
         // actually served so cost/telemetry attribute correctly.
+        if route_fallbacks.is_empty() {
+            validate_exact_model_media_capabilities(provider.as_ref(), &req.model, &req)?;
+        }
         let __primary = provider.id();
         let __stream_outcome = with_request_timeout(request_timeout, async {
             if route_fallbacks.is_empty() {
@@ -6594,6 +6605,134 @@ pub(crate) struct ShadowOutcome {
     pub(crate) succeeded: bool,
 }
 
+/// Reject a media request before any upstream work when the selected provider's
+/// exact catalog entry positively lacks the required modality.
+///
+/// Unknown/unlisted model IDs remain permissive. Provider inference is an
+/// intentional forward-compatibility path for newly released models, so the
+/// gateway only rejects a model when its own adapter catalog provides exact,
+/// contradictory evidence.
+fn validate_exact_model_media_capabilities(
+    provider: &dyn tt_shared::Provider,
+    model: &str,
+    req: &ChatCompletionRequest,
+) -> ApiResult<()> {
+    let required = tt_shared::RequiredCapabilities::from_request(req);
+    if !required.vision && !required.audio {
+        return Ok(());
+    }
+
+    let models = provider.models();
+    let info = models.iter().find(|info| info.id == model);
+    validate_catalog_media_capabilities(provider.id(), model, info, &required)
+}
+
+fn validate_catalog_media_capabilities(
+    provider_id: &str,
+    model: &str,
+    info: Option<&tt_shared::ModelInfo>,
+    required: &tt_shared::RequiredCapabilities,
+) -> ApiResult<()> {
+    let Some(info) = info else {
+        return Ok(());
+    };
+    if required.vision
+        && !info
+            .capabilities
+            .contains(&tt_shared::pricing::Capability::Vision)
+    {
+        return Err(ApiError::InvalidRequest(format!(
+            "model {model:?} for provider {provider_id:?} does not support image input (missing vision capability)"
+        )));
+    }
+    if required.audio
+        && !info
+            .capabilities
+            .contains(&tt_shared::pricing::Capability::Audio)
+    {
+        return Err(ApiError::InvalidRequest(format!(
+            "model {model:?} for provider {provider_id:?} does not support audio input (missing audio capability)"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod direct_media_capability_tests {
+    use super::*;
+    use tt_shared::pricing::Capability;
+
+    fn info(capabilities: Vec<Capability>) -> tt_shared::ModelInfo {
+        tt_shared::ModelInfo {
+            id: "known-model".into(),
+            provider: "known-provider".into(),
+            capabilities,
+            max_input_tokens: 128_000,
+            max_output_tokens: 4096,
+        }
+    }
+
+    #[test]
+    fn exact_catalog_keeps_image_and_audio_requirements_independent() {
+        let vision_only = info(vec![Capability::Text, Capability::Vision]);
+        let image = tt_shared::RequiredCapabilities {
+            vision: true,
+            ..Default::default()
+        };
+        let audio = tt_shared::RequiredCapabilities {
+            audio: true,
+            ..Default::default()
+        };
+
+        assert!(validate_catalog_media_capabilities(
+            "known-provider",
+            "known-model",
+            Some(&vision_only),
+            &image,
+        )
+        .is_ok());
+        let error = validate_catalog_media_capabilities(
+            "known-provider",
+            "known-model",
+            Some(&vision_only),
+            &audio,
+        )
+        .expect_err("Vision must not stand in for Audio");
+        assert!(
+            matches!(&error, ApiError::InvalidRequest(message) if message.contains("does not support audio input")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn exact_catalog_rejects_missing_vision_but_unknown_models_stay_permissive() {
+        let text_only = info(vec![Capability::Text]);
+        let image = tt_shared::RequiredCapabilities {
+            vision: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_catalog_media_capabilities(
+                "known-provider",
+                "known-model",
+                Some(&text_only),
+                &image,
+            ),
+            Err(ApiError::InvalidRequest(message)) if message.contains("does not support image input")
+        ));
+        assert!(
+            validate_catalog_media_capabilities(
+                "known-provider",
+                "new-unlisted-model",
+                None,
+                &image,
+            )
+            .is_ok(),
+            "inferred but unlisted models preserve the provider-forward-compatibility path"
+        );
+    }
+}
+
 /// Dispatch a canary shadow candidate (`RouteAction::shadow_model`) ONCE,
 /// non-streaming, with NO failover, discarding the response and returning only
 /// its cost/usage. SEPARATE from the primary dispatch in every way:
@@ -6630,6 +6769,17 @@ async fn dispatch_shadow(
         );
         return outcome;
     };
+    if let Err(error) =
+        validate_exact_model_media_capabilities(shadow_provider.as_ref(), shadow_model, base_req)
+    {
+        tracing::warn!(
+            shadow_model = %shadow_model,
+            provider = shadow_provider.id(),
+            error = %error,
+            "shadow model lacks a required media capability — skipping shadow dispatch"
+        );
+        return outcome;
+    }
     // Resolve the shadow provider's credential. `allow_bearer_fallback=true`
     // here is gated INSIDE `resolve_credentials_for` to anonymous orgs only
     // (`org_id.is_nil()`), so a VERIFIED org with no stored shadow credential

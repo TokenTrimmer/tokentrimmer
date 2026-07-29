@@ -8,8 +8,8 @@ use tt_provider_anthropic::translate::{
 };
 use tt_shared::{
     messages::{
-        ContentPart, DocumentPart, DocumentSource, ImageUrl, Message, MessageContent, Tool,
-        ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
+        ContentPart, DocumentPart, DocumentSource, ImageUrl, InputAudio, Message, MessageContent,
+        Tool, ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
     },
     ChatCompletionRequest,
 };
@@ -48,14 +48,33 @@ fn user_text(text: &str) -> Message {
 }
 
 #[test]
+fn valid_canonical_audio_remains_explicitly_unsupported() {
+    let req = make_request(
+        "claude-sonnet-4-6",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "UklGRiYAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQIAAAAAAA==".into(),
+                    format: "wav".into(),
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let error = translate_request(req).expect_err("Anthropic audio is not implemented");
+    assert!(error.to_string().contains("audio input is not supported"));
+}
+
+#[test]
 fn data_url_image_becomes_base64_source_not_remote_url() {
     let req = make_request(
         "claude-sonnet-4-6",
         vec![Message::User {
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                    url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=".into(),
                     detail: None,
+                    media_type: None,
                 },
             }]),
             name: None,
@@ -68,7 +87,10 @@ fn data_url_image_becomes_base64_source_not_remote_url() {
         "expected base64 source: {s}"
     );
     assert!(s.contains(r#""media_type":"image/png""#), "{s}");
-    assert!(s.contains(r#""data":"iVBORw0KGgo=""#), "{s}");
+    assert!(
+        s.contains(r#""data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"#),
+        "{s}"
+    );
 }
 
 #[test]
@@ -78,8 +100,9 @@ fn remote_url_image_stays_url_source() {
         vec![Message::User {
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/cat.png".into(),
+                    url: "https://objects.example.com/private/digest?X-Amz-Signature=abc".into(),
                     detail: None,
+                    media_type: Some("image/png".into()),
                 },
             }]),
             name: None,
@@ -88,7 +111,14 @@ fn remote_url_image_stays_url_source() {
     let body = translate_request(req).expect("translate ok");
     let s = serde_json::to_string(&body).unwrap();
     assert!(s.contains(r#""type":"url""#), "expected url source: {s}");
-    assert!(s.contains("https://example.com/cat.png"), "{s}");
+    assert!(
+        s.contains("https://objects.example.com/private/digest?X-Amz-Signature=abc"),
+        "{s}"
+    );
+    assert!(
+        !s.contains("media_type"),
+        "remote URL MIME hint is not part of Anthropic's URL-source wire shape: {s}"
+    );
 }
 
 #[test]
@@ -145,6 +175,26 @@ fn remote_url_document_stays_url_source() {
     );
     assert!(s.contains(r#""type":"url""#), "expected url source: {s}");
     assert!(s.contains("https://example.com/report.pdf"), "{s}");
+}
+
+#[test]
+fn openai_file_id_is_rejected_instead_of_misrepresented_as_anthropic_url() {
+    let req = make_request(
+        "claude-sonnet-4-6",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::Document {
+                document: DocumentPart {
+                    source: DocumentSource::Url {
+                        url: "file-abc_123".into(),
+                    },
+                    filename: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let error = translate_request(req).expect_err("provider-specific file id must fail closed");
+    assert!(error.to_string().contains("file_id is not supported"));
 }
 
 #[test]
@@ -688,6 +738,7 @@ fn translate_multimodal_image_url() {
                 image_url: ImageUrl {
                     url: "https://example.com/cat.jpg".to_string(),
                     detail: None,
+                    media_type: None,
                 },
             },
         ]),

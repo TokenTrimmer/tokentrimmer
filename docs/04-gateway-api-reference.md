@@ -27,6 +27,8 @@ Gateway implements the following OpenAI API endpoints, with the OpenAI request/r
 | `/v1/embeddings` | POST | ✓ v1 |
 | `/v1/models` | GET | ✓ v1 |
 | `/v1/capabilities` | GET | ✓ gateway-runtime evidence v1 |
+| `/v1/capabilities/preflight` | POST | ✓ request-specific local evidence v1 |
+| `/v1/capabilities/preflight/batch` | POST | ✓ single-responder request-set evidence v1 |
 | `/v1/completions` (legacy) | POST | ✗ not supported |
 | `/v1/responses` (OpenAI Responses API) | POST | ✗ not yet supported — use `/v1/chat/completions` |
 | `/v1/images/generations` | POST | ✗ not supported (v2 candidate) |
@@ -359,13 +361,121 @@ Image inputs follow OpenAI format:
     "role": "user",
     "content": [
       { "type": "text", "text": "What's in this image?" },
-      { "type": "image_url", "image_url": { "url": "https://..." } }
+      {
+        "type": "image_url",
+        "image_url": {
+          "url": "https://...",
+          "media_type": "image/png"
+        }
+      }
     ]
   }]
 }
 ```
 
-Gateway translates to provider-specific image handling. Base64 data URLs and HTTPS URLs both supported.
+Gateway translates to provider-specific image handling. Base64 data URLs and
+HTTPS URLs both work. Remote URLs must be valid HTTPS URLs without embedded
+credentials. Image types are closed to `image/jpeg`, `image/png`, `image/gif`,
+and `image/webp`. A request may contain at most four image parts. Each inline
+data URL is decoded as standard base64, capped independently at 5 MiB, and
+must carry the declared JPEG/PNG/GIF/WebP container signature; the four-part
+limit therefore also bounds one request to at most 20 MiB of decoded inline
+image data. Its format header must expose non-zero dimensions no larger than
+16,384 pixels on either edge and no larger than 40,000,000 pixels in total.
+Animated PNG, GIF, and WebP containers are limited to 100 frames. PNG
+animation-control/frame-control counts must agree, GIF image descriptors are
+counted through its bounded block structure, and animated WebP requires a
+consistent `VP8X` flag plus `ANIM`/`ANMF` chunks.
+
+`image_url.media_type` is an optional TokenTrimmer transport extension for
+remote references whose URL path has no trustworthy filename extension, such
+as a content-addressed private object behind a temporary signed URL. Native
+adapters use it when their wire format requires a separate MIME field (Gemini
+`fileData.mimeType`). OpenAI-compatible adapters remove the extension before
+upstream dispatch, while retaining the standard `url` and `detail` fields.
+For a base64 data URL, a supplied hint must exactly match the data URL's media
+type. Inline admission walks the bounded container metadata needed for
+dimensions and animation frame counts, but it is not a successful image decode,
+decompression validation, scanning, moderation, or content attestation. The
+derived limits bound declared pixel/frame surfaces without decoding the raster.
+For a remote URL, the hint remains caller metadata: the gateway validates its
+syntax and closed value set, but does not fetch, scan, authorize, or attest the
+referenced bytes.
+
+The canonical parser also reserves the standard OpenAI-compatible
+`input_audio` content-part shape for forward compatibility:
+
+```json
+{
+  "type": "input_audio",
+  "input_audio": {
+    "data": "UklGRiYAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQIAAAAAAA==",
+    "format": "wav"
+  }
+}
+```
+
+`data` must be non-empty standard base64 (not a data URL or remote URL), and
+`format` is closed to `wav` or `mp3`. A request may contain at most four audio
+parts, at most 20 MiB of decoded audio bytes, and at most ten minutes of decoded
+playback in total. A source may declare no more than eight channels or a
+192 kHz sample rate. WAV admission walks the bounded RIFF chunks, requires one
+internally consistent uncompressed PCM/IEEE-float format plus non-empty sample
+data, and derives duration from the exact byte rate. MP3 admission validates an
+optional bounded ID3v2 prefix, walks every complete MPEG Layer III frame,
+requires stable sample rate/channel count, and derives duration from frame
+sample counts. A terminal ID3v1 tag is accepted. No audio samples are decoded.
+Admission validates that contract before routing, sandboxing, caching, or
+Fusion fan-out and does not echo rejected audio data in its diagnostic. This is
+bounded container-metadata validation, not a codec decode, malware/moderation
+scan, semantic-content check, or content attestation. It does **not** change the
+v1 support matrix in §16:
+the current exact model catalog advertises no Audio-capable model. The Gemini
+adapter can map a validated payload to native `inlineData` (`audio/wav` or
+`audio/mpeg`) for forward-compatible unlisted models; Anthropic translation
+still rejects `input_audio`. Neither source mapping is live-provider acceptance.
+
+Canonical document parts accept the OpenAI `file` input form, the Anthropic
+`document/source` form, and TokenTrimmer's stable
+`document/document/source` form. Before routing, the gateway validates inline
+standard base64 or data URLs against the current Document Lane v1 set:
+`application/pdf`, PNG, JPEG, GIF, WebP, BMP, or TIFF. Remote sources must be
+credential-free HTTPS URLs. An opaque OpenAI `file-*` id is syntax-checked
+separately. A request may contain at most eight document parts and at most
+20 MiB of decoded inline document bytes in total. Inline bytes must also carry
+the declared container signature (PDF header within its first 1,024 bytes, or
+the standard PNG/JPEG/GIF/WebP/BMP/TIFF signature). An image-typed document
+source must also expose non-zero dimensions in that format's header and shares
+the 16,384-pixel edge / 40,000,000-pixel declared-surface ceilings above,
+including BMP and TIFF headers. PNG/GIF/WebP document sources also share the
+100-frame animation ceiling and consistent bounded container walk. Those
+modality-specific limits apply independently of the gateway's whole-request
+body limit.
+
+Provider translation remains explicit:
+
+- OpenAI-compatible adapters reconstruct `type: "file"` with exact
+  `file_data` plus a required filename, or with `file_id`. They reject arbitrary
+  HTTPS document URLs rather than forwarding TokenTrimmer's canonical shape.
+- Anthropic maps inline/data-URL documents to base64 sources and HTTPS
+  documents to URL sources.
+- Gemini maps inline/data-URL documents to `inlineData` and HTTPS documents to
+  `fileData`.
+- Anthropic and Gemini reject OpenAI `file_id` values rather than
+  misrepresenting them as fetchable URLs.
+
+Signature and bounded image-metadata consistency are not a successful decode
+or content attestation. These checks do not fetch remote sources, deeply parse
+PDFs or decode image pixels, scan, authorize, or moderate document contents.
+The Document Lane v1
+distillation seam itself processes inline sources only; an HTTPS URL or
+provider file id cannot be distilled by that seam. Its configured parser stays
+out of process, accepts at most 20 MiB per call, runs at most two extractions at
+once with a short saturation wait and four-second handler budget, and refuses
+PDFs above 100 pages. Successful extracted text is capped at 1,000,000 Unicode
+scalar values / 4 MiB and 100 page spans. The gateway independently streams and
+caps the sidecar response before parsing it. Any parser/transport/limit failure
+keeps the original media verbatim.
 
 ### 3.7 Structured outputs
 
@@ -465,7 +575,9 @@ POST /v1/embeddings
 GET /v1/models
 ```
 
-Returns all models accessible to the authenticated key, across all configured providers.
+Returns the model metadata advertised by providers registered in the responding
+gateway process. This endpoint is intentionally anonymous and is catalog
+metadata, not a caller-specific availability or request-acceptance check.
 
 ```json
 {
@@ -474,38 +586,65 @@ Returns all models accessible to the authenticated key, across all configured pr
     {
       "id": "gpt-4o",
       "object": "model",
-      "created": 1715367049,
       "owned_by": "openai",
       "tokentrimmer": {
         "provider": "openai",
         "pricing": {
-          "input_per_million": 2.50,
-          "output_per_million": 10.00,
-          "cached_input_per_million": 1.25
+          "input_per_million": 2.5,
+          "output_per_million": 10.0,
+          "cached_input_per_million": 1.25,
+          "cache_write_per_million": null,
+          "batch_input_per_million": null,
+          "batch_output_per_million": null,
+          "flex_input_per_million": null,
+          "flex_output_per_million": null,
+          "prompt_cache_min_tokens": null,
+          "effective_at": "2026-05-01T00:00:00Z"
         },
-        "capabilities": ["text", "vision", "tools", "json_mode", "streaming"]
-      }
-    },
-    {
-      "id": "claude-3-5-sonnet",
-      "object": "model",
-      "created": 1717113600,
-      "owned_by": "anthropic",
-      "tokentrimmer": {
-        "provider": "anthropic",
-        "pricing": {
-          "input_per_million": 3.00,
-          "output_per_million": 15.00,
-          "cached_input_per_million": 0.30
-        },
-        "capabilities": ["text", "vision", "tools", "streaming", "prompt_caching"]
+        "capabilities": ["text", "vision", "tools", "json_mode", "streaming"],
+        "max_input_tokens": 128000,
+        "max_output_tokens": 16000
       }
     }
-  ]
+  ],
+  "tokentrimmer": {
+    "schema_version": 1,
+    "snapshot_scope": "responding_process",
+    "source": "registered_provider_catalog",
+    "snapshot_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "limitations": {
+      "provider_credentials": "not_inspected",
+      "provider_health": "not_probed",
+      "request_acceptance": "not_negotiated",
+      "fleet_consistency": "not_attested"
+    }
+  }
 }
 ```
 
-The `tokentrimmer` object is the TokenTrimmer extension.
+Both `tokentrimmer` objects are TokenTrimmer extensions. The response is
+`Cache-Control: private, no-store` with `X-Content-Type-Options: nosniff`.
+`snapshot_sha256` identifies the responding process's exact sorted `data`
+array. It is neither a signature nor a release, deployment, or fleet-consistency
+attestation. The four limitation fields are normative: catalog presence never
+proves that a credential exists or is valid, that a provider is healthy, or
+that a particular request will be accepted.
+
+The generated structural contract is
+`docs/model-contract/models-response.schema.json` and is included in
+`docs/contracts/product-contracts.manifest.json`. Runtime consumers must still
+reject unsafe JavaScript integers, non-finite rates, duplicate or ambiguous
+model IDs, and semantically invalid combinations.
+
+The Rust SDK exposes this exact shared wire through `Client::models()`;
+Python and TypeScript expose typed `client.gateway.models()` readers (the
+Python dataclasses and TypeScript types are emitted by the same Rust
+generator). The reads are
+anonymous, use a five-second timeout and 256 KiB streamed body cap, refuse
+redirects and malformed cache/content headers, validate the v1 semantics, and
+recompute `snapshot_sha256`. That validation detects corruption or an
+internally inconsistent response; the self-described digest is not a signature
+or readiness attestation.
 
 ### 5.2 Gateway runtime capabilities
 
@@ -591,6 +730,122 @@ For every row, `state: "unknown"` and `source: "not_negotiated"` are
 normative: the code describes an omitted observation, never a positive or
 negative readiness result. Clients MUST use the actual request result for any
 credential, provider, model, modality, limit, or execution decision.
+
+The Rust SDK exposes the exact shared wire through `Client::capabilities()`;
+Python and TypeScript expose typed `client.gateway.capabilities()` readers.
+Their Python dataclasses and TypeScript wire types are emitted by the same Rust
+product-contract generator.
+They accept only a configured `tt_live_*` key and HTTPS (or literal-loopback
+HTTP), use a five-second timeout and 64 KiB streamed body cap, refuse redirects,
+require JSON plus `no-store`/`nosniff`, and fail closed on contradictory Fusion
+facts or changed v1 reason-code mappings. Remote error prose is not surfaced.
+Reason messages in a successful typed response are bounded but remain
+responder-supplied display copy; reason codes and the actual later request
+result are the stable machine boundaries.
+
+### 5.3 Request-specific capability preflight
+
+```
+POST /v1/capabilities/preflight
+Authorization: Bearer tt_live_...
+Content-Type: application/json
+```
+
+The request is an explicitly versioned, non-dispatching declaration:
+
+```json
+{
+  "schema_version": 1,
+  "model": "gpt-4o-mini",
+  "provider": null,
+  "required_capabilities": ["text", "tools", "streaming"],
+  "declared_input_tokens": 12000,
+  "requested_max_output_tokens": 4096
+}
+```
+
+Each supplied token value must fit the v1 cross-language wire
+(`0..4,294,967,295` for declared input and `1..4,294,967,295` for requested
+maximum output).
+
+The private/no-store response is scoped to one responding process and reports:
+
+- exact catalog match or dispatch-provider resolution;
+- whether an organization credential **record** exists for the resolved
+  provider (never the secret or a validity result);
+- exact catalog capability coverage and missing capabilities;
+- a comparison of the caller-declared token values with catalog metadata; and
+- when the exact row is priceable, a standard-rate catalog cost interval whose
+  low/high token assumptions are explicit; and
+- bounded stable action/reason codes for known local blockers.
+
+Provider health and request acceptance remain
+`unknown`/`not_negotiated`. The endpoint sends no provider request, does not
+decrypt or validate a credential, does not tokenize the prompt, and does not
+turn catalog limits into provider-accepted hard limits. A catalog match and
+`configured` credential record are therefore not readiness, a spend/capacity
+reservation, or execution evidence. `execute_request_and_handle_result` is
+always present as the non-blocking authoritative next step; known local
+blockers carry separate `required_before_request: true` actions.
+
+`catalog_cost.state: "catalog_projection"` applies the responding process's
+standard fresh-input/output catalog rates. A declared input count fixes both
+input bounds; an omitted count spans zero through the catalog input limit.
+Output spans zero through the requested maximum, or the catalog output limit
+when no maximum was supplied. These are explicit arithmetic assumptions, not
+provider tokenization, cache/tier/discount pricing, a quote, provider-observed
+readiness, a reservation, settlement, invoice reconciliation, or an enforced
+budget. Missing/invalid pricing or an unrepresentable catalog envelope produces
+`state: "unknown"` with every rate, token, and cost value `null`.
+
+The response schema is
+`docs/capability-contract/request-preflight-response.schema.json` and its
+TypeScript/Python wire types are emitted by the product-contract generator.
+Rust, Python, and TypeScript expose bounded, live-key, no-redirect
+`preflight(...)` helpers that validate the echoed declaration and the complete
+v1 evidence/action semantics. Package publication/adoption, Dashboard
+consumption, immutable Cloud pinning, deployment, and real-request evidence
+remain separate rollout gates.
+
+For a bounded role set, `POST /v1/capabilities/preflight/batch` accepts:
+
+```json
+{
+  "schema_version": 1,
+  "requests": [
+    {
+      "schema_version": 1,
+      "model": "gpt-4o-mini",
+      "provider": null,
+      "required_capabilities": ["text"],
+      "declared_input_tokens": 12000,
+      "requested_max_output_tokens": 4096
+    }
+  ]
+}
+```
+
+The batch must contain 1–9 declarations. One responding process evaluates them
+in order and returns one generated-at marker plus an equally ordered
+`documents` array; every nested document satisfies the standalone v1 response
+contract and repeats the same marker. This removes load-balancer/process drift
+between a Fusion panel's effective roles. Before constructing any nested
+document, the gateway captures all resolved credential-presence values through
+one secret-free store call. Postgres performs that capture in one MVCC
+statement; the in-memory store uses one map lock. Default and composite stores
+can still combine sequential source reads, and the runtime catalog is not
+frozen with credential state in a cross-store transaction. The batch performs
+no secret validation, provider/embedding probe, tokenization, executable panel
+admission, reservation, settlement, or execution. The exact two `limitations`
+reason codes are `preflight_batch_single_responder_not_atomic` and
+`preflight_batch_provider_execution_not_observed`.
+
+The Rust SDK exposes `preflight_batch(...)` with the same live-key,
+no-redirect, bounded-body, defensive-header, echo/order, nested-semantics, and
+single-timestamp checks. The generated structural schema is
+`docs/capability-contract/request-preflight-batch-response.schema.json`;
+generated TypeScript includes both batch wire types. This is a coherent
+responder-local metadata batch, not coherent executable panel admission.
 
 ---
 
@@ -1198,7 +1453,7 @@ fall back to the OpenAI SDK's own `OPENAI_API_KEY`).
 ### 11.1 Python
 
 ```python
-from tokentrimmer import TokenTrimmer
+from tokentrimmer import RequestPreflightRequest, TokenTrimmer
 
 client = TokenTrimmer(api_key="tt_live_...")  # or set TOKENTRIMMER_API_KEY
 
@@ -1211,6 +1466,18 @@ response = client.chat.completions.create(
 
 # Access TokenTrimmer metadata
 print(response.tt.cost_usd, response.tt.saved_usd, response.tt.cache)
+
+catalog = client.gateway.models()           # anonymous responder metadata
+capabilities = client.gateway.capabilities()  # requires tt_live_*
+preflight = client.gateway.preflight(RequestPreflightRequest(
+    schema_version=1,
+    model="gpt-4o-mini",
+    provider=None,
+    required_capabilities=("text", "tools"),
+    declared_input_tokens=12_000,
+    requested_max_output_tokens=4_096,
+))
+print(preflight.catalog_cost)
 ```
 
 ### 11.2 TypeScript
@@ -1227,6 +1494,18 @@ const response = await client.chat.completions.create({
 });
 
 console.log(response.tt.costUsd, response.tt.savedUsd, response.tt.cache);
+
+const catalog = await client.gateway.models();          // anonymous metadata
+const capabilities = await client.gateway.capabilities(); // requires tt_live_*
+const preflight = await client.gateway.preflight({
+  schema_version: 1,
+  model: 'gpt-4o-mini',
+  provider: null,
+  required_capabilities: ['text', 'tools'],
+  declared_input_tokens: 12_000,
+  requested_max_output_tokens: 4_096,
+});
+console.log(preflight.catalog_cost);
 ```
 
 The Python and TypeScript SDKs are thin — the underlying request goes through the OpenAI SDK, with `base_url` set to TokenTrimmer. Customers can also use the OpenAI SDK directly (point its `base_url` at the gateway) without the TokenTrimmer wrapper.
@@ -1252,6 +1531,33 @@ let outcome = client
 println!("{:?}", outcome.text());
 // Cost/savings parsed from the x-tokentrimmer-* response headers.
 println!("{:?} {:?}", outcome.cost.cost_usd, outcome.cost.saved_usd);
+
+// Anonymous, bounded read of one responding gateway process's model metadata.
+let catalog = client.models().await?;
+println!("{} catalog rows", catalog.data.len());
+
+// Authenticated evidence from one responder; not a provider-readiness probe.
+let capabilities = client.capabilities().await?;
+println!(
+    "Fusion member cap on this responder: {}",
+    capabilities.features.fusion.limits.member_models_max.value
+);
+
+let preflight = client
+    .preflight(&tt_client::RequestPreflightRequest {
+        schema_version: 1,
+        model: "gpt-4o-mini".into(),
+        provider: None,
+        required_capabilities: vec![
+            tt_client::Capability::Text,
+            tt_client::Capability::Tools,
+        ],
+        declared_input_tokens: Some(12_000),
+        requested_max_output_tokens: Some(4_096),
+    })
+    .await?;
+println!("{:?}", preflight.actions);
+println!("{:?}", preflight.catalog_cost);
 ```
 
 ---
@@ -1597,6 +1903,18 @@ On `/v1/chat/completions` and `/v1/responses`, you can fine-tune the panel by in
 
 **Fan-out:** all member legs are dispatched concurrently (non-streaming, regardless of the caller's `stream` flag on the legs). Each leg targets the assigned member model and provider.
 
+**Media:** every member receives the caller's original typed messages. For
+`synthesize` and `best-of-n`, the LLM arbiter request also retains those
+messages before the gateway appends its instruction and candidate answers.
+Consequently, an image/audio reference can be fetched by every member and by
+that arbiter. The gateway requires the corresponding exact capability evidence
+for each actual media recipient before admission: Vision for images and Audio
+for audio. The two capabilities are independent. Missing, ambiguous, or
+incompatible catalog rows fail with `400` before fan-out. `majority` sends the
+original media only to members because it does not dispatch the configured
+arbiter model. URL privacy, expiry, reuse, and upstream retention remain the
+caller's responsibility.
+
 **Quorum:** the minimum number of legs that must succeed before arbitration. Default (when not set in `tt_extras.panel.quorum`):
 - `majority` strategy: `floor(members / 2) + 1`
 - all other strategies: `1`
@@ -1607,6 +1925,26 @@ If fewer legs succeed than the quorum threshold, the panel fails with `502` and 
 - `synthesize` — the arbiter model is called with all surviving leg answers and asked to synthesize one best answer. When `stream: true`, the arbiter call streams back to the caller.
 - `best-of-n` — the arbiter model is called as a judge to pick the single best leg by number; that leg's original response is returned verbatim (no paraphrase). When `stream: true`, the chosen leg is fake-streamed.
 - `majority` — surviving answers are embedded and clustered by cosine similarity (threshold `TT_PANEL_MAJORITY_THRESHOLD`, default `0.83`). The medoid of the largest cluster is returned verbatim; no arbiter LLM call is made. When embedding is unavailable or fails, falls back to the first surviving leg and sets `arbiter.degraded: true`.
+
+Synthesize and Best-of-N append each candidate through
+`tokentrimmer.fusion-candidate-data.v1`: a separately named, JSON-escaped
+untrusted-data message with an opaque candidate number and content only.
+The arbiter instruction says that candidate content is data, not instructions,
+and receives no TokenTrimmer model or provider identity for a candidate.
+Candidate numbers are assigned under
+`tokentrimmer.fusion-blind-order.v1` after a fresh request-local random shuffle
+whose key does not include model, provider, latency, cost, or answer content.
+Best-of-N maps the selected randomized number back to the original leg before
+returning the answer and recording its receipt. This is prompt-injection
+defense in depth, source-metadata blinding, and protection against stable
+position bias—not a claim that an LLM will always obey the instruction or that
+the resulting choices are balanced or higher quality. Candidate prose may
+identify its own origin, and no evaluation-backed adaptive threshold, cascade,
+or early-stop policy is active. The
+[adaptive-evaluation foundation](fusion-adaptive-evaluation/README.md) documents
+the deterministic 2–8-candidate exposure regression and versioned framing
+attack corpus, including the production, choice-quality, and calibration claims
+they do not establish.
 
 **Streaming behavior:**
 - `/v1/chat/completions` with `stream: true`: member legs always run non-streaming; the arbiter answer streams back as standard chat completion chunks. A trailing `event: tokentrimmer.panel` SSE frame carries the per-leg attribution (same shape as the non-streaming body key; see §21.4).
@@ -1698,13 +2036,15 @@ data: [DONE]
 | `quorum.required` | integer | Minimum legs required to succeed. |
 | `quorum.met` | integer | Legs that actually succeeded. |
 | `legs[]` | array | One entry per dispatched leg (members + arbiter), in dispatch order. |
-| `legs[].leg_index` | integer | Zero-based index into the member list; arbiter entry uses a sentinel value. |
+| `legs[].leg_index` | integer | Bounded zero-based index in the emitted `legs` array. |
 | `legs[].role` | string | `"leg"` for a panel member, `"arbiter"` for the arbitration call. |
 | `legs[].model` | string | Model id dispatched for this leg. |
 | `legs[].provider` | string | Provider id used for dispatch. |
 | `legs[].cost_usd` | float\|null | Cost for this leg; `null` when the model is unpriced. |
 | `legs[].status` | string | `"ok"`, `"error"`, `"timeout"`, or `"skipped_no_cred"`. |
 | `legs[].tokens` | object\|null | `{ input_tokens, output_tokens, cached_tokens }`; `null` on non-ok legs. |
+| `legs[].latency_ms` | integer | Bounded wall-clock latency for this dispatched leg. |
+| `legs[].cache` | object | Provider-terminal cache provenance. `state` distinguishes reported hit, reported zero, not reported, and unavailable usage; `read_tokens`/`write_tokens` remain nullable instead of silently becoming zero. |
 | `arbiter.strategy` | string | Strategy name. |
 | `arbiter.cost_usd` | float\|null | Cost of the arbiter call alone; `null` for `majority` (no LLM call). |
 | `arbiter.chosen_leg` | integer | (`best-of-n` only) leg_index of the chosen answer. |
@@ -1714,6 +2054,27 @@ data: [DONE]
 | `arbiter.total_clusters` | integer | (`majority` only) Total distinct clusters found. |
 | `arbiter.no_majority` | boolean | (`majority` only) `true` when all answers were distinct (global medoid returned). |
 | `arbiter.degraded` | boolean | (`majority` only) `true` when embedding failed; fell back to first leg. |
+| `terminal_receipt` | object | Versioned `tokentrimmer.fusion-terminal-receipt.v1` candidate-answer receipt described below. |
+
+`terminal_receipt` repeats the terminal strategy, legs, aggregate cost, quorum,
+cost-completeness flag, and arbiter object under the exact
+`tokentrimmer.fusion-terminal-receipt.v1` schema so it can be exported and
+validated as one self-contained object. Its `candidates[]` contains one bounded
+plain-text answer for each successful member leg whose first assistant choice
+is text. Each row binds the emitted `leg_index`, the retained content, exact
+full/retained UTF-8 byte counts, a truncation flag, and separate SHA-256 digests
+for the complete answer and retained prefix. Candidate content is capped at 12
+KiB per member and is therefore a review/export preview, not an unbounded
+archive. The receipt also reports the successful-member count and
+captured-answer count so a client cannot mistake missing non-text candidates
+for agreement.
+
+This terminal receipt is gateway-authored, additive, and unsigned. Candidate
+answers can contain the same sensitive material as ordinary model output; store
+or export them only under the caller's applicable retention policy. Digests
+prove byte identity within the receipt but do not prove provider authorship,
+semantic correctness, claim agreement, calibrated confidence, quality, or
+invoice reconciliation.
 
 The `tokentrimmer.panel` shape is **identical across all three ingresses** — `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` all carry or emit the same object.
 
@@ -1777,7 +2138,7 @@ From the billing and overage meter perspective a panel counts as **one request**
 The Gateway records every request as a hash-chained, Ed25519-signed audit entry. Operators can export and verify the chain with:
 
 ```bash
-tt audit verify [--path .claude/AUDIT-CHAIN.jsonl] [--key-hex <hex>]
+tt audit verify [.claude/AUDIT-CHAIN.jsonl] [--key-hex <hex>]
 ```
 
 The verifying key is embedded in the export preamble automatically; pass `--key-hex` or `--key` to override it.
@@ -1792,6 +2153,48 @@ The verifying key is embedded in the export preamble automatically; pass `--key-
 > from a truncated database is self-consistent. The anchor is only as trustworthy
 > as that off-box log pipeline; automatic WORM anchoring (S3 Object Lock) is the
 > deferred full solution.
+
+### 22.1 Customer-controlled checkpoints
+
+A customer can co-sign one exact organization, TokenTrimmer audit verifying
+key, and out-of-band chain tip with a separately controlled Ed25519 key:
+
+```bash
+chmod 0600 customer-audit.seed
+tt audit create-checkpoint \
+  --org <organization-uuid> \
+  --audit-key-hex <tokentrimmer-audit-verifying-key> \
+  --expected-tip <seq>:<hash> \
+  --customer-signing-key customer-audit.seed \
+  --output customer-checkpoint.json
+
+tt audit verify audit-chain.jsonl \
+  --customer-checkpoint customer-checkpoint.json \
+  --customer-key customer-audit.pub
+```
+
+`customer-audit.seed` must contain exactly one 32-byte Ed25519 seed encoded as
+64 lowercase hex characters; on Unix, the CLI rejects a seed file accessible
+by group or other users. The output path must not exist. The public verifying
+key file contains the corresponding 32-byte Ed25519 verifying key in the same
+hex format and may be distributed normally. It is deliberately not embedded in
+the checkpoint: the verifier must obtain it through an authenticated,
+out-of-band customer channel. `--customer-key-hex` is available when an inline
+public key is operationally preferable.
+
+Creation signs the supplied tuple; it does not fetch or verify an audit export.
+Capture the tip from the off-box `tt::audit::tip` stream and confirm the audit
+key and organization independently before signing. Verification first checks
+the customer's checkpoint signature, then verifies the complete TokenTrimmer
+hash chain under the checkpointed audit key, requires every row to have the
+checkpointed organization, and requires the chain to end at the checkpointed
+tip.
+
+This checkpoint is a customer co-signature, not an external timestamp,
+transparency-log entry, Merkle inclusion proof, or proof that the source emitted
+every event. It also says nothing about provider invoices or cost
+reconciliation. Those stronger anchoring and business-evidence properties
+require separate systems.
 
 ---
 
@@ -2022,6 +2425,23 @@ Fetches the current state of a run. Look-up order:
 
 ```
 GET /v1/agent/runs/:id
+Authorization: Bearer tt_live_*
+```
+
+#### `GET|DELETE /v1/agent/runs/:id/transcript` — export or erase retained transcript
+
+`GET` returns the full currently retained run/transcript with `Cache-Control:
+private, no-store`; it does not fall back to the durable metadata-only row, and
+therefore returns `404` after TTL expiry or deletion. `DELETE` idempotently
+removes the authenticated org's exact L1/Redis transcript and returns `204`.
+It shares a writer fence with resume, so a concurrent resume cannot restore a
+transcript after deletion. Deletion intentionally preserves durable run and
+billing/audit/receipt metadata. Directly terminal runs are not retained in
+Redis and are available only in their creation response.
+
+```
+GET /v1/agent/runs/:id/transcript
+DELETE /v1/agent/runs/:id/transcript
 Authorization: Bearer tt_live_*
 ```
 

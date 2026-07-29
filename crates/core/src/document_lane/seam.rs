@@ -542,6 +542,7 @@ mod tests {
                     image_url: tt_shared::messages::ImageUrl {
                         url: format!("data:image/png;base64,{PNG_1X1_B64}"),
                         detail: None,
+                        media_type: None,
                     },
                 }]),
                 name: None,
@@ -595,6 +596,7 @@ mod tests {
                     image_url: tt_shared::messages::ImageUrl {
                         url: format!("data:image/png;base64,{PNG_1X1_B64}"),
                         detail: None,
+                        media_type: None,
                     },
                 }]),
                 name: None,
@@ -744,12 +746,14 @@ mod tests {
                 image_url: tt_shared::messages::ImageUrl {
                     url: "https://example.test/image.png".into(),
                     detail: None,
+                    media_type: None,
                 },
             },
             ContentPart::ImageUrl {
                 image_url: tt_shared::messages::ImageUrl {
                     url: "data:image/png,not-base64".into(),
                     detail: None,
+                    media_type: None,
                 },
             },
         ];

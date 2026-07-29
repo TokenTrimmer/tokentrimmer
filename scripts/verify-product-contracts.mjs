@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Dependency-free cross-language smoke for generated route/workflow/capability
+// Dependency-free cross-language smoke for generated route/workflow/model/capability
 // artifacts. Rust owns generation and semantic validation; this independently
 // checks manifest hashes plus the TypeScript/schema/vector seams consumers use.
 
@@ -19,7 +19,9 @@ for (const family of [
   'route_preview_coverage',
   'workflow_definition',
   'workflow_write',
+  'models',
   'gateway_capabilities',
+  'request_preflight',
 ]) {
   assert(families.has(family), `missing product contract family: ${family}`);
 }
@@ -94,17 +96,87 @@ assert(
   'capability positive member limit missing',
 );
 
+const models = load(families.get('models').schema);
+assert(models.properties.object.const === 'list', 'model list discriminator drift');
+assert(models.$defs.ModelEntry.properties.object.const === 'model', 'model row discriminator drift');
+assert(models.$defs.ModelsDocumentMeta.properties.schema_version.const === 1, 'model version drift');
+assert(
+  models.$defs.ModelsDocumentMeta.properties.snapshot_scope.const === 'responding_process',
+  'model snapshot scope drift',
+);
+assert(
+  models.$defs.ModelsDocumentMeta.properties.source.const === 'registered_provider_catalog',
+  'model source drift',
+);
+assert(
+  models.$defs.ModelsDocumentMeta.properties.snapshot_sha256.pattern === '^[0-9a-f]{64}$',
+  'model digest shape drift',
+);
+for (const field of [
+  'batch_input_per_million',
+  'batch_output_per_million',
+  'cache_write_per_million',
+  'cached_input_per_million',
+  'flex_input_per_million',
+  'flex_output_per_million',
+  'prompt_cache_min_tokens',
+]) {
+  assert(models.$defs.ModelPricing.required.includes(field), `model pricing output field is optional: ${field}`);
+}
+assert(
+  models.$defs.ModelTokenTrimmerMeta.required.includes('pricing'),
+  'model pricing output field must be present, including null',
+);
+assert(
+  capabilities.$defs.SchemaVersionEvidence.required.includes('version'),
+  'capability schema version output must be present, including null',
+);
+
+const requestPreflight = load(families.get('request_preflight').schema);
+assert(requestPreflight.properties.schema_version.const === 1, 'preflight version drift');
+assert(requestPreflight.properties.scope.const === 'request_preflight', 'preflight scope drift');
+assert(
+  requestPreflight.properties.snapshot_scope.const === 'responding_process',
+  'preflight snapshot scope drift',
+);
+assert(
+  requestPreflight.$defs.RequestPreflightRequest.properties.required_capabilities.uniqueItems === true &&
+    requestPreflight.$defs.RequestPreflightRequest.properties.required_capabilities.maxItems === 8,
+  'preflight required-capability bound drift',
+);
+assert(
+  requestPreflight.$defs.PreflightAction.properties.code.enum.includes(
+    'execute_request_and_handle_result',
+  ),
+  'preflight authoritative-request action missing',
+);
+
 const typescript = readText(manifest.typescript);
+const sdkTypescript = readText(manifest.typescript_sdk);
+const sdkPython = readText(manifest.python_sdk);
+assert(sdkTypescript === typescript, 'SDK generated product TypeScript drift');
 for (const typeName of [
   'RouteWriteRequest',
   'WorkflowDefinition',
   'WorkflowWriteRequest',
+  'ModelsResponse',
   'GatewayCapabilitiesDocument',
+  'RequestPreflightResponse',
 ]) {
   assert(typescript.includes(`export type ${typeName} =`), `missing generated ${typeName}`);
 }
 assert(typescript.includes('export type Node = {\n  id: string;\n} & ('), 'flattened node id lost');
 assert(!/\bany\b/.test(typescript), 'generated product TypeScript contains any');
+for (const className of [
+  'ModelsResponse',
+  'ModelTokenTrimmerMeta',
+  'GatewayCapabilitiesDocument',
+  'CapabilityReason',
+  'RequestPreflightResponse',
+]) {
+  assert(sdkPython.includes(`class ${className}:`), `missing generated Python ${className}`);
+}
+assert(!/\bAny\b/.test(sdkPython), 'generated product Python contains Any');
 
 console.log(`verified ${manifest.files.length} generated product files across ${families.size} families`);
 

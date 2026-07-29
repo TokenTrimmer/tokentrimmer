@@ -28,8 +28,10 @@ use crate::{
 /// The set of capabilities a [`ChatCompletionRequest`] requires.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequiredCapabilities {
-    /// At least one message contains an image_url or input_audio content part.
+    /// At least one message contains an image_url content part.
     pub vision: bool,
+    /// At least one message contains an input_audio content part.
+    pub audio: bool,
     /// The request has non-empty `tools`, or any assistant message contains
     /// `tool_calls`.
     pub tools: bool,
@@ -54,16 +56,19 @@ impl RequiredCapabilities {
             }
         }
 
-        // scan messages for vision content and tool_calls
+        // Scan messages for media capabilities and tool_calls. Images and
+        // audio are deliberately independent: a model advertising Vision
+        // does not thereby advertise Audio input.
         for msg in &req.messages {
             match msg {
                 Message::User { content, .. } | Message::System { content } => {
                     if let MessageContent::Parts(parts) = content {
                         for part in parts {
                             match part {
-                                ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => {
+                                ContentPart::ImageUrl { .. } => {
                                     caps.vision = true;
                                 }
+                                ContentPart::InputAudio { .. } => caps.audio = true,
                                 // A Document part does NOT require Vision: the
                                 // Document Lane's target is a TEXT model (the
                                 // pre-routing seam distills it to text). Leaving
@@ -99,6 +104,9 @@ impl RequiredCapabilities {
         if self.vision && !info.capabilities.contains(&Capability::Vision) {
             return false;
         }
+        if self.audio && !info.capabilities.contains(&Capability::Audio) {
+            return false;
+        }
         if self.tools && !info.capabilities.contains(&Capability::Tools) {
             return false;
         }
@@ -117,6 +125,9 @@ impl RequiredCapabilities {
         let mut reasons = Vec::new();
         if self.vision && !info.capabilities.contains(&Capability::Vision) {
             reasons.push("vision_not_supported");
+        }
+        if self.audio && !info.capabilities.contains(&Capability::Audio) {
+            reasons.push("audio_not_supported");
         }
         if self.tools && !info.capabilities.contains(&Capability::Tools) {
             reasons.push("tools_not_supported");
@@ -165,8 +176,8 @@ fn extract_text(content: &MessageContent) -> String {
 
 /// True when any message carries an image (`ContentPart::ImageUrl`) content part.
 ///
-/// Distinct from [`RequiredCapabilities`], which collapses image **and** audio
-/// into a single `vision` flag; routing needs to tell the two modalities apart.
+/// This is the request-shape counterpart to
+/// [`RequiredCapabilities::vision`].
 pub fn request_has_images(req: &ChatCompletionRequest) -> bool {
     req.messages
         .iter()
@@ -300,6 +311,16 @@ mod tests {
         }
     }
 
+    fn audio_model() -> ModelInfo {
+        ModelInfo {
+            id: "audio-model".into(),
+            provider: "mock".into(),
+            capabilities: vec![Capability::Text, Capability::Audio],
+            max_input_tokens: 128_000,
+            max_output_tokens: 4096,
+        }
+    }
+
     fn small_model() -> ModelInfo {
         ModelInfo {
             id: "small-ctx".into(),
@@ -337,6 +358,7 @@ mod tests {
         let req = base_req();
         let caps = RequiredCapabilities::from_request(&req);
         assert!(!caps.vision);
+        assert!(!caps.audio);
         assert!(!caps.tools);
         assert!(!caps.json_mode);
     }
@@ -353,6 +375,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "data:image/png;base64,abc".into(),
                         detail: None,
+                        media_type: None,
                     },
                 },
             ]),
@@ -360,6 +383,7 @@ mod tests {
         }];
         let caps = RequiredCapabilities::from_request(&req);
         assert!(caps.vision);
+        assert!(!caps.audio);
         assert!(!caps.tools);
     }
 
@@ -416,6 +440,7 @@ mod tests {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".into(),
                     detail: None,
+                    media_type: None,
                 },
             }]),
             name: None,
@@ -432,12 +457,32 @@ mod tests {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".into(),
                     detail: None,
+                    media_type: None,
                 },
             }]),
             name: None,
         }];
         let caps = RequiredCapabilities::from_request(&req);
         assert!(caps.satisfied_by(&vision_model(), 0));
+    }
+
+    #[test]
+    fn audio_part_sets_audio_without_vision() {
+        let mut req = base_req();
+        req.messages = vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "abc".into(),
+                    format: "wav".into(),
+                },
+            }]),
+            name: None,
+        }];
+        let caps = RequiredCapabilities::from_request(&req);
+        assert!(caps.audio);
+        assert!(!caps.vision);
+        assert!(!caps.satisfied_by(&vision_model(), 0));
+        assert!(caps.satisfied_by(&audio_model(), 0));
     }
 
     #[test]
@@ -462,11 +507,13 @@ mod tests {
     fn skip_reasons_lists_all_failures() {
         let caps = RequiredCapabilities {
             vision: true,
+            audio: true,
             tools: true,
             ..Default::default()
         };
         let reasons = caps.skip_reasons(&text_model(), 9999);
         assert!(reasons.contains(&"vision_not_supported"));
+        assert!(reasons.contains(&"audio_not_supported"));
         assert!(reasons.contains(&"tools_not_supported"));
         assert!(reasons.contains(&"context_window_too_small"));
     }
@@ -483,6 +530,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "data:image/png;base64,abc".into(),
                         detail: None,
+                        media_type: None,
                     },
                 },
             ]),
@@ -506,6 +554,9 @@ mod tests {
         }];
         assert!(request_has_audio(&req));
         assert!(!request_has_images(&req));
+        let caps = RequiredCapabilities::from_request(&req);
+        assert!(caps.audio);
+        assert!(!caps.vision);
     }
 
     #[test]
@@ -541,7 +592,9 @@ mod tests {
         assert!(!request_has_images(&req));
         assert!(!request_has_audio(&req));
         // A document does NOT require the Vision capability.
-        assert!(!RequiredCapabilities::from_request(&req).vision);
+        let required = RequiredCapabilities::from_request(&req);
+        assert!(!required.vision);
+        assert!(!required.audio);
     }
 
     #[test]
@@ -552,6 +605,7 @@ mod tests {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc".into(),
                     detail: None,
+                    media_type: None,
                 },
             }]),
             name: None,

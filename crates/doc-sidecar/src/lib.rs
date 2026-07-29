@@ -20,7 +20,7 @@
 //! constrained CI can build the sidecar without the ML graph.
 
 use axum::{
-    extract::Json,
+    extract::{DefaultBodyLimit, Json},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -28,8 +28,21 @@ use axum::{
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::sync::Semaphore;
+use tt_shared::{
+    validate_document_bytes, MAX_DOCUMENT_EXTRACTED_TEXT_BYTES, MAX_DOCUMENT_EXTRACTED_TEXT_CHARS,
+    MAX_DOCUMENT_PAGES, MAX_INLINE_DOCUMENT_BYTES, SUPPORTED_DOCUMENT_MEDIA_TYPES,
+};
 
 mod ocr;
+
+const MAX_SIDECAR_BASE64_CHARS: usize = MAX_INLINE_DOCUMENT_BYTES.div_ceil(3) * 4;
+const MAX_EXTRACT_REQUEST_BODY_BYTES: usize = MAX_SIDECAR_BASE64_CHARS + 1024;
+const MAX_CONCURRENT_EXTRACTIONS: usize = 2;
+const EXTRACTION_QUEUE_TIMEOUT: Duration = Duration::from_millis(100);
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(4);
+static EXTRACTION_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_EXTRACTIONS);
 
 /// Request body for `POST /extract`: a document's media type + its bytes as
 /// standard base64 (no `data:` prefix).
@@ -98,27 +111,92 @@ pub fn app() -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/extract", post(extract_handler))
+        .layer(DefaultBodyLimit::max(MAX_EXTRACT_REQUEST_BODY_BYTES))
 }
 
 /// `POST /extract` handler. Malformed base64 → `400`; everything else → `200`
 /// with a (possibly empty) [`ExtractResponse`] (fail-soft, so the fail-open
 /// client never has to distinguish "couldn't extract" from "no text").
 async fn extract_handler(Json(req): Json<ExtractRequest>) -> Response {
-    let bytes = match base64::engine::general_purpose::STANDARD.decode(req.data_base64.trim()) {
+    let bytes = match decode_request_data(&req.data_base64, MAX_INLINE_DOCUMENT_BYTES) {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(message) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": "invalid base64 in `data_base64`",
-                    "detail": err.to_string(),
+                    "error": message,
                 })),
             )
                 .into_response();
         }
     };
 
-    (StatusCode::OK, Json(extract(&req.media_type, &bytes))).into_response()
+    let media_type = req.media_type.trim().to_ascii_lowercase();
+    if SUPPORTED_DOCUMENT_MEDIA_TYPES.contains(&media_type.as_str()) {
+        if validate_document_bytes(&media_type, &bytes).is_err() {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "document bytes failed bounded media validation",
+                })),
+            )
+                .into_response();
+        }
+    } else {
+        return (StatusCode::OK, Json(extract(&media_type, &bytes))).into_response();
+    }
+
+    let permit =
+        match tokio::time::timeout(EXTRACTION_QUEUE_TIMEOUT, EXTRACTION_PERMITS.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ExtractResponse::empty(
+                        "isolation_unavailable",
+                        "document extraction capacity is unavailable",
+                        0,
+                    )),
+                )
+                    .into_response();
+            }
+        };
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            extract(&media_type, &bytes)
+        }))
+    });
+    let response = match tokio::time::timeout(EXTRACTION_TIMEOUT, task).await {
+        Ok(Ok(Ok(response))) => response,
+        Ok(Ok(Err(_))) => {
+            ExtractResponse::empty("isolation_error", "document extraction panicked", 0)
+        }
+        Ok(Err(_)) => {
+            ExtractResponse::empty("isolation_error", "document extraction task failed", 0)
+        }
+        Err(_) => ExtractResponse::empty(
+            "isolation_timeout",
+            "document extraction exceeded the bounded runtime",
+            0,
+        ),
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+fn decode_request_data(data: &str, max_decoded_bytes: usize) -> Result<Vec<u8>, &'static str> {
+    let data = data.trim();
+    let max_base64_chars = max_decoded_bytes.div_ceil(3) * 4;
+    if data.len() > max_base64_chars {
+        return Err("decoded document bytes exceed the sidecar limit");
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| "invalid standard base64 in `data_base64`")?;
+    if bytes.len() > max_decoded_bytes {
+        return Err("decoded document bytes exceed the sidecar limit");
+    }
+    Ok(bytes)
 }
 
 /// Dispatch extraction on the media type. PDFs → lossless text-layer pull;
@@ -126,7 +204,7 @@ async fn extract_handler(Json(req): Json<ExtractRequest>) -> Response {
 #[must_use]
 pub fn extract(media_type: &str, bytes: &[u8]) -> ExtractResponse {
     let media_type = media_type.trim();
-    if media_type.eq_ignore_ascii_case("application/pdf") {
+    let response = if media_type.eq_ignore_ascii_case("application/pdf") {
         extract_pdf(bytes)
     } else if media_type.to_ascii_lowercase().starts_with("image/") {
         ocr::extract_image(bytes)
@@ -136,6 +214,23 @@ pub fn extract(media_type: &str, bytes: &[u8]) -> ExtractResponse {
             format!("unsupported media_type `{media_type}` (expected application/pdf or image/*)"),
             0,
         )
+    };
+    bound_extraction_response(response)
+}
+
+fn bound_extraction_response(response: ExtractResponse) -> ExtractResponse {
+    let too_large = response.pages > MAX_DOCUMENT_PAGES
+        || response.spans.len() > usize::try_from(MAX_DOCUMENT_PAGES).unwrap_or(usize::MAX)
+        || response.text.len() > MAX_DOCUMENT_EXTRACTED_TEXT_BYTES
+        || response.text.chars().count() > MAX_DOCUMENT_EXTRACTED_TEXT_CHARS;
+    if too_large && (!response.text.is_empty() || !response.spans.is_empty()) {
+        ExtractResponse::empty(
+            "output_limit",
+            "document extraction exceeded the bounded output",
+            response.pages,
+        )
+    } else {
+        response
     }
 }
 
@@ -144,12 +239,59 @@ pub fn extract(media_type: &str, bytes: &[u8]) -> ExtractResponse {
 /// (some malformed PDFs make the parser panic) degrades to an empty result with
 /// a note rather than a 500 — the client stays fail-open either way.
 fn extract_pdf(bytes: &[u8]) -> ExtractResponse {
+    let page_count = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lopdf::Document::load_mem(bytes).map(|document| document.get_pages().len())
+    }));
+    let page_count = match page_count {
+        Ok(Ok(page_count)) => page_count,
+        Ok(Err(_)) => {
+            return ExtractResponse::empty("pdf-extract", "pdf page tree parse failed", 0);
+        }
+        Err(_) => {
+            return ExtractResponse::empty("pdf-extract", "pdf page tree parse panicked", 0);
+        }
+    };
+    let pages = u32::try_from(page_count).unwrap_or(u32::MAX);
+    if pages > MAX_DOCUMENT_PAGES {
+        return ExtractResponse::empty(
+            "pdf_limit",
+            "pdf exceeds the 100-page extraction limit",
+            pages,
+        );
+    }
+
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem_by_pages(bytes)
     }));
 
     match parsed {
         Ok(Ok(pages_text)) => {
+            if pages_text.len() != page_count {
+                return ExtractResponse::empty(
+                    "pdf-extract",
+                    "pdf extractor page evidence is inconsistent",
+                    pages,
+                );
+            }
+            let text_bytes = pages_text.iter().try_fold(0usize, |total, text| {
+                total
+                    .checked_add(text.len())
+                    .and_then(|value| value.checked_add(2))
+            });
+            let text_chars = pages_text.iter().try_fold(0usize, |total, text| {
+                total
+                    .checked_add(text.chars().count())
+                    .and_then(|value| value.checked_add(2))
+            });
+            if text_bytes.is_none_or(|count| count > MAX_DOCUMENT_EXTRACTED_TEXT_BYTES + 2)
+                || text_chars.is_none_or(|count| count > MAX_DOCUMENT_EXTRACTED_TEXT_CHARS + 2)
+            {
+                return ExtractResponse::empty(
+                    "output_limit",
+                    "pdf extraction exceeded the bounded text output",
+                    pages,
+                );
+            }
             let spans = pages_text
                 .iter()
                 .enumerate()
@@ -159,7 +301,6 @@ fn extract_pdf(bytes: &[u8]) -> ExtractResponse {
                     chars: page_text.chars().count(),
                 })
                 .collect();
-            let pages = u32::try_from(pages_text.len()).unwrap_or(u32::MAX);
             ExtractResponse {
                 text: pages_text.join("\n\n"),
                 spans,
@@ -168,7 +309,7 @@ fn extract_pdf(bytes: &[u8]) -> ExtractResponse {
                 note: None,
             }
         }
-        Ok(Err(err)) => ExtractResponse::empty("pdf-extract", format!("pdf parse error: {err}"), 0),
+        Ok(Err(_)) => ExtractResponse::empty("pdf-extract", "pdf text extraction failed", 0),
         Err(_) => ExtractResponse::empty("pdf-extract", "pdf extraction panicked", 0),
     }
 }
@@ -185,7 +326,7 @@ mod tests {
 
     /// Build a valid single-page PDF with a text layer that reads
     /// "Hello TokenTrimmer" — using lopdf so the xref/offsets are correct.
-    fn text_layer_pdf() -> Vec<u8> {
+    fn text_layer_pdf_with_pages(page_count: u32) -> Vec<u8> {
         use lopdf::content::{Content, Operation};
         use lopdf::{dictionary, Document, Object, Stream};
 
@@ -209,17 +350,21 @@ mod tests {
             ],
         };
         let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-            "Resources" => resources_id,
-            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-        });
+        let page_ids = (0..page_count)
+            .map(|_| {
+                doc.add_object(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                    "Contents" => content_id,
+                    "Resources" => resources_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                })
+            })
+            .collect::<Vec<_>>();
         let pages = dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
+            "Kids" => page_ids.into_iter().map(Object::Reference).collect::<Vec<_>>(),
+            "Count" => page_count,
         };
         doc.objects.insert(pages_id, Object::Dictionary(pages));
         let catalog_id = doc.add_object(dictionary! {
@@ -231,6 +376,10 @@ mod tests {
         let mut buf = Vec::new();
         doc.save_to(&mut buf).unwrap();
         buf
+    }
+
+    fn text_layer_pdf() -> Vec<u8> {
+        text_layer_pdf_with_pages(1)
     }
 
     async fn post_extract(media_type: &str, data_base64: &str) -> (StatusCode, ExtractResponse) {
@@ -314,6 +463,55 @@ mod tests {
     async fn malformed_base64_is_400() {
         let (status, _resp) = post_extract("application/pdf", "@@@ this is not base64 @@@").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decoded_request_limit_preflights_before_allocation() {
+        assert_eq!(
+            decode_request_data("QUJD", 3).expect("three decoded bytes"),
+            b"ABC"
+        );
+        assert_eq!(
+            decode_request_data("QUJD", 2),
+            Err("decoded document bytes exceed the sidecar limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn supported_media_with_invalid_container_is_422() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"not a pdf");
+        let (status, _resp) = post_extract("application/pdf", &b64).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn pdf_page_count_is_bounded_inside_the_isolated_parser() {
+        let response = extract(
+            "application/pdf",
+            &text_layer_pdf_with_pages(MAX_DOCUMENT_PAGES + 1),
+        );
+        assert_eq!(response.engine, "pdf_limit");
+        assert_eq!(response.pages, MAX_DOCUMENT_PAGES + 1);
+        assert!(response.text.is_empty());
+        assert!(response.spans.is_empty());
+    }
+
+    #[test]
+    fn extracted_output_is_bounded_for_every_engine() {
+        let response = bound_extraction_response(ExtractResponse {
+            text: "x".repeat(MAX_DOCUMENT_EXTRACTED_TEXT_BYTES + 1),
+            spans: vec![Span {
+                kind: Span::LOSSY.into(),
+                page: 0,
+                chars: 1,
+            }],
+            pages: 1,
+            engine: "test".into(),
+            note: None,
+        });
+        assert_eq!(response.engine, "output_limit");
+        assert!(response.text.is_empty());
+        assert!(response.spans.is_empty());
     }
 
     #[tokio::test]

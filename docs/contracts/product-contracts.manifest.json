@@ -53,20 +53,50 @@
       "versions": [
         1
       ]
+    },
+    {
+      "family": "request_preflight",
+      "id": "tokentrimmer.request-preflight.v1",
+      "read": "POST /v1/capabilities/preflight",
+      "schema": "docs/capability-contract/request-preflight-response.schema.json",
+      "versions": [
+        1
+      ]
+    },
+    {
+      "family": "models",
+      "id": "tokentrimmer.models.v1",
+      "read": "GET /v1/models",
+      "schema": "docs/model-contract/models-response.schema.json",
+      "versions": [
+        1
+      ]
     }
   ],
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "22726bc1dddad42d4c1bd10325e88fd8207876c8c170d734adcf96882a5432c2"
+      "sha256": "82a98f44f254ffb8c594ffede616f145b784b494350143cbea41c4fe8e6f49fa"
     },
     {
       "path": "docs/capability-contract/gateway-capabilities.schema.json",
-      "sha256": "273191038c0c39dc72626a787f37649495b4a20426c2416fccf7cdfdfe31a783"
+      "sha256": "ba9275ee2fd1b2e187b3efbeef6b74549a37a5d4c8f2421ee7bd1a5940211401"
+    },
+    {
+      "path": "docs/capability-contract/request-preflight-batch-response.schema.json",
+      "sha256": "c016ba003e66ca2ec53f886187ed22ef9090ff7badbdeb7fecb3d23c595fd5e6"
+    },
+    {
+      "path": "docs/capability-contract/request-preflight-response.schema.json",
+      "sha256": "4f6c85c8c998b6aeb3ba15fb6a16ebeb17816de6be3f943d19ca73904bab9cc6"
+    },
+    {
+      "path": "docs/model-contract/models-response.schema.json",
+      "sha256": "481e75eac2764c78fbcc67dd60cdcfd48f67496bbf76001c21e78b039013ebb3"
     },
     {
       "path": "docs/route-contract/route-write.schema.json",
-      "sha256": "e2f2c6d224350fe17cf15b91e6ca56c63947fbb30ba422b55d5662392cf25a09"
+      "sha256": "d5bc7e9b324de50af0f0ef9d4e7a97e15aeb39495e757882b9ad23d4cc57833f"
     },
     {
       "path": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json",
@@ -83,8 +113,18 @@
     {
       "path": "docs/workflow-contract/workflow-write.schema.json",
       "sha256": "411dd9deae0591ff7b80d48cefb875e7208e01ec594a368402d3ba79f8c8016e"
+    },
+    {
+      "path": "sdk-python/tokentrimmer/product_contracts_generated.py",
+      "sha256": "ea8fe717bbfd16f754850e22904bf42f8a27dc20201c0d87739973cd37bf2d5c"
+    },
+    {
+      "path": "sdk-typescript/src/product-contracts.generated.ts",
+      "sha256": "82a98f44f254ffb8c594ffede616f145b784b494350143cbea41c4fe8e6f49fa"
     }
   ],
-  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, and gateway capability response type",
-  "typescript": "bindings/product-contracts.generated.ts"
+  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, and request-preflight response type",
+  "python_sdk": "sdk-python/tokentrimmer/product_contracts_generated.py",
+  "typescript": "bindings/product-contracts.generated.ts",
+  "typescript_sdk": "sdk-typescript/src/product-contracts.generated.ts"
 }

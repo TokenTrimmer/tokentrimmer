@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use tt_provider_compat::translate::{extract_usage, translate_request};
 use tt_shared::{
     messages::{
-        ContentPart, ImageUrl, Message, MessageContent, ResponseFormat, Tool, ToolCall,
-        ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
+        ContentPart, DocumentPart, DocumentSource, ImageUrl, InputAudio, Message, MessageContent,
+        ResponseFormat, Tool, ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction,
+        ToolFunction,
     },
     ChatCompletionRequest,
 };
@@ -262,6 +263,7 @@ fn translate_vision_content_parts() {
                 image_url: ImageUrl {
                     url: "https://example.com/cat.jpg".to_string(),
                     detail: Some("high".to_string()),
+                    media_type: Some("image/jpeg".to_string()),
                 },
             },
         ]),
@@ -270,8 +272,148 @@ fn translate_vision_content_parts() {
 
     let req = make_request("gpt-4o", messages);
     let body = translate_request(req).expect("translate ok");
+    let encoded = serde_json::to_value(&body).unwrap();
+    let image = &encoded["messages"][0]["content"][1]["image_url"];
+    assert_eq!(image["url"], "https://example.com/cat.jpg");
+    assert_eq!(image["detail"], "high");
+    assert!(
+        image.get("media_type").is_none(),
+        "TokenTrimmer MIME hint must not reach an OpenAI-compatible upstream: {encoded}"
+    );
 
     insta::assert_json_snapshot!("vision_content_parts", &body);
+}
+
+#[test]
+fn translate_audio_validates_then_preserves_the_openai_wire_shape() {
+    let audio = |data: &str, format: &str| {
+        make_request(
+            "gpt-audio-new-unlisted",
+            vec![Message::User {
+                content: MessageContent::Parts(vec![ContentPart::InputAudio {
+                    input_audio: InputAudio {
+                        data: data.into(),
+                        format: format.into(),
+                    },
+                }]),
+                name: None,
+            }],
+        )
+    };
+
+    let wav = "UklGRiYAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQIAAAAAAA==";
+    let body = translate_request(audio(wav, "wav")).expect("valid audio wire");
+    let encoded = serde_json::to_value(body).unwrap();
+    assert_eq!(
+        encoded["messages"][0]["content"][0],
+        serde_json::json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": wav,
+                "format": "wav"
+            }
+        })
+    );
+
+    let error = translate_request(audio("caller-secret-not-base64", "wav"))
+        .expect_err("malformed audio must stop before upstream serialization");
+    let message = error.to_string();
+    assert!(message.contains("standard base64"), "{message}");
+    assert!(
+        !message.contains("caller-secret"),
+        "validation errors must not echo caller audio data: {message}"
+    );
+}
+
+#[test]
+fn translate_documents_reconstructs_exact_openai_file_parts() {
+    let req = make_request(
+        "gpt-4o",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Document {
+                    document: DocumentPart {
+                        source: DocumentSource::Base64 {
+                            media_type: "application/pdf".into(),
+                            data: "JVBERi0xLjQK".into(),
+                        },
+                        filename: Some("report.pdf".into()),
+                    },
+                },
+                ContentPart::Document {
+                    document: DocumentPart {
+                        source: DocumentSource::Url {
+                            url: "file-abc_123-XYZ".into(),
+                        },
+                        filename: None,
+                    },
+                },
+            ]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("documents should translate");
+    let encoded = serde_json::to_value(body).unwrap();
+    assert_eq!(
+        encoded["messages"][0]["content"][0],
+        serde_json::json!({
+            "type": "file",
+            "file": {
+                "filename": "report.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi0xLjQK"
+            }
+        })
+    );
+    assert_eq!(
+        encoded["messages"][0]["content"][1],
+        serde_json::json!({
+            "type": "file",
+            "file": { "file_id": "file-abc_123-XYZ" }
+        })
+    );
+    let serialized = encoded.to_string();
+    assert!(
+        !serialized.contains(r#""type":"document""#)
+            && !serialized.contains(r#""document":{"source""#),
+        "canonical-only document keys must not reach OpenAI-compatible upstreams: {serialized}"
+    );
+}
+
+#[test]
+fn translate_documents_rejects_unrepresentable_url_or_missing_filename() {
+    let request = |source: DocumentSource, filename: Option<&str>| {
+        make_request(
+            "gpt-4o",
+            vec![Message::User {
+                content: MessageContent::Parts(vec![ContentPart::Document {
+                    document: DocumentPart {
+                        source,
+                        filename: filename.map(str::to_string),
+                    },
+                }]),
+                name: None,
+            }],
+        )
+    };
+
+    let remote = translate_request(request(
+        DocumentSource::Url {
+            url: "https://example.com/report.pdf".into(),
+        },
+        None,
+    ))
+    .expect_err("OpenAI-compatible file parts do not accept arbitrary URLs");
+    assert!(remote.to_string().contains("use file_data or file_id"));
+
+    let missing_filename = translate_request(request(
+        DocumentSource::Base64 {
+            media_type: "application/pdf".into(),
+            data: "JVBERi0xLjQK".into(),
+        },
+        None,
+    ))
+    .expect_err("file_data requires an explicit filename");
+    assert!(missing_filename.to_string().contains("requires a filename"));
 }
 
 // ---------------------------------------------------------------------------

@@ -189,6 +189,218 @@ async fn tt_test_bypasses_verify_and_credential_substitution() {
 }
 
 #[tokio::test]
+async fn invalid_image_inputs_are_rejected_before_sandbox_short_circuit() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_key = Arc::new(Mutex::new(None));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        last_api_key: Arc::clone(&last_key),
+        calls: Arc::clone(&calls),
+    }));
+    let app = build_app_with_state(AppState::new(registry));
+    let body = json!({
+        "model": "rec-1",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://objects.example.test/private/digest",
+                    "media_type": "image/svg+xml"
+                }
+            }]
+        }],
+        "stream": false,
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer tt_test_image_hint")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let body = json!({
+        "model": "rec-1",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,caller-secret-not-base64"
+                }
+            }]
+        }],
+        "stream": false,
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer tt_test_image_data")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+    assert!(
+        response_text.contains("valid standard base64"),
+        "{response_text}"
+    );
+    assert!(
+        !response_text.contains("caller-secret"),
+        "image data must not be reflected in the response: {response_text}"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn invalid_audio_wire_is_rejected_before_sandbox_short_circuit() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_key = Arc::new(Mutex::new(None));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        last_api_key: Arc::clone(&last_key),
+        calls: Arc::clone(&calls),
+    }));
+    let app = build_app_with_state(AppState::new(registry));
+    let body = json!({
+        "model": "rec-1",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "not base64!",
+                    "format": "wav"
+                }
+            }]
+        }],
+        "stream": false,
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer tt_test_audio_wire")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+    assert!(response_text.contains("standard base64"), "{response_text}");
+    assert!(
+        !response_text.contains("not base64"),
+        "audio data must not be reflected in the response: {response_text}"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let malformed_container = json!({
+        "model": "rec-1",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "UklGRgQAAABXQVZF",
+                    "format": "wav"
+                }
+            }]
+        }],
+        "stream": false,
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer tt_test_audio_container")
+                .body(Body::from(malformed_container.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+    assert!(
+        response_text.contains("container metadata is malformed"),
+        "{response_text}"
+    );
+    assert!(
+        !response_text.contains("UklGRgQAAABXQVZF"),
+        "audio data must not be reflected in the response: {response_text}"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn invalid_document_wire_is_rejected_before_sandbox_short_circuit() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_key = Arc::new(Mutex::new(None));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        last_api_key: Arc::clone(&last_key),
+        calls: Arc::clone(&calls),
+    }));
+    let app = build_app_with_state(AppState::new(registry));
+    let body = json!({
+        "model": "rec-1",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "document",
+                "document": {
+                    "source": {
+                        "type": "base64",
+                        "media_type": "text/html",
+                        "data": "PGgxPnByaXZhdGU8L2gxPg=="
+                    }
+                }
+            }]
+        }],
+        "stream": false,
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer tt_test_document_wire")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+    assert!(
+        response_text.contains("document media type"),
+        "{response_text}"
+    );
+    assert!(
+        !response_text.contains("PGgxPnByaXZhdGU"),
+        "document data must not be reflected in the response: {response_text}"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn tt_live_with_no_key_store_passes_through() {
     let calls = Arc::new(AtomicUsize::new(0));
     let last_key = Arc::new(Mutex::new(None));

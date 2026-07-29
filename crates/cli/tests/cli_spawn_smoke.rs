@@ -129,6 +129,11 @@ fn audit_spawns_without_panic() {
 }
 
 #[test]
+fn audit_create_checkpoint_help_is_exposed() {
+    assert_exits_cleanly(&["audit", "create-checkpoint", "--help"]);
+}
+
+#[test]
 fn mcp_spawns_without_panic() {
     // stdio transport with stdin already at EOF → serves zero requests and
     // exits. This is the arm that used to die on a nested Runtime::block_on.

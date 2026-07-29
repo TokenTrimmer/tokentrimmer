@@ -9,10 +9,16 @@
 //! 3. Extract `usage.prompt_tokens_details.cached_tokens` from responses into
 //!    [`tt_shared::Usage::cached_tokens`].
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    ser::{Error as _, SerializeSeq, SerializeStruct},
+    Deserialize, Serialize,
+};
 use serde_json::Value;
 use tt_shared::{
-    messages::{Message, ResponseFormat, Tool, ToolChoice},
+    messages::{
+        ContentPart, DocumentPart, DocumentSource, Message, MessageContent, ResponseFormat, Tool,
+        ToolChoice,
+    },
     usage::Usage,
     ProviderError,
 };
@@ -46,7 +52,9 @@ pub fn dropped_params(req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
 #[derive(Debug, Serialize)]
 pub struct OpenAiRequestBody {
     pub model: String,
-    pub messages: Vec<Message>,
+    /// Provider-wire messages. Canonical TokenTrimmer document parts are
+    /// normalized back to OpenAI's `file` content-part shape.
+    pub messages: Vec<OpenAiMessage>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -97,8 +105,17 @@ pub struct OpenAiRequestBody {
 ///
 /// This strips `tt_extras` and applies reasoning-model parameter constraints.
 pub fn translate_request(
-    req: tt_shared::ChatCompletionRequest,
+    mut req: tt_shared::ChatCompletionRequest,
 ) -> Result<OpenAiRequestBody, ProviderError> {
+    tt_shared::validate_chat_media_inputs(&req)
+        .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
+    // `image_url.media_type` is a TokenTrimmer transport hint, not part of the
+    // OpenAI-compatible upstream schema. Retain it through gateway admission
+    // and cache identity, then strip it from every message just before this
+    // provider-wire body is constructed.
+    strip_image_media_type_hints(&mut req.messages);
+    validate_openai_documents(&req.messages)?;
+    let messages = req.messages.into_iter().map(OpenAiMessage).collect();
     let reasoning = is_reasoning_model(&req.model);
 
     // An explicit caller-supplied `max_completion_tokens` is always authoritative
@@ -121,7 +138,7 @@ pub fn translate_request(
 
     Ok(OpenAiRequestBody {
         model: req.model,
-        messages: req.messages,
+        messages,
         temperature,
         top_p: req.top_p,
         max_tokens,
@@ -142,6 +159,216 @@ pub fn translate_request(
         extra: req.extra,
         // tt_extras is intentionally not forwarded.
     })
+}
+
+/// A provider-wire message serializer that preserves the canonical message
+/// field order while replacing only document parts with OpenAI's `file` shape.
+///
+/// Keeping this typed avoids converting every message through
+/// `serde_json::Value`, whose map ordering would churn otherwise-unchanged
+/// request bytes and snapshots.
+#[derive(Debug)]
+pub struct OpenAiMessage(Message);
+
+impl Serialize for OpenAiMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.0 {
+            Message::System { content } => {
+                let mut message = serializer.serialize_struct("OpenAiSystemMessage", 2)?;
+                message.serialize_field("role", "system")?;
+                message.serialize_field("content", &OpenAiContent(content))?;
+                message.end()
+            }
+            Message::User { content, name } => {
+                let mut message = serializer
+                    .serialize_struct("OpenAiUserMessage", 2 + usize::from(name.is_some()))?;
+                message.serialize_field("role", "user")?;
+                message.serialize_field("content", &OpenAiContent(content))?;
+                if let Some(name) = name {
+                    message.serialize_field("name", name)?;
+                }
+                message.end()
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                name,
+            } => {
+                let mut message = serializer.serialize_struct(
+                    "OpenAiAssistantMessage",
+                    1 + usize::from(content.is_some())
+                        + usize::from(!tool_calls.is_empty())
+                        + usize::from(name.is_some()),
+                )?;
+                message.serialize_field("role", "assistant")?;
+                if let Some(content) = content {
+                    message.serialize_field("content", &OpenAiContent(content))?;
+                }
+                if !tool_calls.is_empty() {
+                    message.serialize_field("tool_calls", tool_calls)?;
+                }
+                if let Some(name) = name {
+                    message.serialize_field("name", name)?;
+                }
+                message.end()
+            }
+            Message::Tool {
+                content,
+                tool_call_id,
+            } => {
+                let mut message = serializer.serialize_struct("OpenAiToolMessage", 3)?;
+                message.serialize_field("role", "tool")?;
+                message.serialize_field("content", &OpenAiContent(content))?;
+                message.serialize_field("tool_call_id", tool_call_id)?;
+                message.end()
+            }
+        }
+    }
+}
+
+struct OpenAiContent<'a>(&'a MessageContent);
+
+impl Serialize for OpenAiContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.0 {
+            MessageContent::Text(text) => serializer.serialize_str(text),
+            MessageContent::Parts(parts) => {
+                let mut wire_parts = serializer.serialize_seq(Some(parts.len()))?;
+                for part in parts {
+                    wire_parts.serialize_element(&OpenAiPart(part))?;
+                }
+                wire_parts.end()
+            }
+        }
+    }
+}
+
+struct OpenAiPart<'a>(&'a ContentPart);
+
+impl Serialize for OpenAiPart<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.0 {
+            ContentPart::Document { document } => {
+                let mut wire_part = serializer.serialize_struct("OpenAiDocumentPart", 2)?;
+                wire_part.serialize_field("type", "file")?;
+                wire_part.serialize_field("file", &OpenAiFile(document))?;
+                wire_part.end()
+            }
+            other => other.serialize(serializer),
+        }
+    }
+}
+
+struct OpenAiFile<'a>(&'a DocumentPart);
+
+impl Serialize for OpenAiFile<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.0.source {
+            DocumentSource::Base64 { media_type, data } => {
+                let filename = required_openai_filename(self.0)
+                    .map_err(<S::Error as serde::ser::Error>::custom)?;
+                let file_data = format!("data:{media_type};base64,{data}");
+                let mut file = serializer.serialize_struct("OpenAiFileData", 2)?;
+                file.serialize_field("filename", filename)?;
+                file.serialize_field("file_data", &file_data)?;
+                file.end()
+            }
+            DocumentSource::Url { url } if url.starts_with("file-") => {
+                let mut file = serializer.serialize_struct("OpenAiFileId", 1)?;
+                file.serialize_field("file_id", url)?;
+                file.end()
+            }
+            DocumentSource::Url { url } if url.starts_with("data:") => {
+                let filename = required_openai_filename(self.0)
+                    .map_err(<S::Error as serde::ser::Error>::custom)?;
+                let mut file = serializer.serialize_struct("OpenAiFileData", 2)?;
+                file.serialize_field("filename", filename)?;
+                file.serialize_field("file_data", url)?;
+                file.end()
+            }
+            DocumentSource::Url { .. } => Err(S::Error::custom(
+                "OpenAI-compatible document URL sources are not supported; use file_data or file_id",
+            )),
+        }
+    }
+}
+
+fn validate_openai_documents(messages: &[Message]) -> Result<(), ProviderError> {
+    for message in messages {
+        let content = match message {
+            Message::System { content }
+            | Message::User { content, .. }
+            | Message::Tool { content, .. } => Some(content),
+            Message::Assistant { content, .. } => content.as_ref(),
+        };
+        let Some(MessageContent::Parts(parts)) = content else {
+            continue;
+        };
+        for part in parts {
+            let ContentPart::Document { document } = part else {
+                continue;
+            };
+            match &document.source {
+                DocumentSource::Base64 { .. } => {
+                    required_openai_filename(document)?;
+                }
+                DocumentSource::Url { url } if url.starts_with("file-") => {}
+                DocumentSource::Url { url } if url.starts_with("data:") => {
+                    required_openai_filename(document)?;
+                }
+                DocumentSource::Url { .. } => {
+                    return Err(ProviderError::Unsupported(
+                        "OpenAI-compatible document URL sources are not supported; use file_data or file_id"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn required_openai_filename(document: &DocumentPart) -> Result<&str, ProviderError> {
+    document
+        .filename
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            ProviderError::InvalidRequest(
+                "OpenAI-compatible file_data document input requires a filename".to_string(),
+            )
+        })
+}
+
+fn strip_image_media_type_hints(messages: &mut [Message]) {
+    for message in messages {
+        let content = match message {
+            Message::System { content }
+            | Message::User { content, .. }
+            | Message::Tool { content, .. } => Some(content),
+            Message::Assistant { content, .. } => content.as_mut(),
+        };
+        let Some(MessageContent::Parts(parts)) = content else {
+            continue;
+        };
+        for part in parts {
+            if let tt_shared::messages::ContentPart::ImageUrl { image_url } = part {
+                image_url.media_type = None;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

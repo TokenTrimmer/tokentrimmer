@@ -95,6 +95,26 @@ async fn pg_batch_store_round_trips_and_is_org_scoped() {
     assert_eq!(after.error_file_id.as_deref(), Some("file-err"));
     assert_eq!(after.request_completed, 6);
     assert_eq!(after.request_failed, 1);
+    assert!(store
+        .owns_file(org_a, "file-in")
+        .await
+        .expect("input ownership"));
+    assert!(store
+        .owns_file(org_a, "file-out")
+        .await
+        .expect("output ownership"));
+    assert!(store
+        .owns_file(org_a, "file-err")
+        .await
+        .expect("error ownership"));
+    assert!(!store
+        .owns_file(org_b, "file-out")
+        .await
+        .expect("cross-org ownership"));
+    assert!(!store
+        .owns_file(org_a, "file-unknown")
+        .await
+        .expect("unknown ownership"));
 
     // A cross-org update (org_b claiming org_a's id) must NOT mutate org_a's row.
     let mut hijack = after.clone();
