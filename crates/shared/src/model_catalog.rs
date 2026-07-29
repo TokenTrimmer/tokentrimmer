@@ -5,11 +5,68 @@
 
 use std::sync::OnceLock;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::pricing::{Capability, ModelInfo};
+use crate::pricing::{Capability, ModelInfo, ModelPricing};
 
 const MODELS_TOML: &str = include_str!("../data/models.toml");
+
+/// Wire version for TokenTrimmer's additive `GET /v1/models` extension.
+///
+/// OpenAI-compatible `object`/`data` fields remain at the response root. A
+/// breaking change to the TokenTrimmer metadata must use a new version.
+pub const MODELS_SCHEMA_VERSION: u32 = 1;
+pub const MODELS_SNAPSHOT_SCOPE: &str = "responding_process";
+pub const MODELS_SOURCE: &str = "registered_provider_catalog";
+pub const MODELS_PROVIDER_CREDENTIALS: &str = "not_inspected";
+pub const MODELS_PROVIDER_HEALTH: &str = "not_probed";
+pub const MODELS_REQUEST_ACCEPTANCE: &str = "not_negotiated";
+pub const MODELS_FLEET_CONSISTENCY: &str = "not_attested";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+pub struct ModelsResponse {
+    pub object: String,
+    pub data: Vec<ModelEntry>,
+    pub tokentrimmer: ModelsDocumentMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+pub struct ModelEntry {
+    pub id: String,
+    pub object: String,
+    pub owned_by: String,
+    pub tokentrimmer: ModelTokenTrimmerMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+pub struct ModelTokenTrimmerMeta {
+    pub provider: String,
+    pub pricing: Option<ModelPricing>,
+    pub capabilities: Vec<Capability>,
+    pub max_input_tokens: u64,
+    pub max_output_tokens: u64,
+}
+
+/// Provenance and explicit limitations for one responding process's catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct ModelsDocumentMeta {
+    pub schema_version: u32,
+    pub snapshot_scope: String,
+    pub source: String,
+    /// SHA-256 over the deterministic JSON serialization of the sorted `data`
+    /// array. It identifies this exact responder snapshot; it is not a signed
+    /// release revision or fleet-consistency claim.
+    pub snapshot_sha256: String,
+    pub limitations: ModelCatalogLimitations,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct ModelCatalogLimitations {
+    pub provider_credentials: String,
+    pub provider_health: String,
+    pub request_acceptance: String,
+    pub fleet_consistency: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct RawModel {

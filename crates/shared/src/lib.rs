@@ -34,8 +34,13 @@ pub use messages::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart, EmbeddingsRequest,
     EmbeddingsResponse, Message, MessageContent, PanelExtras, Tool, ToolCall, ToolChoice,
 };
-pub use model_catalog::{model_catalog, ModelCatalog};
-pub use pricing::{CacheWriteTier, ModelInfo, ModelPricing};
+pub use model_catalog::{
+    model_catalog, ModelCatalog, ModelCatalogLimitations, ModelEntry, ModelTokenTrimmerMeta,
+    ModelsDocumentMeta, ModelsResponse, MODELS_FLEET_CONSISTENCY, MODELS_PROVIDER_CREDENTIALS,
+    MODELS_PROVIDER_HEALTH, MODELS_REQUEST_ACCEPTANCE, MODELS_SCHEMA_VERSION,
+    MODELS_SNAPSHOT_SCOPE, MODELS_SOURCE,
+};
+pub use pricing::{CacheWriteTier, Capability, ModelInfo, ModelPricing};
 pub use provider::Provider;
 pub use request_delta::{
     estimate_request_delta_v1, RequestDeltaEstimate, RequestDeltaInput, RequestDeltaReceiptError,
