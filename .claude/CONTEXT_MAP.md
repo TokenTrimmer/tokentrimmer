@@ -22,6 +22,7 @@ This file is the human-curated counterpart to `.claude/INDEX.md` (auto-generated
 | Defining a new wire type | `crates/shared/src/messages.rs` | Canonical OpenAI-format types — adapters translate to/from this. |
 | Adding a Provider | `crates/shared/src/provider.rs`, `docs/02-provider-adapter-guide.md`, `crates/providers/anthropic/` (when populated) | Trait contract + worked example. |
 | Provider error mapping | `crates/shared/src/error.rs`, `crates/core/src/error.rs` | `ProviderError` is the adapter contract; `ApiError` is the HTTP shape. |
+| Model catalog metadata, `/v1/models`, or its Rust SDK read | `crates/shared/src/{model_catalog,pricing}.rs`, `crates/shared/data/models.toml`, `crates/core/src/routes/models.rs`, `crates/client/src/models.rs` | The embedded metadata feeds provider adapters and the responder-scoped OpenAI-compatible catalog; the bounded Rust SDK shares its exact wire without claiming credentials, health, request acceptance, or fleet consistency. |
 | API surface decisions | `docs/04-gateway-api-reference.md` | The public contract — request/response shapes, headers, error codes. |
 | Cache (L1 exact-match) | `crates/cache/src/lib.rs` | Trait only at this stage; Redis impl lands in `w1-redis-l1`. |
 | Cache (L2 semantic) | `crates/core/src/cache_l2.rs` (TBD, Week 8-9) | pgvector HNSW lookup. |
