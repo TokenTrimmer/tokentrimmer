@@ -27,7 +27,57 @@ use redis::AsyncCommands;
 use uuid::Uuid;
 
 use crate::response_codec::{org_from_l1_key, L1Open, ResponseCodec};
-use crate::{CacheError, L1Cache};
+use crate::{CacheError, L1Cache, L1PurgeResult};
+
+/// Purge fences outlive the longest accepted L1 TTL (30 days) so an unindexed
+/// pre-rollout value cannot become readable again after its account is erased.
+const ORG_PURGE_FENCE_SECS: u64 = 35 * 24 * 60 * 60;
+const PURGE_KEYS_PER_BATCH: usize = 1_000;
+const PURGE_BATCHES_PER_CALL: usize = 10;
+
+const INDEXED_GET_LUA: &str = r#"
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return nil
+end
+return redis.call('GET', KEYS[1])
+"#;
+
+const INDEXED_SET_LUA: &str = r#"
+if redis.call('EXISTS', KEYS[3]) == 1 then
+  return 0
+end
+local ttl = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ttl)
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+redis.call('ZADD', KEYS[2], now + ttl, KEYS[1])
+local index_ttl = redis.call('TTL', KEYS[2])
+if index_ttl < ttl + 86400 then
+  redis.call('EXPIRE', KEYS[2], ttl + 86400)
+end
+return 1
+"#;
+
+const INDEXED_DELETE_LUA: &str = r#"
+local deleted = redis.call('DEL', KEYS[1])
+redis.call('ZREM', KEYS[2], KEYS[1])
+return deleted
+"#;
+
+const ORG_PURGE_LUA: &str = r#"
+redis.call('SET', KEYS[2], '1', 'EX', ARGV[1])
+local members = redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[2]) - 1)
+local deleted = 0
+if #members > 0 then
+  deleted = redis.call('DEL', unpack(members))
+  redis.call('ZREM', KEYS[1], unpack(members))
+end
+local remaining = redis.call('ZCARD', KEYS[1])
+if remaining == 0 then
+  redis.call('DEL', KEYS[1])
+end
+return {remaining == 0 and 1 or 0, deleted}
+"#;
 
 /// A Redis-backed L1 exact-match cache.
 ///
@@ -82,9 +132,26 @@ impl RedisL1Cache {
         self
     }
 
-    /// Build the full namespaced key string.
-    fn full_key(&self, key: &str) -> String {
+    /// Build the legacy pre-index key. New tenant values deliberately use a
+    /// Redis hash tag so value/index/fence scripts remain cluster-safe.
+    fn legacy_full_key(&self, key: &str) -> String {
         format!("{}:{}", self.namespace, key)
+    }
+
+    fn full_key(&self, key: &str, org_id: Uuid) -> String {
+        if org_id.is_nil() {
+            self.legacy_full_key(key)
+        } else {
+            format!("{}:{{{org_id}}}:{key}", self.namespace)
+        }
+    }
+
+    fn org_index_key(&self, org_id: Uuid) -> String {
+        format!("{}:{{{org_id}}}:org-index:v1", self.namespace)
+    }
+
+    fn org_fence_key(&self, org_id: Uuid) -> String {
+        format!("{}:{{{org_id}}}:org-purge-fence:v1", self.namespace)
     }
 }
 
@@ -95,9 +162,18 @@ impl L1Cache for RedisL1Cache {
     /// that does not authenticate is treated as a miss, a legacy plaintext value
     /// is returned as-is.
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
-        let full = self.full_key(key);
+        let org_id = org_from_l1_key(key);
+        let full = self.full_key(key, org_id);
         // ConnectionManager requires &mut; clone is O(1) (Arc clone).
-        let result: Option<Vec<u8>> = self.conn.clone().get(&full).await?;
+        let result: Option<Vec<u8>> = if org_id.is_nil() {
+            self.conn.clone().get(&full).await?
+        } else {
+            redis::Script::new(INDEXED_GET_LUA)
+                .key(&full)
+                .key(self.org_fence_key(org_id))
+                .invoke_async(&mut self.conn.clone())
+                .await?
+        };
         let Some(bytes) = result else {
             return Ok(None);
         };
@@ -128,15 +204,72 @@ impl L1Cache for RedisL1Cache {
             }
             None => value,
         };
-        let full = self.full_key(key);
-        let _: () = self.conn.clone().set_ex(&full, payload, ttl_secs).await?;
+        let full = self.full_key(key, org_id);
+        if org_id.is_nil() {
+            let _: () = self.conn.clone().set_ex(&full, payload, ttl_secs).await?;
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            let _: i64 = redis::Script::new(INDEXED_SET_LUA)
+                .key(&full)
+                .key(self.org_index_key(org_id))
+                .key(self.org_fence_key(org_id))
+                .arg(payload)
+                .arg(ttl_secs)
+                .arg(now)
+                .invoke_async(&mut self.conn.clone())
+                .await?;
+        }
         Ok(())
     }
 
     /// Delete `key` from the cache.  A no-op if the key does not exist.
     async fn delete(&self, key: &str) -> Result<(), CacheError> {
-        let full = self.full_key(key);
-        let _: () = self.conn.clone().del(&full).await?;
+        let org_id = org_from_l1_key(key);
+        let full = self.full_key(key, org_id);
+        if org_id.is_nil() {
+            let _: () = self.conn.clone().del(&full).await?;
+        } else {
+            let _: i64 = redis::Script::new(INDEXED_DELETE_LUA)
+                .key(&full)
+                .key(self.org_index_key(org_id))
+                .invoke_async(&mut self.conn.clone())
+                .await?;
+            // Best-effort removal of the pre-index rollout key. New readers do
+            // not fall back to it, and the account fence covers indexed reads.
+            let _: () = self.conn.clone().del(self.legacy_full_key(key)).await?;
+        }
         Ok(())
+    }
+
+    async fn purge_org(&self, org_id: Uuid) -> Result<L1PurgeResult, CacheError> {
+        if org_id.is_nil() {
+            return Ok(L1PurgeResult {
+                complete: true,
+                deleted: 0,
+            });
+        }
+        let index = self.org_index_key(org_id);
+        let fence = self.org_fence_key(org_id);
+        let mut deleted = 0usize;
+        for _ in 0..PURGE_BATCHES_PER_CALL {
+            let result: (i64, i64) = redis::Script::new(ORG_PURGE_LUA)
+                .key(&index)
+                .key(&fence)
+                .arg(ORG_PURGE_FENCE_SECS)
+                .arg(PURGE_KEYS_PER_BATCH)
+                .invoke_async(&mut self.conn.clone())
+                .await?;
+            deleted = deleted.saturating_add(usize::try_from(result.1).unwrap_or(usize::MAX));
+            if result.0 == 1 {
+                return Ok(L1PurgeResult {
+                    complete: true,
+                    deleted,
+                });
+            }
+        }
+        Ok(L1PurgeResult {
+            complete: false,
+            deleted,
+        })
     }
 }
