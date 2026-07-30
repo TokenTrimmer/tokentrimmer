@@ -391,6 +391,27 @@ fn migrator_includes_versioned_workflow_environment_variables() {
     }
 }
 
+#[test]
+fn migrator_includes_master_key_rotation_fence() {
+    let migration = tt_core::db::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 46)
+        .expect("migration version 46 not found");
+    assert!(
+        migration.description.contains("master key rotation"),
+        "migration 0046 description is '{}', expected master-key rotation semantics",
+        migration.description
+    );
+    let up = include_str!("../migrations/0046_master_key_rotation.up.sql");
+    let down = include_str!("../migrations/0046_master_key_rotation.down.sql");
+    assert!(up.contains("CREATE TABLE IF NOT EXISTS public.master_key_rotation"));
+    assert!(up.contains("'in_progress'"));
+    assert!(up.contains("'awaiting_promotion'"));
+    assert!(up.contains("new_key_fingerprint <> old_key_fingerprint"));
+    assert!(!up.contains("TT_NEW_MASTER_KEY"));
+    assert!(down.contains("DROP TABLE IF EXISTS public.master_key_rotation"));
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
