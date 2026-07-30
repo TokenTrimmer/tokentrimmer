@@ -62,16 +62,35 @@
       "versions": [
         1
       ]
+    },
+    {
+      "batch_schema": "docs/capability-contract/request-preflight-batch-response.schema.json",
+      "batch_write": "POST /v1/capabilities/preflight/batch",
+      "family": "request_preflight",
+      "id": "tokentrimmer.request-preflight.v1",
+      "schema": "docs/capability-contract/request-preflight-response.schema.json",
+      "versions": [
+        1
+      ],
+      "write": "POST /v1/capabilities/preflight"
     }
   ],
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "c1d83c1ac432f03770f08e551ee317b3c382da9bc915d87eb4097e546cf84f92"
+      "sha256": "82a98f44f254ffb8c594ffede616f145b784b494350143cbea41c4fe8e6f49fa"
     },
     {
       "path": "docs/capability-contract/gateway-capabilities.schema.json",
       "sha256": "ba9275ee2fd1b2e187b3efbeef6b74549a37a5d4c8f2421ee7bd1a5940211401"
+    },
+    {
+      "path": "docs/capability-contract/request-preflight-batch-response.schema.json",
+      "sha256": "c016ba003e66ca2ec53f886187ed22ef9090ff7badbdeb7fecb3d23c595fd5e6"
+    },
+    {
+      "path": "docs/capability-contract/request-preflight-response.schema.json",
+      "sha256": "4f6c85c8c998b6aeb3ba15fb6a16ebeb17816de6be3f943d19ca73904bab9cc6"
     },
     {
       "path": "docs/model-contract/models-response.schema.json",
@@ -98,6 +117,6 @@
       "sha256": "411dd9deae0591ff7b80d48cefb875e7208e01ec594a368402d3ba79f8c8016e"
     }
   ],
-  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, and gateway capability response type",
+  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, and request-preflight response types",
   "typescript": "bindings/product-contracts.generated.ts"
 }
