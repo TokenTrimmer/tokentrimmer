@@ -4,7 +4,7 @@
 
 **Totals (original):** 82 findings — 4 high · 33 medium · 45 low. By focus: 9 security · 5 backlog · 2 UX. Across 13 areas.
 
-**Current checkbox rollup (reconciled 2026-07-29):** 85 closed · 8 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
+**Current checkbox rollup (reconciled 2026-07-29):** 87 closed · 6 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
 
 ## 🚩 Priority queue (high-severity + security) — 11
 
@@ -289,12 +289,12 @@ _Group-B adapters (groq, mistral, together, openrouter, local) are thin, well-do
 
 ### `pub-cli`
 
-_The `tt` CLI (crates/cli) is mature and well-engineered: credential resolution is a clean pure/precedence design with strong unit coverage, session names and AI-injected markdown markers are sanitized against traversal/injection, the tool-calling loop has a round cap and rolls back history on failure, context budgeting is advisory with the gateway as authority, and Sentry events are scrubbed of secret-looking fields before upload. Test coverage on pure helpers is excellent. The notable gaps are: a small TOCTOU window when first writing the credentials file (secret briefly readable at default umask before the 0600 chmod), `tt whoami` reporting "Logged in" without ever validating the key server-side (documented but misleading), raw untrusted model output (and the `/copy` OSC52 clipboard path) being emitted to the terminal without escape-sequence sanitization, missing HTTP timeouts on the `tt route`/`tt models` request clients, and unencoded route-id path interpolation. Most are bounded/low; none are clear high-severity multi-tenant or data-loss bugs._
+_The `tt` CLI (crates/cli) is mature and well-engineered: credential resolution is a clean pure/precedence design with strong unit coverage, session names and AI-injected markdown markers are sanitized against traversal/injection, the tool-calling loop has a round cap and rolls back history on failure, context budgeting is advisory with the gateway as authority, and Sentry events are scrubbed of secret-looking fields before upload. Test coverage on pure helpers is excellent. The prior credential-file TOCTOU, misleading login/whoami verification claims, raw terminal escape exposure, missing request timeouts, and unencoded route-id interpolation are now closed; no clear high-severity multi-tenant or data-loss defect remains in this section._
 
-- [ ] 🟡 **[ux/medium] tt whoami reports "Logged in" without validating the key server-side** — **🔴 OPEN**
-  - Where: crates/cli/src/account/mod.rs:136-171 (whoami)
-  - Issue: whoami resolves the key locally and unconditionally prints the green "Logged in" heading whenever any non-empty key is present, regardless of whether it is valid, revoked, or expired. The doc comment admits "local only (no network in V0)". Users running whoami to confirm auth after a key rotation/revocation will be told they are logged in when the next real request will 401. login also never round-trips the key, so a typo'd key is stored and reported as success.
-  - Action: Add an opt-in (or default) lightweight validation: hit an authenticated no-op like GET /v1/models with the key (or a /v1/whoami if added) and show "verified" vs "stored (unverified)". At minimum soften the wording to "Key stored (not verified)" so the success line doesn't overstate state.
+- [x] 🟡 **[ux/medium] tt whoami reports "Logged in" without validating the key server-side** — **✅ DONE (2026-07-29).**
+  - Resolution: Local-only output now says `Key configured (not verified)`. `tt whoami --check` reuses the bounded, redirect-denying capabilities client and returns non-zero unless an authenticated `GET /v1/capabilities` yields a valid responder document, so the public `/v1/models` route can no longer create a false-positive validity claim.
+  - Sandbox boundary: `tt_test_*` tokens intentionally have no durable server-side identity; the command reports their locally accepted format without claiming remote verification. `tt doctor` follows the same live/sandbox distinction and no longer probes the public model catalog.
+  - Evidence: Account unit tests pass **4/4**, capability endpoint/auth/redirect/response tests pass **12/12**, and focused login/whoami process smoke tests pass **2/2**.
 
 - [x] 🟡 **[security/medium] Credentials file is briefly world/group-readable: write-then-chmod TOCTOU** — **✅ DONE in #77 (2026-06-08)**
   - Where: crates/cli/src/context/store.rs:58-66 (save_credentials)
@@ -316,10 +316,9 @@ _The `tt` CLI (crates/cli) is mature and well-engineered: credential resolution 
   - Issue: mask_key does &key[..n] with n = key.len().min(12). This indexes by bytes; if a stored/typed key ever contains a multibyte UTF-8 character within the first 12 bytes (e.g. a user fat-fingers a paste, or a future key format includes non-ASCII), the slice can land mid-codepoint and panic, taking down whoami/login. tt_live_* keys are ASCII today so the risk is latent.
   - Action: Use a char-based take: let masked: String = key.chars().take(12).collect(); format!("{masked}…"). Avoids any byte-boundary panic.
 
-- [ ] ⚪ **[gap/low] tt login stores a key with no format/shape check beyond non-empty + validate_api_key** — **🔴 OPEN**
-  - Where: crates/cli/src/account/mod.rs:54-70 (store_key), :115-133 (login)
-  - Issue: store_key relies on tt_mcp::auth::validate_api_key for shape validation, but there is no network confirmation and (combined with the whoami gap above) a wrong-but-well-formed key is persisted and reported as a successful login. Browser login pastes a hidden key and stores it with the same trust. Users who paste the wrong value get a green success and only discover the problem on the next real call.
-  - Action: Optionally validate against the gateway during login (a single authenticated request) and report verified vs stored-unverified; keep it skippable for offline/--no-browser flows.
+- [x] ⚪ **[gap/low] tt login stores a key with no format/shape check beyond non-empty + validate_api_key** — **✅ DONE (2026-07-29).**
+  - Resolution: Login retains its local `tt_live_*` / `tt_test_*` format validation and offline/self-hosted usability, but the success message now says `Key stored (not verified)` and the reachability result explicitly says it did not verify the key. Live-key users are directed to the scriptable `tt whoami --check`; sandbox users receive the explicit no-server-identity boundary.
+  - Evidence: The CLI help and command guide distinguish storage, reachability, and live-key verification. Account unit tests pass **4/4** and the focused login process smoke passes **1/1**.
 
 ### `pub-client-sdk`
 
