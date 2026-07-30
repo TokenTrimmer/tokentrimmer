@@ -47,7 +47,7 @@ Verified-open items remaining after the F1–F12 series + post-roadmap queue (#3
 - [ ] [P2] [gw-metrics-endpoint] rust-crate-builder: Implement the documented `GET /metrics` Prometheus endpoint (04-gateway-api-reference.md:820-827 + architecture-spec:1159 advertise it but it does NOT exist in `crates/core/src/server.rs`). Expose the counters the telemetry crate already maintains (requests, latency histogram, cache hit/miss, failover, $0-priced-catalog-miss). Prerequisite for `post-scale-slo-proof`. (audit: pub-docs/backlog-completeness) (est: $1.00)
 - [ ] [P2] [gw-gdpr-delete-export] rust-crate-builder: Self-serve "delete my org / export my data" flow (cascade-delete request_logs, audit, cache_entries; subscription teardown; export request_logs+reports as CSV/JSON) + a documented data-retention window. Pairs with `rv-l2-org-cache-optout`. Required for a multi-tenant billing platform. (audit: backlog-completeness) (est: $1.50)
 - [ ] [P0] [beta-go-live-runbook] ops: Single tracked checklist enumerating the human steps to unblock the four externally-BLOCKED P0 gates in order (deploy staging → run e2e smoke → enable Free tier → onboard alpha org → start the 14-day reconciliation + Inspect-FP windows). Consolidates the scattered [BLOCKED] lines. (audit: backlog-completeness) (est: —)
-- [ ] [P2→ up from P3] [rv-l2-org-cache-optout] (priority bump): privacy/compliance control (per-org `semantic_cache_disabled`), not just perf — see line 78. Prioritize alongside `gw-gdpr-delete-export`.
+- [x] [P2→ up from P3] [rv-l2-org-cache-optout] (priority bump): privacy/compliance control (per-org `semantic_cache_disabled`), not just perf. DONE in #267; re-verified and hardened to fail closed for caching on resolver/read errors (2026-07-29).
 
 ---
 
@@ -102,7 +102,7 @@ Verified-open items remaining after the F1–F12 series + post-roadmap queue (#3
 - [x] [P3] [rv-inspect-parallel-scan] rust-crate-builder: Parallelize the per-file inspect scan with rayon for large repos + store source length alongside the 64-bit AST-cache hash to remove the collision class (engine.rs:60-84; parse.rs:73-101). (§4.15) (est: $0.40)
 - [x] [P3] [rv-preview-provider-disambig] rust-crate-builder: Let preview pricing lookup honor the intended provider for cross-listed models instead of first-hit probe order (preview/pricing.rs:33-59). (§4-preview) (est: $0.20)
 - [x] [P3] [rv-env-credential-failclosed] rust-crate-builder: Don't chain the Env credential store as a multi-tenant fallback; boot-assert/metric when `EnvProviderCredentialStore` is active alongside >1 org (credentials.rs:205-265; chat.rs:822-834). (§5.10) (est: $0.30)
-- [ ] [P3] [rv-l2-org-cache-optout] rust-crate-builder: Per-org `semantic_cache_disabled` flag that forces `cache_behavior.do_lookup=do_insert=false` for sensitive orgs (resolve alongside tier in tier_resolver.rs; gate before the L1/L2 branches in chat.rs). Implements the ADR-017 control. (§5.10 follow-up of rv-l2-response-encryption-decision) (est: $0.50)
+- [x] [P3] [rv-l2-org-cache-optout] rust-crate-builder: Per-org `semantic_cache_disabled` flag forces `cache_behavior.do_lookup=do_insert=false` before the L1/L2 branches and rides cached tier resolution. Resolver/read errors keep the request available but fail closed for caching. Implements ADR-017. DONE #267; hardening re-verified 2026-07-29. (§5.10 follow-up of rv-l2-response-encryption-decision) (est: $0.50)
 
 ---
 
