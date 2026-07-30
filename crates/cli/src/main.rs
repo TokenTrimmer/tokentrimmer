@@ -1970,6 +1970,21 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     if let Some(l1) = l1_cache {
         state = state.with_l1(l1, None);
     }
+    match tt_core::GatewayPurgeAuthorizer::from_env() {
+        Ok(Some(authorizer)) => {
+            state = state.with_gateway_purge_authorizer(Arc::new(authorizer));
+            tracing::info!(
+                "signed gateway account-purge executor armed (requires Redis at request time)"
+            );
+        }
+        Ok(None) => tracing::warn!(
+            "gateway account-purge executor disabled: TT_MASTER_KEY is not configured"
+        ),
+        Err(error) => tracing::error!(
+            error,
+            "gateway account-purge executor disabled: TT_MASTER_KEY is malformed"
+        ),
+    }
 
     // REL-1: hand the Postgres pool to AppState so the `/ready` probe actually
     // checks the DB (`SELECT 1`) instead of always reporting `not_configured`.

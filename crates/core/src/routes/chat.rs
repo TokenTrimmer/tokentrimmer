@@ -379,12 +379,12 @@ fn effective_ttl_secs(
     default: u64,
 ) -> u64 {
     if let Some(secs) = request_override {
-        return secs;
+        return secs.clamp(1, crate::state::MAX_L1_TTL_SECS);
     }
     if let Some(t) = tier {
-        return t.ttl_secs();
+        return t.ttl_secs().min(crate::state::MAX_L1_TTL_SECS);
     }
-    default
+    default.clamp(1, crate::state::MAX_L1_TTL_SECS)
 }
 
 // ---------------------------------------------------------------------------
@@ -10038,6 +10038,23 @@ mod tier_ttl_tests {
         assert_eq!(
             effective_ttl_secs(Some(override_secs), None, SECS_24H),
             override_secs
+        );
+    }
+
+    #[test]
+    fn ttl_is_bounded_to_the_account_purge_fence_window() {
+        assert_eq!(
+            effective_ttl_secs(Some(0), None, SECS_24H),
+            1,
+            "zero-length overrides still need a valid Redis TTL"
+        );
+        assert_eq!(
+            effective_ttl_secs(Some(u64::MAX), None, SECS_24H),
+            crate::state::MAX_L1_TTL_SECS
+        );
+        assert_eq!(
+            effective_ttl_secs(None, None, u64::MAX),
+            crate::state::MAX_L1_TTL_SECS
         );
     }
 }

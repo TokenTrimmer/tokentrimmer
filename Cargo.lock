@@ -6309,6 +6309,7 @@ dependencies = [
  "futures",
  "governor",
  "hex",
+ "hmac",
  "httpmock",
  "hyper",
  "metrics",

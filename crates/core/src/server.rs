@@ -325,10 +325,19 @@ pub fn build_router_with_retrieval(
         )),
     };
 
-    base.layer(axum::middleware::from_fn_with_state(
+    let base = base.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         middleware::auth::middleware,
-    ))
+    ));
+
+    // This cleanup executor is not a tenant API route. Adding it after the
+    // bearer-auth layer keeps the tenant bearer out of this trust boundary;
+    // the handler requires its own short-lived, domain-separated HMAC
+    // capability and fails closed unless boot explicitly wires it.
+    base.route(
+        "/internal/v1/account-purge/l1",
+        post(routes::account_purge::purge_l1),
+    )
     .layer(axum::middleware::from_fn(middleware::trace::middleware))
     .layer(TraceLayer::new_for_http())
     // Request timeouts are applied per-route above (ARCH-4), not as a single

@@ -642,6 +642,12 @@ impl L1Cache for RecordingL1 {
     async fn delete(&self, key: &str) -> Result<(), tt_cache::CacheError> {
         self.inner.delete(key).await
     }
+    async fn purge_org(
+        &self,
+        org_id: uuid::Uuid,
+    ) -> Result<tt_cache::L1PurgeResult, tt_cache::CacheError> {
+        self.inner.purge_org(org_id).await
+    }
 }
 
 /// Streaming miss with a volatile prompt: the reconstructed response's L2
