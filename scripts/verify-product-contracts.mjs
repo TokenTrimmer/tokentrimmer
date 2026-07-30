@@ -171,6 +171,8 @@ assert(
 );
 
 const typescript = readText(manifest.typescript);
+const sdkTypescript = readText(manifest.typescript_sdk);
+assert(sdkTypescript === typescript, 'SDK generated product TypeScript drift');
 for (const typeName of [
   'RouteWriteRequest',
   'WorkflowDefinition',
