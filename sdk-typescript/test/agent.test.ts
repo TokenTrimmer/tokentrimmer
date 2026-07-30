@@ -10,6 +10,7 @@ import { TokenTrimmer } from '../src/index.js';
 // Endpoint shape (crates/client/src/agent.rs):
 //   POST /v1/agent/runs                       { model, messages, tools?, max_turns?, stream }
 //   POST /v1/agent/runs/{id}/tool_outputs     { tool_outputs: [{ tool_call_id, output }] }
+//   GET|DELETE /v1/agent/runs/{id}/transcript export/erase retained resume state
 // A `Run` body = { id, status, messages, turns, usage{...,cost_usd}, ... }. NO
 // x-tokentrimmer-* headers; aggregate cost is `run.usage.cost_usd`.
 
@@ -101,6 +102,35 @@ const TOOLS = [
 ];
 
 describe('TokenTrimmer agent loop', () => {
+  it('exports and idempotently deletes the retained transcript', async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const fetchImpl = (async (url: string | URL | Request, init: RequestInit = {}) => {
+      const method = init.method ?? 'GET';
+      calls.push({ url: String(url), method });
+      if (method === 'DELETE') return new Response(null, { status: 204 });
+      return new Response(JSON.stringify(requiresActionRun()), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    const agent = client(fetchImpl).agent;
+    const exported = await agent.exportTranscript(RUN_ID);
+    expect(exported.id).toBe(RUN_ID);
+    expect(exported.status).toBe('requires_action');
+    await agent.deleteTranscript(RUN_ID);
+    expect(calls).toEqual([
+      { url: `http://gw.test/v1/agent/runs/${RUN_ID}/transcript`, method: 'GET' },
+      { url: `http://gw.test/v1/agent/runs/${RUN_ID}/transcript`, method: 'DELETE' },
+    ]);
+  });
+
+  it('rejects an empty transcript run id before any request', async () => {
+    const { calls, fetchImpl } = stubFetch({ create: () => ({}), resume: () => ({}) });
+    await expect(client(fetchImpl).agent.exportTranscript('')).rejects.toThrow();
+    expect(calls).toHaveLength(0);
+  });
+
   it('executes a client tool then resumes to completion with aggregated cost', async () => {
     const { calls, fetchImpl } = stubFetch({
       create: requiresActionRun,

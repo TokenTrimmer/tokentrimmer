@@ -536,6 +536,24 @@ export class Agent {
   constructor(private readonly client: OpenAI) {}
 
   /**
+   * Export a still-retained paused/resumed transcript. Returns 404 after the
+   * one-hour Redis record expires or is deleted; durable run metadata remains.
+   */
+  async exportTranscript(runId: string): Promise<Run> {
+    const path = this.transcriptPath(runId);
+    const wire = (await this.client.get(path)) as RunWire;
+    return parseRun(wire);
+  }
+
+  /**
+   * Idempotently erase a still-retained transcript/resume record. Durable
+   * billing and audit run metadata is intentionally unaffected.
+   */
+  async deleteTranscript(runId: string): Promise<void> {
+    await this.client.delete(this.transcriptPath(runId));
+  }
+
+  /**
    * Drive the agent run to completion: create the run, then while it is paused
    * on client tools, execute them via `executor` and resume — until a terminal
    * status or the resume cap.
@@ -604,6 +622,13 @@ export class Agent {
     ttTag: string | undefined,
   ): Promise<Run> {
     return this.send(`/agent/runs/${runId}/tool_outputs`, { tool_outputs: toolOutputs }, ttTag);
+  }
+
+  private transcriptPath(runId: string): string {
+    if (typeof runId !== 'string' || runId.trim() === '') {
+      throw new Error('runId must be a non-empty string');
+    }
+    return `/agent/runs/${encodeURIComponent(runId)}/transcript`;
   }
 
   private async send(path: string, body: unknown, ttTag: string | undefined): Promise<Run> {

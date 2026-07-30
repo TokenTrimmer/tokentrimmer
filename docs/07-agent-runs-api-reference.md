@@ -20,9 +20,19 @@ receipt or provider-invoice proof.
 | `POST /v1/agent/runs` | Create + run. Non-streaming returns a JSON `Run`; `stream: true` returns SSE run events. |
 | `GET /v1/agent/runs` | List the caller-org's runs. |
 | `GET /v1/agent/runs/:id` | Fetch a run by id. |
+| `GET /v1/agent/runs/:id/transcript` | Export the caller-org's still-retained transcript (`private, no-store`). |
+| `DELETE /v1/agent/runs/:id/transcript` | Idempotently erase the caller-org's short-lived transcript. |
 | `POST /v1/agent/runs/:id/tool_outputs` | Resume a paused (`requires_action`) run with the client tool outputs. |
 
 Auth: the `tt_live_` key (org derived; never caller-supplied).
+
+Transcript export/deletion applies only to the one-hour L1/Redis record created
+when a run pauses or is resumed. A directly terminal run returns its transcript
+in the creation response but does not create a retained transcript record.
+`DELETE` removes only that short-lived transcript/resume state; durable run
+identity, status, cost, and receipt metadata remain for the documented legal,
+billing, and audit lifecycle. Export returns `404` after deletion or TTL expiry.
+Deletion is idempotent and fenced against a concurrent resume.
 
 ## `CreateRunRequest` body
 
