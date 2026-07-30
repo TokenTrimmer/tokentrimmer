@@ -1,5 +1,5 @@
 {
-  "$comment": "Structural GET /v1/capabilities response generated from the exact tt_core::routes::capabilities::GatewayCapabilitiesDocument output type. Runtime semantic validation, authorization, readiness, and execution remain separate gates.",
+  "$comment": "Structural GET /v1/capabilities response generated from the exact tt_shared::GatewayCapabilitiesDocument wire type. Runtime semantic validation, authorization, readiness, and execution remain separate gates.",
   "$defs": {
     "AccessEvidence": {
       "properties": {
@@ -174,7 +174,8 @@
       "required": [
         "reason",
         "source",
-        "state"
+        "state",
+        "version"
       ],
       "type": "object"
     },
@@ -258,6 +259,7 @@
   },
   "$id": "urn:tokentrimmer:gateway-capabilities:response-schema:v1",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One authenticated caller's capability evidence from one gateway process.",
   "properties": {
     "features": {
       "$ref": "#/$defs/GatewayFeatures"

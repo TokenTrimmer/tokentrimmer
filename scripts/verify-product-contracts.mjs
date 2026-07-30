@@ -94,6 +94,10 @@ assert(
   capabilities.$defs.NumericLimit.properties.value.minimum === 1,
   'capability positive member limit missing',
 );
+assert(
+  capabilities.$defs.SchemaVersionEvidence.required.includes('version'),
+  'capability schema version output must be present, including null',
+);
 
 const models = load(families.get('models').schema);
 assert(models.properties.object.const === 'list', 'model list discriminator drift');
