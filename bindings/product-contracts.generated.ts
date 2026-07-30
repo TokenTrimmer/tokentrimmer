@@ -176,6 +176,68 @@ export type NumericLimit = {
 
 export type OnExceed = "Stop";
 
+export type PreflightAction = {
+  code: "choose_registered_provider_or_model" | "configure_provider_credential" | "retry_preflight_or_contact_operator" | "change_model_or_required_capabilities" | "reduce_declared_tokens_or_choose_model" | "execute_request_and_handle_result";
+  reason: CapabilityReason;
+  required_before_request: boolean;
+};
+
+export type PreflightCostEvidence = {
+  input_tokens_high: number | null;
+  input_tokens_low: number | null;
+  output_tokens_high: number | null;
+  output_tokens_low: number | null;
+  reason: CapabilityReason;
+  source: "registered_provider_pricing_catalog" | "not_negotiated";
+  standard_cost_usd_high: number | null;
+  standard_cost_usd_low: number | null;
+  standard_input_rate_usd_per_million: number | null;
+  standard_output_rate_usd_per_million: number | null;
+  state: "catalog_projection" | "unknown";
+};
+
+export type PreflightCredentialEvidence = {
+  reason: CapabilityReason;
+  source: "organization_credential_store" | "not_inspected";
+  state: "configured" | "missing" | "unknown" | "unavailable";
+};
+
+export type PreflightLimitEvidence = {
+  catalog_max_input_tokens?: number | null;
+  catalog_max_output_tokens?: number | null;
+  reason: CapabilityReason;
+  source: "registered_provider_catalog" | "caller_not_supplied" | "not_negotiated";
+  state: "within_catalog_metadata" | "exceeds_catalog_metadata" | "not_evaluated" | "unknown";
+};
+
+export type PreflightModelSupportEvidence = {
+  missing_capabilities: Array<Capability>;
+  reason: CapabilityReason;
+  source: "registered_provider_catalog" | "not_negotiated";
+  state: "supported_by_catalog" | "unsupported_by_catalog" | "unknown";
+};
+
+export type PreflightProviderResolution = {
+  provider?: string | null;
+  reason: CapabilityReason;
+  source: "registered_provider_catalog" | "gateway_dispatch_resolution" | "gateway_runtime";
+  state: "exact_catalog_match" | "provider_registered_catalog_miss" | "provider_unregistered" | "dispatch_resolved_catalog_unknown" | "unresolved";
+};
+
+export type RequestPreflightBatchRequest = {
+  requests: Array<RequestPreflightRequest>;
+  schema_version: 1;
+};
+
+export type RequestPreflightRequest = {
+  declared_input_tokens?: number | null;
+  model: string;
+  provider?: string | null;
+  requested_max_output_tokens?: number | null;
+  required_capabilities: Array<Capability>;
+  schema_version: 1;
+};
+
 export type RouteAction = {
   agentic_budget?: AgenticBudget | null;
   auto_pause?: boolean;
@@ -336,5 +398,31 @@ export type GatewayCapabilitiesDocument = {
   schema_version: 1;
   schema_versions: SchemaVersions;
   scope: "gateway_runtime";
+  snapshot_scope: "responding_process";
+};
+
+export type RequestPreflightResponse = {
+  actions: Array<PreflightAction>;
+  catalog_cost: PreflightCostEvidence;
+  catalog_limits: PreflightLimitEvidence;
+  credential: PreflightCredentialEvidence;
+  generated_at: string;
+  model_support: PreflightModelSupportEvidence;
+  provider_health: UnknownEvidence;
+  provider_resolution: PreflightProviderResolution;
+  request: RequestPreflightRequest;
+  request_acceptance: UnknownEvidence;
+  schema_version: 1;
+  scope: "request_preflight";
+  snapshot_scope: "responding_process";
+};
+
+export type RequestPreflightBatchResponse = {
+  documents: Array<RequestPreflightResponse>;
+  generated_at: string;
+  limitations: Array<CapabilityReason>;
+  request: RequestPreflightBatchRequest;
+  schema_version: 1;
+  scope: "request_preflight_batch";
   snapshot_scope: "responding_process";
 };

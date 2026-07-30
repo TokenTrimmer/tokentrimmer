@@ -1,10 +1,18 @@
 # Gateway capabilities contract corpus
 
-This directory publishes a generated structural schema plus a small versioned
-compatibility corpus for the public gateway's authenticated
-`GET /v1/capabilities` document. `gateway-capabilities.schema.json` comes from
-the exact Rust `GatewayCapabilitiesDocument` response type; its matching
-TypeScript is in `bindings/product-contracts.generated.ts`.
+This directory publishes generated structural schemas for the public gateway's
+authenticated `GET /v1/capabilities`, `POST /v1/capabilities/preflight`, and
+`POST /v1/capabilities/preflight/batch` documents, plus a small versioned
+compatibility corpus for the gateway-runtime capability document. The schemas
+come from the exact shared Rust response types; their matching TypeScript is in
+`bindings/product-contracts.generated.ts`.
+
+The request-preflight schemas describe bounded responder-local evidence, not
+provider-observed readiness. They do not establish credential validity,
+tokenized prompt size, provider health, live pricing, admission, reservation,
+request acceptance, execution, or fleet convergence. The batch response keeps
+one responder timestamp and ordered documents, but its credential/configuration
+reads are not a transaction.
 
 `tokentrimmer.gateway-capabilities.v1.corpus.json` remains the semantic parser
 drift guard. Neither artifact is a second runtime validator or readiness

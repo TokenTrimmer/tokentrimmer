@@ -1,0 +1,947 @@
+{
+  "$comment": "Structural POST /v1/capabilities/preflight/batch response generated from the exact tt_shared::RequestPreflightBatchResponse wire type. Every nested document must also satisfy the standalone request-preflight v1 contract. Runtime semantic validation, authorization, readiness, and execution remain separate gates.",
+  "$defs": {
+    "Capability": {
+      "enum": [
+        "text",
+        "vision",
+        "audio",
+        "tools",
+        "json_mode",
+        "streaming",
+        "reasoning",
+        "prompt_caching"
+      ],
+      "type": "string"
+    },
+    "CapabilityReason": {
+      "properties": {
+        "code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^[a-z0-9_:-]+$",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "PreflightAction": {
+      "properties": {
+        "code": {
+          "enum": [
+            "choose_registered_provider_or_model",
+            "configure_provider_credential",
+            "retry_preflight_or_contact_operator",
+            "change_model_or_required_capabilities",
+            "reduce_declared_tokens_or_choose_model",
+            "execute_request_and_handle_result"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "required_before_request": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "reason",
+        "required_before_request"
+      ],
+      "type": "object"
+    },
+    "PreflightCostEvidence": {
+      "description": "Cost interval under one responder's standard fresh-input/output catalog rates. This is a projection, not provider-observed pricing, a quote, a reservation, settlement, or an enforced spending limit.",
+      "properties": {
+        "input_tokens_high": {
+          "format": "uint64",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_tokens_low": {
+          "description": "Low/high token assumptions used for the interval. When input is not declared, the range spans zero through the responder's catalog limit.",
+          "format": "uint64",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output_tokens_high": {
+          "format": "uint64",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output_tokens_low": {
+          "description": "The low output assumption is zero; the high value is the caller's requested maximum or, when omitted, the responder's catalog limit.",
+          "format": "uint64",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "registered_provider_pricing_catalog",
+            "not_negotiated"
+          ],
+          "type": "string"
+        },
+        "standard_cost_usd_high": {
+          "format": "double",
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "standard_cost_usd_low": {
+          "format": "double",
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "standard_input_rate_usd_per_million": {
+          "format": "double",
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "standard_output_rate_usd_per_million": {
+          "format": "double",
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "state": {
+          "enum": [
+            "catalog_projection",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "input_tokens_high",
+        "input_tokens_low",
+        "output_tokens_high",
+        "output_tokens_low",
+        "reason",
+        "source",
+        "standard_cost_usd_high",
+        "standard_cost_usd_low",
+        "standard_input_rate_usd_per_million",
+        "standard_output_rate_usd_per_million",
+        "state"
+      ],
+      "type": "object"
+    },
+    "PreflightCredentialEvidence": {
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "organization_credential_store",
+            "not_inspected"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "configured",
+            "missing",
+            "unknown",
+            "unavailable"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "source",
+        "state"
+      ],
+      "type": "object"
+    },
+    "PreflightLimitEvidence": {
+      "properties": {
+        "catalog_max_input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "catalog_max_output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "registered_provider_catalog",
+            "caller_not_supplied",
+            "not_negotiated"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "within_catalog_metadata",
+            "exceeds_catalog_metadata",
+            "not_evaluated",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "source",
+        "state"
+      ],
+      "type": "object"
+    },
+    "PreflightModelSupportEvidence": {
+      "properties": {
+        "missing_capabilities": {
+          "items": {
+            "$ref": "#/$defs/Capability"
+          },
+          "maxItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "registered_provider_catalog",
+            "not_negotiated"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "supported_by_catalog",
+            "unsupported_by_catalog",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "missing_capabilities",
+        "reason",
+        "source",
+        "state"
+      ],
+      "type": "object"
+    },
+    "PreflightProviderResolution": {
+      "properties": {
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "registered_provider_catalog",
+            "gateway_dispatch_resolution",
+            "gateway_runtime"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "exact_catalog_match",
+            "provider_registered_catalog_miss",
+            "provider_unregistered",
+            "dispatch_resolved_catalog_unknown",
+            "unresolved"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "source",
+        "state"
+      ],
+      "type": "object"
+    },
+    "RequestPreflightBatchRequest": {
+      "description": "One responder-local evaluation of several request declarations.\n\nThis removes cross-process drift between roles, but it is not a database transaction or provider-observed admission. Each nested document retains the exact single-request limitations.",
+      "properties": {
+        "requests": {
+          "items": {
+            "$ref": "#/$defs/RequestPreflightRequest"
+          },
+          "maxItems": 9,
+          "minItems": 1,
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requests",
+        "schema_version"
+      ],
+      "type": "object"
+    },
+    "RequestPreflightRequest": {
+      "properties": {
+        "declared_input_tokens": {
+          "description": "Caller-declared value. The preflight does not tokenize a prompt.",
+          "format": "uint64",
+          "maximum": 4294967295,
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9_-]+$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested_max_output_tokens": {
+          "format": "uint64",
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "required_capabilities": {
+          "items": {
+            "$ref": "#/$defs/Capability"
+          },
+          "maxItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "schema_version": {
+          "const": 1,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model",
+        "required_capabilities",
+        "schema_version"
+      ],
+      "type": "object"
+    },
+    "RequestPreflightResponse": {
+      "$defs": {
+        "Capability": {
+          "enum": [
+            "text",
+            "vision",
+            "audio",
+            "tools",
+            "json_mode",
+            "streaming",
+            "reasoning",
+            "prompt_caching"
+          ],
+          "type": "string"
+        },
+        "CapabilityReason": {
+          "properties": {
+            "code": {
+              "maxLength": 96,
+              "minLength": 1,
+              "pattern": "^[a-z0-9_:-]+$",
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 600,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "PreflightAction": {
+          "properties": {
+            "code": {
+              "enum": [
+                "choose_registered_provider_or_model",
+                "configure_provider_credential",
+                "retry_preflight_or_contact_operator",
+                "change_model_or_required_capabilities",
+                "reduce_declared_tokens_or_choose_model",
+                "execute_request_and_handle_result"
+              ],
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/CapabilityReason"
+            },
+            "required_before_request": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "required_before_request"
+          ],
+          "type": "object"
+        },
+        "PreflightCostEvidence": {
+          "description": "Cost interval under one responder's standard fresh-input/output catalog rates. This is a projection, not provider-observed pricing, a quote, a reservation, settlement, or an enforced spending limit.",
+          "properties": {
+            "input_tokens_high": {
+              "format": "uint64",
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "input_tokens_low": {
+              "description": "Low/high token assumptions used for the interval. When input is not declared, the range spans zero through the responder's catalog limit.",
+              "format": "uint64",
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "output_tokens_high": {
+              "format": "uint64",
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "output_tokens_low": {
+              "description": "The low output assumption is zero; the high value is the caller's requested maximum or, when omitted, the responder's catalog limit.",
+              "format": "uint64",
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "reason": {
+              "$ref": "#/$defs/CapabilityReason"
+            },
+            "source": {
+              "enum": [
+                "registered_provider_pricing_catalog",
+                "not_negotiated"
+              ],
+              "type": "string"
+            },
+            "standard_cost_usd_high": {
+              "format": "double",
+              "minimum": 0,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "standard_cost_usd_low": {
+              "format": "double",
+              "minimum": 0,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "standard_input_rate_usd_per_million": {
+              "format": "double",
+              "minimum": 0,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "standard_output_rate_usd_per_million": {
+              "format": "double",
+              "minimum": 0,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "state": {
+              "enum": [
+                "catalog_projection",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "input_tokens_high",
+            "input_tokens_low",
+            "output_tokens_high",
+            "output_tokens_low",
+            "reason",
+            "source",
+            "standard_cost_usd_high",
+            "standard_cost_usd_low",
+            "standard_input_rate_usd_per_million",
+            "standard_output_rate_usd_per_million",
+            "state"
+          ],
+          "type": "object"
+        },
+        "PreflightCredentialEvidence": {
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/CapabilityReason"
+            },
+            "source": {
+              "enum": [
+                "organization_credential_store",
+                "not_inspected"
+              ],
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "configured",
+                "missing",
+                "unknown",
+                "unavailable"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "source",
+            "state"
+          ],
+          "type": "object"
+        },
+        "PreflightLimitEvidence": {
+          "properties": {
+            "catalog_max_input_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "catalog_max_output_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "reason": {
+              "$ref": "#/$defs/CapabilityReason"
+            },
+            "source": {
+              "enum": [
+                "registered_provider_catalog",
+                "caller_not_supplied",
+                "not_negotiated"
+              ],
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "within_catalog_metadata",
+                "exceeds_catalog_metadata",
+                "not_evaluated",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "source",
+            "state"
+          ],
+          "type": "object"
+        },
+        "PreflightModelSupportEvidence": {
+          "properties": {
+            "missing_capabilities": {
+              "items": {
+                "$ref": "#/$defs/Capability"
+              },
+              "maxItems": 8,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "reason": {
+              "$ref": "#/$defs/CapabilityReason"
+            },
+            "source": {
+              "enum": [
+                "registered_provider_catalog",
+                "not_negotiated"
+              ],
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "supported_by_catalog",
+                "unsupported_by_catalog",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "missing_capabilities",
+            "reason",
+            "source",
+            "state"
+          ],
+          "type": "object"
+        },
+        "PreflightProviderResolution": {
+          "properties": {
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "$ref": "#/$defs/CapabilityReason"
+            },
+            "source": {
+              "enum": [
+                "registered_provider_catalog",
+                "gateway_dispatch_resolution",
+                "gateway_runtime"
+              ],
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "exact_catalog_match",
+                "provider_registered_catalog_miss",
+                "provider_unregistered",
+                "dispatch_resolved_catalog_unknown",
+                "unresolved"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "source",
+            "state"
+          ],
+          "type": "object"
+        },
+        "RequestPreflightRequest": {
+          "properties": {
+            "declared_input_tokens": {
+              "description": "Caller-declared value. The preflight does not tokenize a prompt.",
+              "format": "uint64",
+              "maximum": 4294967295,
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "provider": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[a-z0-9_-]+$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "requested_max_output_tokens": {
+              "format": "uint64",
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "required_capabilities": {
+              "items": {
+                "$ref": "#/$defs/Capability"
+              },
+              "maxItems": 8,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "schema_version": {
+              "const": 1,
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "model",
+            "required_capabilities",
+            "schema_version"
+          ],
+          "type": "object"
+        },
+        "UnknownEvidence": {
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/CapabilityReason"
+            },
+            "source": {
+              "enum": [
+                "not_negotiated"
+              ],
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "source",
+            "state"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "actions": {
+          "items": {
+            "$ref": "#/$defs/PreflightAction"
+          },
+          "maxItems": 6,
+          "minItems": 1,
+          "type": "array"
+        },
+        "catalog_cost": {
+          "$ref": "#/$defs/PreflightCostEvidence"
+        },
+        "catalog_limits": {
+          "$ref": "#/$defs/PreflightLimitEvidence"
+        },
+        "credential": {
+          "$ref": "#/$defs/PreflightCredentialEvidence"
+        },
+        "generated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "model_support": {
+          "$ref": "#/$defs/PreflightModelSupportEvidence"
+        },
+        "provider_health": {
+          "$ref": "#/$defs/UnknownEvidence"
+        },
+        "provider_resolution": {
+          "$ref": "#/$defs/PreflightProviderResolution"
+        },
+        "request": {
+          "$ref": "#/$defs/RequestPreflightRequest"
+        },
+        "request_acceptance": {
+          "$ref": "#/$defs/UnknownEvidence"
+        },
+        "schema_version": {
+          "const": 1,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "scope": {
+          "const": "request_preflight",
+          "type": "string"
+        },
+        "snapshot_scope": {
+          "const": "responding_process",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actions",
+        "catalog_cost",
+        "catalog_limits",
+        "credential",
+        "generated_at",
+        "model_support",
+        "provider_health",
+        "provider_resolution",
+        "request",
+        "request_acceptance",
+        "schema_version",
+        "scope",
+        "snapshot_scope"
+      ],
+      "type": "object"
+    },
+    "UnknownEvidence": {
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "not_negotiated"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "source",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:tokentrimmer:request-preflight-batch:response-schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "documents": {
+      "items": {
+        "$ref": "#/$defs/RequestPreflightResponse"
+      },
+      "maxItems": 9,
+      "minItems": 1,
+      "type": "array"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "limitations": {
+      "items": {
+        "$ref": "#/$defs/CapabilityReason"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "request": {
+      "$ref": "#/$defs/RequestPreflightBatchRequest"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "scope": {
+      "const": "request_preflight_batch",
+      "type": "string"
+    },
+    "snapshot_scope": {
+      "const": "responding_process",
+      "type": "string"
+    }
+  },
+  "required": [
+    "documents",
+    "generated_at",
+    "limitations",
+    "request",
+    "schema_version",
+    "scope",
+    "snapshot_scope"
+  ],
+  "title": "TokenTrimmer batched request capability preflight",
+  "type": "object"
+}

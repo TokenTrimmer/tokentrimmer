@@ -576,7 +576,7 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
         .collect::<Vec<_>>();
     let manifest = json!({
         "contract": "tokentrimmer.product-contracts.v1",
-        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, and gateway capability response type",
+        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, and request-preflight response types",
         "typescript": PRODUCT_TS_PATH,
         "contracts": [
             {
@@ -624,6 +624,15 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
                 "schema": "docs/capability-contract/gateway-capabilities.schema.json",
                 "compatibility_corpus": "docs/capability-contract/tokentrimmer.gateway-capabilities.v1.corpus.json",
                 "read": "GET /v1/capabilities"
+            },
+            {
+                "family": "request_preflight",
+                "id": "tokentrimmer.request-preflight.v1",
+                "versions": [tt_shared::REQUEST_PREFLIGHT_SCHEMA_VERSION],
+                "schema": "docs/capability-contract/request-preflight-response.schema.json",
+                "batch_schema": "docs/capability-contract/request-preflight-batch-response.schema.json",
+                "write": "POST /v1/capabilities/preflight",
+                "batch_write": "POST /v1/capabilities/preflight/batch"
             }
         ],
         "files": files
@@ -702,5 +711,7 @@ mod tests {
         assert!(product_types.contains("export type RouteWriteRequest ="));
         assert!(product_types.contains("export type ModelsResponse ="));
         assert!(product_types.contains("export type GatewayCapabilitiesDocument ="));
+        assert!(product_types.contains("export type RequestPreflightResponse ="));
+        assert!(product_types.contains("export type RequestPreflightBatchResponse ="));
     }
 }
