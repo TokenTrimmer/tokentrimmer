@@ -478,6 +478,13 @@ interface RunWire {
 /** Resume (`tool_outputs`) round-trip cap, matching the Rust driver default. */
 const DEFAULT_MAX_RESUME_ROUNDS = 8;
 
+function validRunId(runId: string): string {
+  if (typeof runId !== 'string' || runId.trim() === '') {
+    throw new Error('run id must be a non-empty string');
+  }
+  return runId;
+}
+
 function parseRun(wire: RunWire): Run {
   const u = wire.usage ?? {};
   return {
@@ -534,6 +541,29 @@ function pendingToolCalls(messages: RunMessage[]) {
  */
 export class Agent {
   constructor(private readonly client: OpenAI) {}
+
+  /**
+   * Export the retained server-side transcript for a run.
+   *
+   * This is the portable owner-visible run record used for durable agent
+   * resume/review. It is not a provider transcript export.
+   */
+  async exportTranscript(runId: string): Promise<Run> {
+    const id = validRunId(runId);
+    const wire = (await this.client.get(`/agent/runs/${id}/transcript`)) as RunWire;
+    return parseRun(wire);
+  }
+
+  /**
+   * Delete the retained server-side transcript for a run.
+   *
+   * The gateway treats this as idempotent owner erasure of retained resume
+   * state; a successful response has no body.
+   */
+  async deleteTranscript(runId: string): Promise<void> {
+    const id = validRunId(runId);
+    await this.client.delete(`/agent/runs/${id}/transcript`);
+  }
 
   /**
    * Drive the agent run to completion: create the run, then while it is paused
