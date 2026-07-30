@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Subcommand;
+use futures::StreamExt as _;
+use tokio::io::AsyncWriteExt as _;
 
 use crate::context::ResolvedContext;
 use crate::ui;
@@ -182,31 +184,42 @@ async fn cancel(client: &tt_client::Client, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Download a file's bytes to `output` (or stdout).
+/// Stream a file's bytes to `output` (or stdout).
 async fn download(
     client: &tt_client::Client,
     file_id: &str,
     output: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    let bytes = client
-        .download_file_content(file_id)
+    let stream = client
+        .stream_file_content(file_id)
         .await
         .map_err(|e| anyhow::anyhow!("downloading file {file_id}: {e}"))?;
-    match output {
-        Some(path) => {
-            std::fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
-            ui::ok(&format!(
-                "wrote {} bytes to {}",
-                bytes.len(),
-                path.display()
-            ));
-        }
-        None => {
-            use std::io::Write as _;
-            std::io::stdout()
-                .write_all(&bytes)
-                .context("writing batch output to stdout")?;
-        }
+    let mut writer: Box<dyn tokio::io::AsyncWrite + Unpin> = match output {
+        Some(path) => Box::new(
+            tokio::fs::File::create(path)
+                .await
+                .with_context(|| format!("creating {}", path.display()))?,
+        ),
+        None => Box::new(tokio::io::stdout()),
+    };
+    futures::pin_mut!(stream);
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow::anyhow!("downloading file {file_id}: {e}"))?;
+        writer
+            .write_all(&chunk)
+            .await
+            .context("writing batch file content")?;
+        written = written
+            .checked_add(u64::try_from(chunk.len()).context("batch file chunk length overflow")?)
+            .context("batch file byte count overflow")?;
+    }
+    writer
+        .flush()
+        .await
+        .context("flushing batch file content")?;
+    if let Some(path) = output {
+        ui::ok(&format!("wrote {written} bytes to {}", path.display()));
     }
     Ok(())
 }

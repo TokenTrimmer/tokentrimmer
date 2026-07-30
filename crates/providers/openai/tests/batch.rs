@@ -418,3 +418,42 @@ async fn download_file_content_401_unauthorized() {
         "expected Unauthorized, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn oversized_successful_batch_metadata_is_rejected() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/batches/batch_huge");
+        then.status(200).body("x".repeat(1024 * 1024 + 1));
+    });
+    let ctx = make_ctx(&server.base_url());
+    let error = provider()
+        .get_batch("batch_huge", &ctx)
+        .await
+        .expect_err("oversized metadata must fail closed");
+    assert!(
+        matches!(&error, ProviderError::Deserialize(message) if message.contains("exceeded")),
+        "expected bounded metadata error, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn file_content_error_body_is_bounded() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/files/file-huge/content");
+        then.status(502).body("x".repeat(64 * 1024 + 1));
+    });
+    let ctx = make_ctx(&server.base_url());
+    let error = match provider().stream_file_content("file-huge", &ctx).await {
+        Err(error) => error,
+        Ok(_) => panic!("provider error expected"),
+    };
+    match error {
+        ProviderError::ProviderUpstream { status, message } => {
+            assert_eq!(status, 502);
+            assert!(message.len() <= 64 * 1024);
+        }
+        other => panic!("expected bounded upstream error, got {other:?}"),
+    }
+}

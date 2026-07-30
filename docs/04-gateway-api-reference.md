@@ -32,8 +32,11 @@ Gateway implements the following OpenAI API endpoints, with the OpenAI request/r
 | `/v1/images/generations` | POST | ✗ not supported (v2 candidate) |
 | `/v1/audio/transcriptions` | POST | ✗ not supported (v2 candidate) |
 | `/v1/audio/speech` | POST | ✗ not supported (v2 candidate) |
-| `/v1/files` | POST | ✗ not supported |
-| `/v1/batches` | POST | ✗ not supported (v2 candidate) |
+| `/v1/files` | POST | ✓ Batch Lane input upload |
+| `/v1/files/:id/content` | GET | ✓ org-owned Batch result/error stream |
+| `/v1/batches` | POST, GET | ✓ create and list Batch jobs |
+| `/v1/batches/:id` | GET | ✓ fetch an org-owned Batch job |
+| `/v1/batches/:id/cancel` | POST | ✓ cancel an org-owned Batch job |
 | `/v1/assistants` | * | ✗ not supported |
 
 Gateway routes requests to any supported provider behind a unified OpenAI-format surface. Providers in v1:
@@ -63,6 +66,25 @@ ollama/llama3:8b              # local
 ```
 
 When the model name is unique across providers, the bare name works. Routes can also rewrite the model based on conditions (see configuration docs).
+
+### 1.1 Batch Lane ownership and streaming
+
+Batch Lane is currently OpenAI-only and requires a verified `tt_live_*` key, a
+stored OpenAI credential, and a configured durable Batch store. Upload/create,
+status, list, and cancellation use OpenAI-compatible request/response shapes.
+Every durable row is scoped to the organization derived from the gateway key;
+unknown and cross-organization Batch ids return `404`.
+
+`GET /v1/files/:id/content` requires the exact input, output, or error file id
+to appear on one of that organization's durable Batch rows before the gateway
+makes any provider request. Possession of the same upstream OpenAI credential
+does not establish ownership because multiple TokenTrimmer organizations can
+share an upstream account. A successful provider response is streamed through
+the gateway without being accumulated by the provider adapter, gateway handler,
+Rust streaming client, or CLI download command. Provider retention, the
+organization's live gateway key, and its matching upstream credential still
+govern availability; this API does not promise that a provider-held file is
+retained.
 
 ---
 
@@ -625,7 +647,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Baseline-Cost-Usd` | on dispatched/cached responses | `0.0218` |
 | `X-TokenTrimmer-Saved-Usd` | on dispatched/cached responses | `0.0184` |
 | `X-TokenTrimmer-Provider-Cache-Saved-Usd` | on dispatched/cached responses | `0.0009` |
-| `X-TokenTrimmer-Batch-Forgone-Usd` | on dispatched/cached responses — the **forgone** Batch-API discount for batch-eligible requests (advisory `then.batch` route action), priced from the served model's real catalog batch rate. An advisory projection for the future async Batch Lane: the request was dispatched synchronously and billed in full, so this figure is **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for all unmarked traffic. | `0.0125` |
+| `X-TokenTrimmer-Batch-Forgone-Usd` | on dispatched/cached responses — the **forgone** Batch-API discount for batch-eligible requests (advisory `then.batch` route action), priced from the served model's real catalog batch rate. The manual async Batch Lane does not change this synchronous request: it was dispatched and billed in full, so this figure is **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for all unmarked traffic. | `0.0125` |
 | `X-TokenTrimmer-Minify-Saved-Est-Usd` | on dispatched/cached responses — the **ESTIMATED** saving from minified-JSON output steering (`then.minify_json` route action): the emitted JSON re-rendered pretty and re-tokenized with the served model's tokenizer, minus the tokens actually emitted, priced at the billed output rate. An estimate of an unmeasurable counterfactual: **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for un-minified traffic, non-JSON responses, and streaming (v1 meters but does not estimate). | `0.000312` |
 | `X-TokenTrimmer-Diff-Saved-Usd` | on dispatched/cached responses — the **measured** saving of an applied `then.diff` patch: tokens of the reconstructed artifact minus the billed patch tokens, priced at the served model's output rate. Both sides are real tokenizer counts on real strings, so this figure **is** included in `X-TokenTrimmer-Saved-Usd` (via the baseline fold) and is itemized here for the methodology breakdown. `0.000000` for all undiffed traffic. | `0.0297` |
 | `X-TokenTrimmer-Format-Switch-Saved-Est-Usd` | on dispatched/cached responses — the **estimated** saving of a validated `then.format_switch` emission: a JSON-equivalent reconstruction minus the emitted body, output-rate-priced. The `Est` in the name is the label: an estimate, **never** included in `X-TokenTrimmer-Saved-Usd` / `Baseline-Cost-Usd` (which are catalog-priced gateway figures, not provider-invoice reconciliation). `0.000000` for unswitched traffic, whenever the reconstruction is not computable (booked $0), and on cache **hits** of a switched response (the hit still advertises `format_switch:<label>`, but its saving is attributed to the cache — the estimate belongs to the original miss's row, mirroring the diff/compression figures). | `0.0041` |
@@ -708,12 +730,13 @@ the action never changes the bill:
 
 - `batch_deferred_unavailable` — the marker was applied: the row is tagged
   batch-eligible and the forgone discount is reported on
-  `X-TokenTrimmer-Batch-Forgone-Usd`, but there is no async Batch Lane yet, so
-  the request was served and billed normally. Corner case: eligibility is
-  assessed on the *planned* model, while the forgone discount is priced only
-  from the *served* model's real catalog batch rate — after a failover to a
-  model with no batch tier, this token can therefore accompany a `0.000000`
-  forgone figure (intent stays auditable; no rate, no claim).
+  `X-TokenTrimmer-Batch-Forgone-Usd`, but automatic conversion of a synchronous
+  request into a Batch job is not implemented. The manual Batch Lane is a
+  separate API, so this request was served and billed normally. Corner case:
+  eligibility is assessed on the *planned* model, while the forgone discount
+  is priced only from the *served* model's real catalog batch rate — after a
+  failover to a model with no batch tier, this token can therefore accompany a
+  `0.000000` forgone figure (intent stays auditable; no rate, no claim).
 - `batch_ineligible:streaming` — the matched route requested the marker but the
   request streams; the gateway cleared it (a ≤24h batch window cannot serve a
   live stream).

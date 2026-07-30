@@ -512,7 +512,13 @@ async fn upload_file_proxies_multipart_and_returns_file_id() {
 
 #[tokio::test]
 async fn download_file_content_proxies_jsonl_bytes() {
-    let server = MockServer::start();
+    let server = MockServer::start_async().await;
+    let create_mock = server.mock(|when, then| {
+        when.method(POST).path("/batches");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(batch_body("batch_download", "completed", true));
+    });
     let jsonl = "{\"custom_id\":\"req-1\",\"response\":{\"status_code\":200}}\n";
     let download_mock = server.mock(|when, then| {
         when.method(GET).path("/files/file-output456/content");
@@ -522,20 +528,61 @@ async fn download_file_content_proxies_jsonl_bytes() {
     });
     let h = harness(&server.base_url()).await;
 
-    let r = h
+    let create = h
         .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/v1/batches",
+            Some(&h.key),
+            Some(json!({
+                "input_file_id": "file-input123",
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    create_mock.assert();
+
+    // A second TokenTrimmer organization can share the same upstream account,
+    // so the provider credential is not sufficient ownership. The local
+    // batch-row predicate must reject this exact file before upstream I/O.
+    let foreign = h
+        .app
+        .clone()
         .oneshot(req(
             "GET",
             "/v1/files/file-output456/content",
-            Some(&h.key),
+            Some(&h.other_key),
             None,
         ))
         .await
         .unwrap();
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+    download_mock.assert_calls(0);
+
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        h.app.oneshot(req(
+            "GET",
+            "/v1/files/file-output456/content",
+            Some(&h.key),
+            None,
+        )),
+    )
+    .await
+    .expect("gateway response headers timed out")
+    .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        axum::body::to_bytes(r.into_body(), usize::MAX),
+    )
+    .await
+    .expect("gateway response body timed out")
+    .unwrap();
     download_mock.assert();
-    let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
-        .await
-        .unwrap();
     assert_eq!(std::str::from_utf8(&bytes).unwrap(), jsonl);
 }
