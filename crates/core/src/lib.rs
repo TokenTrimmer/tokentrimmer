@@ -10,6 +10,7 @@ pub mod document_lane;
 pub mod error;
 pub mod failover;
 pub mod gateway_purge_auth;
+pub mod master_key_rotation;
 pub(crate) mod measurement;
 pub mod metrics;
 pub mod middleware;

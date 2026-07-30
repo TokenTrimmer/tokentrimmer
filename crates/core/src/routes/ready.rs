@@ -6,10 +6,11 @@
 //!
 //! * **Postgres = HARD.** When a DB pool was wired at boot
 //!   ([`AppState::with_db_pool`](crate::AppState::with_db_pool)) the probe runs
-//!   `SELECT 1`; a failure answers **503** so an orchestrator (Fly) pulls the
-//!   process out of rotation rather than routing traffic to a gateway that
-//!   can't read routes/auth/telemetry. When no DB was configured (degraded
-//!   mode) Postgres is reported `not_configured` and never gates the result.
+//!   `SELECT 1` and re-reads the exact successful gateway migration ledger; a
+//!   failure answers **503** so an orchestrator pulls the process out of
+//!   rotation rather than routing traffic to a gateway that can't read the
+//!   expected routes/auth/telemetry schema. When no DB was configured
+//!   (loopback dev mode) Postgres is `not_configured` and does not gate.
 //!
 //! * **Redis/L1 = SOFT.** The L1 cache is optional and `degrades cleanly`
 //!   throughout the codebase: auth, routing, budget and dispatch all work
@@ -53,24 +54,74 @@ pub struct ReadyResponse {
 
 #[derive(Serialize)]
 pub struct ReadyChecks {
-    /// Postgres `SELECT 1` outcome. HARD when configured.
+    /// Postgres reachability plus exact migration-ledger outcome. HARD when configured.
     pub postgres: DepStatus,
     /// L1/Redis sentinel-read outcome. SOFT — reported, never gates the 503.
     pub redis: DepStatus,
 }
 
-/// Probe Postgres (hard) and Redis/L1 (soft). Returns 503 iff a HARD
+const READY_DB_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Probe Postgres + its migration ledger (hard) and Redis/L1 (soft). Returns 503 iff a HARD
 /// dependency that was configured at boot is down, else 200.
 pub async fn handler(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
-    // Postgres (HARD when configured): a cheap `SELECT 1` round-trips the pool.
+    // Postgres (HARD when configured): prove both reachability and that this
+    // request-serving pool still sees the exact schema ledger embedded here.
     let postgres = match state.db_pool.as_ref() {
-        Some(pool) => match sqlx::query("SELECT 1").execute(pool).await {
-            Ok(_) => DepStatus::Ok,
-            Err(err) => {
-                tracing::warn!(error = %err, "readiness: postgres SELECT 1 failed");
-                DepStatus::Down
+        Some(pool) => {
+            match tokio::time::timeout(
+                READY_DB_TIMEOUT,
+                sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool),
+            )
+            .await
+            {
+                Ok(Ok(1)) => {
+                    match tokio::time::timeout(
+                        READY_DB_TIMEOUT,
+                        crate::verify_migration_ledger(pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => match tokio::time::timeout(
+                            READY_DB_TIMEOUT,
+                            crate::master_key_rotation::ensure_normal_boot_allowed_from_env(pool),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => DepStatus::Ok,
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "readiness: master-key rotation fence failed");
+                                DepStatus::Down
+                            }
+                            Err(_) => {
+                                tracing::warn!("readiness: master-key rotation fence timed out");
+                                DepStatus::Down
+                            }
+                        },
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "readiness: gateway migration ledger check failed");
+                            DepStatus::Down
+                        }
+                        Err(_) => {
+                            tracing::warn!("readiness: gateway migration ledger check timed out");
+                            DepStatus::Down
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {
+                    tracing::warn!("readiness: postgres SELECT 1 returned an unexpected value");
+                    DepStatus::Down
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "readiness: postgres SELECT 1 failed");
+                    DepStatus::Down
+                }
+                Err(_) => {
+                    tracing::warn!("readiness: postgres SELECT 1 timed out");
+                    DepStatus::Down
+                }
             }
-        },
+        }
         None => DepStatus::NotConfigured,
     };
 
