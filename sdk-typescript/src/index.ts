@@ -14,6 +14,8 @@
  *   4. For streaming calls, strips the Gateway's terminal `tokentrimmer.usage`
  *      SSE frame (which the OpenAI parser would otherwise turn into a malformed
  *      chunk) and surfaces its cost on the returned stream's `.tt` once drained.
+ *   5. Adds bounded, runtime-validated model, capability, and request-preflight
+ *      operations under `gateway`.
  *
  * @example
  *
@@ -55,6 +57,21 @@ import type {
   ChatCompletionCreateParamsNonStreaming,
   ChatCompletionCreateParamsStreaming,
 } from 'openai/resources/chat/completions';
+import { GatewayMetadata } from './gateway-metadata.js';
+
+export {
+  GatewayMetadata,
+  GatewayMetadataError,
+  type GatewayCapabilitiesDocument,
+  type ModelEntry,
+  type ModelPricing,
+  type ModelsResponse,
+  type PreflightCostEvidence,
+  type RequestPreflightBatchRequest,
+  type RequestPreflightBatchResponse,
+  type RequestPreflightRequest,
+  type RequestPreflightResponse,
+} from './gateway-metadata.js';
 
 export const DEFAULT_BASE_URL = 'https://api.tokentrimmer.com/v1';
 
@@ -621,6 +638,8 @@ export class TokenTrimmer extends OpenAI {
 
   /** Driver for the server-side agent loop (`client.agent.run(...)`). See {@link Agent}. */
   readonly agent: Agent;
+  /** Bounded responder-scoped catalog, capability, and preflight operations. */
+  readonly gateway: GatewayMetadata;
 
   constructor(options: ClientOptions = {}) {
     super({
@@ -630,6 +649,7 @@ export class TokenTrimmer extends OpenAI {
     });
 
     this.agent = new Agent(this);
+    this.gateway = new GatewayMetadata(this.baseURL, this.apiKey ?? '');
 
     // Capture the original OpenAI `create` (an `APIPromise`-returning, overloaded
     // method) before we replace it. The `chat` field is type-narrowed to the
@@ -714,4 +734,3 @@ export {
   EmptyExtractionError,
   type DistilledDocument,
 } from './document.js';
-
