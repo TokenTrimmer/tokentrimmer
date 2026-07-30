@@ -21,11 +21,16 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::Value;
 use opentelemetry_sdk::trace::InMemorySpanExporter;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::prelude::*;
 
-use tt_core::{build_router, AppState, ProviderRegistry};
+use tt_core::{
+    build_router,
+    middleware::trace::{OTEL_TRACE_ID_ATTRIBUTE, TRACE_ID_HEADER},
+    AppState, ProviderRegistry,
+};
 use tt_shared::{
     messages::{Choice, Message, MessageContent},
     pricing::Capability,
@@ -136,7 +141,7 @@ fn chat_request(traceparent: Option<&str>) -> Request<Body> {
 /// A current-thread runtime keeps the whole request on this thread so the
 /// thread-local subscriber installed by `with_default` is in scope for the
 /// polled future as well.
-fn run_request_capturing_span(req: Request<Body>) -> opentelemetry_sdk::trace::SpanData {
+fn run_request_capturing_span(req: Request<Body>) -> (opentelemetry_sdk::trace::SpanData, String) {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -150,25 +155,43 @@ fn run_request_capturing_span(req: Request<Body>) -> opentelemetry_sdk::trace::S
         .build()
         .unwrap();
 
-    tracing::subscriber::with_default(subscriber, || {
+    let response_trace_id = tracing::subscriber::with_default(subscriber, || {
         let resp = rt.block_on(async { app().oneshot(req).await.unwrap() });
         assert_eq!(resp.status(), StatusCode::OK, "route should return 200");
+        resp.headers()
+            .get(&TRACE_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("response must carry a TokenTrimmer trace UUID")
+            .to_owned()
     });
 
     // Spans export on close; the request span closed when the future finished.
     provider.force_flush().expect("force_flush should succeed");
     let spans = exporter.get_finished_spans().expect("finished spans");
-    spans
+    let span = spans
         .into_iter()
         .find(|s| s.name == "http_request")
-        .expect("gateway request span 'http_request' should have been recorded")
+        .expect("gateway request span 'http_request' should have been recorded");
+    (span, response_trace_id)
+}
+
+fn correlation_attribute(span: &opentelemetry_sdk::trace::SpanData) -> &str {
+    span.attributes
+        .iter()
+        .find(|attribute| attribute.key.as_str() == OTEL_TRACE_ID_ATTRIBUTE)
+        .and_then(|attribute| match &attribute.value {
+            Value::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .expect("request span must carry tokentrimmer.trace_id")
 }
 
 /// WITH a valid inbound `traceparent`: the request span continues that trace —
 /// same trace_id, and the inbound span-id is its parent.
 #[test]
 fn inbound_traceparent_is_continued_as_parent() {
-    let span = run_request_capturing_span(chat_request(Some(INBOUND_TRACEPARENT)));
+    let (span, response_trace_id) =
+        run_request_capturing_span(chat_request(Some(INBOUND_TRACEPARENT)));
 
     assert_eq!(
         span.span_context.trace_id().to_string(),
@@ -180,6 +203,18 @@ fn inbound_traceparent_is_continued_as_parent() {
         INBOUND_PARENT_ID_HEX,
         "request span's parent must be the inbound traceparent span-id"
     );
+    assert_eq!(
+        correlation_attribute(&span),
+        response_trace_id,
+        "the exported correlation attribute must equal the response UUID"
+    );
+    assert_ne!(
+        correlation_attribute(&span).replace('-', ""),
+        INBOUND_TRACE_ID_HEX,
+        "the TokenTrimmer correlation UUID must not masquerade as the W3C trace ID"
+    );
+    uuid::Uuid::parse_str(&response_trace_id)
+        .expect("the TokenTrimmer correlation attribute must remain a UUID");
 }
 
 /// WITHOUT a `traceparent`: a fresh local trace — a different trace_id and the
@@ -191,7 +226,7 @@ fn inbound_traceparent_is_continued_as_parent() {
 /// parent.)
 #[test]
 fn absent_traceparent_starts_fresh_root() {
-    let span = run_request_capturing_span(chat_request(None));
+    let (span, response_trace_id) = run_request_capturing_span(chat_request(None));
 
     assert_ne!(
         span.span_context.trace_id().to_string(),
@@ -207,4 +242,5 @@ fn absent_traceparent_starts_fresh_root() {
         INBOUND_PARENT_ID_HEX,
         "with no traceparent, the request span must not be parented on the inbound span-id"
     );
+    assert_eq!(correlation_attribute(&span), response_trace_id);
 }

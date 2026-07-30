@@ -62,7 +62,7 @@ This file is the human-curated counterpart to `.claude/INDEX.md` (auto-generated
 |---|---|
 | Audit row schema | `crates/telemetry/src/audit.rs` (AuditEntry, Actor) |
 | Hash-chain rationale | Plan file § "Audit Guarantees" + `docs/tokentrimmer-architecture-spec-v1.md` § 16.3 |
-| OTel setup | `crates/telemetry/src/lib.rs` (stub; init in Week 1 `w1-otel-init`) |
+| OTel export, inbound W3C parentage, and request correlation | `crates/telemetry/src/{tracing,propagation,gen_ai}.rs`, `crates/core/src/middleware/trace.rs`, `crates/core/tests/traceparent_ingest.rs`, `docs/observability/README.md` | The gateway owns one operator-configured OTLP exporter and continues valid inbound W3C context; `tokentrimmer.trace_id` joins the exported request span to the separate UUID returned in the response header and used in logs/receipts. |
 | Persisted-data inventory / retention | `../cloud/docs/data-inventory.v1.json` + `../cloud/docs/validate-data-inventory.rb` | Cross-repo Postgres, R2, Redis, processor, export, and deletion evidence. |
 | Receipt/bundle formats and generated TS contracts | `crates/telemetry/src/{vcr,l2_receipt,wfr_receipt,arr_receipt}.rs`, `crates/cli/src/bundle.rs`, `crates/ts-types/`, `docs/receipt-spec/` | Canonical payloads, replay bundle, Rust-derived schemas/TS, deterministic vectors, and drift gates. |
 
