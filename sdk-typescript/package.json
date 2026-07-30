@@ -75,7 +75,7 @@
     "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "4.1.10",
     "openai": "^6.45.0",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "unpdf": "^1.8.0",
     "vitest": "4.1.10"
   },
