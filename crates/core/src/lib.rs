@@ -38,7 +38,7 @@ pub use budget::{
     InMemoryBudgetEnforcer, SpendSink,
 };
 pub use cache_volatility::{classify_volatility, l2_ttl_with_volatility, VolatilityClass};
-pub use db::{connect, migrate, migrate_only, MIGRATOR};
+pub use db::{connect, migrate, migrate_only, verify_migration_ledger, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use gateway_purge_auth::GatewayPurgeAuthorizer;
