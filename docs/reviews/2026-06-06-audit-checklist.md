@@ -4,7 +4,7 @@
 
 **Totals (original):** 82 findings — 4 high · 33 medium · 45 low. By focus: 9 security · 5 backlog · 2 UX. Across 13 areas.
 
-**Current checkbox rollup (reconciled 2026-07-29):** 83 closed · 10 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
+**Current checkbox rollup (reconciled 2026-07-29):** 84 closed · 9 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
 
 ## 🚩 Priority queue (high-severity + security) — 11
 
@@ -260,10 +260,11 @@ _Provider adapter group A (openai/anthropic/gemini/compat) is in solid shape on 
 
 _Group-B adapters (groq, mistral, together, openrouter, local) are thin, well-documented wrappers over the shared OpenAI-compatible base. The hosted four are essentially identical boilerplate with correct fee_multiplier handling and request-time SSRF validation via the shared url_guard, which is solid (good IPv4/IPv6 range coverage, metadata-IP blocking, hop-by-hop header filtering). The main concern is the local provider: it runs the compat base with allow_local: true, which makes validate_provider_url skip ALL private/loopback/metadata range checks (scheme-only). Because tenant-supplied credential base_url is stored without write-time validation (auth/postgres.rs put() validates nothing) and is loaded by provider id at dispatch, a tenant credential for a registered local backend (ollama/vllm/lmstudio) with a custom base_url can reach internal addresses (169.254.169.254, internal Redis, etc.) — a conditional SSRF. The backlog explicitly defers write-time validation to a cloud-side item, but the public code path has no guard. Secondary issues: two near-duplicate compat bases (tt-provider-openai vs tt-provider-compat) with subtly different validation gating, LocalProvider not forwarding dropped_params, and no HTTP-level test for the local adapter._
 
-- [ ] 🟡 **[dx/medium] Two near-duplicate OpenAI-compatible bases with divergent validation gating** — **🔴 OPEN**
-  - Where: crates/providers/openai/src/lib.rs:120-126,187-191,211-215 vs crates/providers/compat/src/compat.rs:172-175,227-229,249-251
-  - Issue: local depends on tt-provider-openai while groq/mistral/together/openrouter depend on tt-provider-compat. The two crates implement the same OpenAICompatibleProvider with subtly different behavior: compat.rs always calls validate_provider_url (even on the compiled-in default), whereas openai/lib.rs only validates when ctx.credentials.base_url.is_some() (lib.rs:123). The two also differ in struct fields and base_url() default handling. Maintaining two copies invites drift — a hardening fix applied to one base silently misses the other (the local SSRF lives in the openai-base copy). It also makes the crate naming confusing (LocalProvider importing tt_provider_openai::CompatConfig).
-  - Action: Consolidate to a single shared OpenAICompatibleProvider crate that local, groq, mistral, together, and openrouter all wrap. If a separate native-OpenAI adapter is genuinely needed, factor the shared compat base into one crate and have the OpenAI native adapter depend on it, eliminating the duplicate validation logic.
+- [x] 🟡 **[dx/medium] Two near-duplicate OpenAI-compatible bases had divergent validation gating** — **✅ DONE in `fc2fd3f`; direct-local dependency cleanup completed 2026-07-29.**
+  - Where: crates/providers/compat/; crates/providers/{groq,mistral,together,openrouter,local}/; crates/providers/openai/
+  - Resolution: `tt-provider-compat` is the single generic OpenAI-wire HTTP, translation, error, and SSE implementation. All hosted wrappers and the local adapter configure it directly. Native OpenAI depends on/re-exports the shared machinery while retaining only OpenAI-specific adapter behavior, pricing, and Batch APIs.
+  - Validation semantics: The generic base consistently validates configured provider URLs using its `allow_local` policy. Native OpenAI trusts its compiled-in constant and validates only customer overrides; this is an intentional input-boundary difference, not duplicate generic logic.
+  - Evidence: Compatibility, local, and native OpenAI tests/doctests all pass (`128` checks), with strict clippy across all three packages.
 
 - [x] 🟡 **[security/medium] Credential write path performs no base_url / extra_headers validation**  **✅ DONE in #65 (2026-06-07).**
   - Where: crates/auth/src/postgres.rs:131-177 (put); url_guard.rs:311 (find_denied_header exists but unused at write time)
