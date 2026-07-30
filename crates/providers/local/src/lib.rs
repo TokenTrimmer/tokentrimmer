@@ -1,7 +1,7 @@
 //! Local-LLM provider adapter — Ollama, vLLM, LM Studio.
 //!
 //! All three speak the OpenAI Chat Completions wire format on their default
-//! ports, so we wrap [`tt_provider_openai::OpenAICompatibleProvider`] with a
+//! ports, so we wrap [`tt_provider_compat::OpenAICompatibleProvider`] with a
 //! per-backend `base_url` and a zero-cost pricing fallback.
 //!
 //! Unlike hosted providers, local backends serve whatever model the user has
@@ -11,8 +11,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use tt_provider_local::{LocalProvider, LocalBackend};
-//! use tt_provider_openai::ClientConfig;
+//! use tt_provider_local::{ClientConfig, LocalBackend, LocalProvider};
 //!
 //! let ollama = LocalProvider::new(LocalBackend::Ollama, ClientConfig::default());
 //! let vllm   = LocalProvider::new(LocalBackend::Vllm,   ClientConfig::default());
@@ -25,7 +24,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::BoxStream;
-use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
+pub use tt_provider_compat::ClientConfig;
+use tt_provider_compat::{CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
