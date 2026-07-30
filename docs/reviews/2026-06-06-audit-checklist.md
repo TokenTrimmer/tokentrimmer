@@ -4,7 +4,7 @@
 
 **Totals (original):** 82 findings — 4 high · 33 medium · 45 low. By focus: 9 security · 5 backlog · 2 UX. Across 13 areas.
 
-**Current checkbox rollup (reconciled 2026-07-29):** 81 closed · 12 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
+**Current checkbox rollup (reconciled 2026-07-29):** 82 closed · 11 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
 
 ## 🚩 Priority queue (high-severity + security) — 11
 
@@ -142,10 +142,10 @@ _The gateway core (crates/core) is mature, well-tested, and security-conscious. 
   - Issue: When no ApiKeyContext is attached (no key store wired / dev / legacy BYO-key passthrough), org_id collapses to Uuid::nil(). All such callers then share one L1/L2 cache namespace (nil:{cache_key}) and the SpendSink no-ops for the nil org. In a multi-tenant production deployment this is never reached because a valid tt_live_* key always stamps a real org_id, and L2 is gated on a paid tier (None tier -> no L2). The risk only materializes if someone deploys the gateway as a shared passthrough without the key store but with L1 configured. The retrieval middleware already fails closed in this exact scenario (retrieval.rs:216-243), but the chat cache does not.
   - Action: Consider gating L1 lookup/insert to off (like retrieval's fail-closed) when org_id == Uuid::nil() AND a key store is configured but produced no context, or add a boot assertion warning when L1 is wired without a key store in a multi-tenant config. Document that nil-org dev mode shares cache state.
 
-- [ ] ⚪ **[opportunity/low] L2 cache-hit baseline savings use a hard-coded $1/$2-per-million placeholder** — **🔴 OPEN**
-  - Where: crates/core/src/routes/chat.rs:1737-1744 (synthetic_baseline_from_entry); :1645-1658 (build_hit_l2_response), :2054 (request_log_for_l2_hit)
-  - Issue: On an L2 semantic-cache hit the reported baseline_cost_usd / saved_usd is reconstructed from a fixed $1/M input + $2/M output placeholder because the CacheEntry doesn't carry the original model's pricing. This silently mis-reports realized savings on the dashboard for any model whose real rate diverges from that placeholder (e.g. an Anthropic Opus hit understates savings by ~15x; a cheap model overstates them). The code comment acknowledges this is a placeholder pending an L2 schema column. L1 hits don't have this problem (the L1Entry envelope carries baseline_cost_usd).
-  - Action: Add a baseline_cost_usd column to the L2 cache_entries schema (computed at insert time, as L1Entry already does) and read it back on hit instead of synthetic_baseline_from_entry, so L2-hit savings match reality.
+- [x] ⚪ **[opportunity/low] L2 cache-hit baseline savings used a hard-coded $1/$2-per-million placeholder** — **✅ DONE in #106 (re-verified 2026-07-29).**
+  - Where: crates/core/migrations/0010_cache_baseline_cost.up.sql; crates/cache/src/l2.rs (`CacheEntry::baseline_cost_usd`); crates/core/src/routes/chat.rs (`l2_entry_baseline`); crates/core/tests/l2_cache_hit.rs
+  - Resolution: New L2 rows store the catalog-derived baseline computed for the original miss. Legacy rows with no stored value are repriced from their model/token counts against the current catalog, or conservatively report zero when pricing is unavailable.
+  - Evidence: The L2 hit suite proves stored-baseline use, legacy catalog repricing, absence of the old placeholder, and catalog-derived insertion (`9 passed` on 2026-07-29).
 
 - [x] ⚪ **[dx/low] chat.rs handler is a 1500-line monolith with significant duplicated input-token estimation** — **✅ DONE (PR #104): streaming input-token estimate now uses the shared `tt_shared::message_text_for_estimation` (removes the divergence hazard — −40 lines); stale "Week N" module docstring refreshed to the actual pipeline; the negative-cache / L1 / L2 lookup branches extracted into `try_negative_cache_hit` / `try_l1_hit` / `try_l2_hit` helpers. Behavior-preserving — full tt-core suite passes unchanged (166). Conservative scope: dispatch/cost/insert stay inline; no handler-context struct.**
   - Where: crates/core/src/routes/chat.rs:480-1499 (handler); :793-836 (inline per-message text extraction duplicates tt_shared::message_text_for_estimation used elsewhere at :679, :1209, :2151)
