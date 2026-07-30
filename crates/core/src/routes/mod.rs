@@ -16,6 +16,7 @@ pub mod models;
 pub mod panel;
 pub mod preview;
 pub mod ready;
+pub mod request_preflight;
 pub mod responses;
 pub mod routes_api;
 pub mod spend_api;
