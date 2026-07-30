@@ -177,6 +177,15 @@ pub trait BatchStore: Send + Sync {
     /// gets an empty vec.
     async fn list(&self, org_id: Uuid) -> Result<Vec<BatchJob>, BatchStoreError>;
 
+    /// Whether `file_id` appears as an input, output, or error file on one of
+    /// this organization's durable batch rows.
+    ///
+    /// Provider credentials are not an ownership boundary: two organizations
+    /// can deliberately use the same upstream account. File-content routes
+    /// therefore require this exact local ownership predicate before making an
+    /// upstream request.
+    async fn owns_file(&self, org_id: Uuid, file_id: &str) -> Result<bool, BatchStoreError>;
+
     /// Update an existing org-scoped row's status + file ids + counts +
     /// `updated_at`. No-op (returns `Ok`) when the id isn't the org's.
     async fn update(&self, job: BatchJob) -> Result<(), BatchStoreError>;
@@ -225,6 +234,22 @@ impl BatchStore for InMemoryBatchStore {
         // Newest-first, mirroring the Postgres `ORDER BY created_at DESC`.
         rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(rows)
+    }
+
+    async fn owns_file(&self, org_id: Uuid, file_id: &str) -> Result<bool, BatchStoreError> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|e| BatchStoreError::Storage(e.to_string()))?;
+        Ok(g.values().any(|job| {
+            job.org_id == org_id
+                && [
+                    job.input_file_id.as_deref(),
+                    job.output_file_id.as_deref(),
+                    job.error_file_id.as_deref(),
+                ]
+                .contains(&Some(file_id))
+        }))
     }
 
     async fn update(&self, job: BatchJob) -> Result<(), BatchStoreError> {
@@ -356,6 +381,21 @@ impl BatchStore for PostgresBatchStore {
         Ok(rows.into_iter().map(row_to_job).collect())
     }
 
+    async fn owns_file(&self, org_id: Uuid, file_id: &str) -> Result<bool, BatchStoreError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM public.batch_jobs \
+               WHERE org_id = $1 \
+                 AND $2 IN (input_file_id, output_file_id, error_file_id) \
+             )",
+        )
+        .bind(org_id)
+        .bind(file_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BatchStoreError::Storage(e.to_string()))
+    }
+
     async fn update(&self, job: BatchJob) -> Result<(), BatchStoreError> {
         // Org-scoped UPDATE: a row belonging to another org never matches the
         // WHERE, so this is a safe no-op for cross-org ids.
@@ -441,6 +481,9 @@ mod tests {
         assert!(store.get(org_a, "batch_abc123").await.unwrap().is_some());
         // org_b does NOT (cross-org isolation).
         assert!(store.get(org_b, "batch_abc123").await.unwrap().is_none());
+        assert!(store.owns_file(org_a, "file-in").await.unwrap());
+        assert!(!store.owns_file(org_b, "file-in").await.unwrap());
+        assert!(!store.owns_file(org_a, "file-unknown").await.unwrap());
 
         // An update under org_b must not touch org_a's row.
         let mut hijack = job.clone();

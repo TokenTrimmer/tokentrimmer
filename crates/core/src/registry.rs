@@ -96,7 +96,7 @@ impl ProviderRegistry {
     /// The concrete OpenAI adapter, when registered. Used by the Batch Lane
     /// endpoints to call the slice-1 batch methods (`create_batch`,
     /// `upload_batch_input`, `get_batch`, `cancel_batch`,
-    /// `download_file_content`), which are inherent methods on `OpenAiProvider`
+    /// `stream_file_content`), which are inherent methods on `OpenAiProvider`
     /// that the type-erased `Arc<dyn Provider>` cannot reach. `None` when OpenAI
     /// is not enabled.
     pub fn openai(&self) -> Option<Arc<OpenAiProvider>> {

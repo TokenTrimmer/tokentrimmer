@@ -6226,6 +6226,7 @@ dependencies = [
  "dirs",
  "doc-sidecar",
  "ed25519-dalek",
+ "futures",
  "hex",
  "httpmock",
  "include_dir",
