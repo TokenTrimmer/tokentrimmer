@@ -10,6 +10,7 @@ pub mod content_kind;
 pub mod context;
 pub mod dns_guard;
 pub mod error;
+pub mod gateway_capabilities;
 pub mod messages;
 pub mod model_aliases;
 pub mod model_catalog;
@@ -29,6 +30,12 @@ pub use content_kind::{classify as classify_content, ContentKind};
 pub use context::{CallerTier, RequestContext};
 pub use dns_guard::{with_guarded_dns, GuardedResolveError, GuardedResolver};
 pub use error::ProviderError;
+pub use gateway_capabilities::{
+    AccessEvidence, CapabilityReason, EnabledEvidence, FusionCapability, FusionLimits,
+    GatewayCapabilitiesDocument, GatewayFeatures, NumericLimit, SchemaVersionEvidence,
+    SchemaVersions, TierEvidence, UnknownEvidence, CAPABILITIES_SCHEMA_VERSION, CAPABILITIES_SCOPE,
+    CAPABILITIES_SNAPSHOT_SCOPE,
+};
 pub use messages::{
     parse_cache_control, parse_panel_extras, CacheControlConfig, CacheMode, ChatCompletionChunk,
     ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart, EmbeddingsRequest,

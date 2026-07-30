@@ -22,6 +22,13 @@ pub use tt_shared::{
     ModelsResponse,
 };
 
+mod capabilities;
+pub use tt_shared::{
+    AccessEvidence, CapabilityReason, EnabledEvidence, FusionCapability, FusionLimits,
+    GatewayCapabilitiesDocument, GatewayFeatures, NumericLimit, SchemaVersionEvidence,
+    SchemaVersions, TierEvidence, UnknownEvidence,
+};
+
 mod embeddings;
 pub use embeddings::{EmbedBuilder, EmbedOutcome};
 
@@ -418,6 +425,13 @@ pub enum Error {
     /// The catalog endpoint returned or crossed a redirect boundary.
     #[error("model catalog endpoint returned a redirect")]
     UnexpectedModelCatalogRedirect,
+    /// A capability document parsed structurally but violated the versioned
+    /// responding-process contract. The reason is a fixed local code.
+    #[error("invalid gateway capabilities contract: {0}")]
+    InvalidGatewayCapabilities(&'static str),
+    /// The capability endpoint returned or crossed a redirect boundary.
+    #[error("gateway capabilities endpoint returned a redirect")]
+    UnexpectedGatewayCapabilitiesRedirect,
     /// The client's dedicated no-redirect control-metadata transport could not
     /// be initialized. No metadata request was sent.
     #[error("failed to initialize the control-metadata HTTP client")]
@@ -520,7 +534,9 @@ impl Client {
     }
 
     /// New client reusing an existing `reqwest::Client` for ordinary data/API
-    /// calls. Bounded model metadata reads use a separate no-redirect client.
+    /// calls. Bounded model/capability metadata reads use a separate
+    /// no-redirect client so an authenticated capability bearer cannot inherit
+    /// the caller's redirect policy.
     #[must_use]
     pub fn with_http_client(
         http: reqwest::Client,
@@ -529,6 +545,9 @@ impl Client {
     ) -> Self {
         Self {
             http,
+            // Control metadata uses an independent, no-redirect transport so
+            // an authenticated capability bearer is never forwarded through a
+            // caller-configured redirect policy.
             control_http: control_metadata_http(),
             base: base.into().trim_end_matches('/').to_string(),
             key: key.into(),
