@@ -12720,7 +12720,6 @@ Used by:
 - [parse-zoneinfo 0.3.1](https://github.com/chronotope/chrono-tz)
 - [pdf-extract 0.12.0](https://github.com/jrmuizel/pdf-extract)
 - [tiktoken-rs 0.12.0](https://github.com/zurawiki/tiktoken-rs)
-- [tree-sitter-javascript 0.23.1](https://github.com/tree-sitter/tree-sitter-javascript)
 - [tree-sitter-python 0.23.6](https://github.com/tree-sitter/tree-sitter-python)
 - [tree-sitter-typescript 0.23.2](https://github.com/tree-sitter/tree-sitter-typescript)
 - [type1-encoding-parser 0.1.1](https://github.com/jrmuizel/type1-encoding-parser)
@@ -12985,6 +12984,36 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+## MIT License
+
+Used by:
+- [tree-sitter-javascript 0.25.0](https://github.com/tree-sitter/tree-sitter-javascript)
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2014 Max Brunsfeld
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ```
 
 ## MIT License
