@@ -4,7 +4,7 @@
 
 **Totals (original):** 82 findings — 4 high · 33 medium · 45 low. By focus: 9 security · 5 backlog · 2 UX. Across 13 areas.
 
-**Current checkbox rollup (reconciled 2026-07-29):** 84 closed · 9 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
+**Current checkbox rollup (reconciled 2026-07-29):** 85 closed · 8 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
 
 ## 🚩 Priority queue (high-severity + security) — 11
 
@@ -281,10 +281,11 @@ _Group-B adapters (groq, mistral, together, openrouter, local) are thin, well-do
   - Issue: Every hosted group-B adapter has a tests/smoke.rs that exercises the real HTTP path against httpmock (endpoint construction, error mapping, headers). LocalProvider only has in-crate unit tests for id/url/prefix-strip; there is no test that drives chat_completion through the inner client, verifies the prefix-stripped model is what hits the wire, or confirms allow_local URL handling. The security-sensitive allow_local behavior in particular is untested at this layer. local_dispatch.rs in tt-core uses a hand-rolled MockOllama, not the real adapter.
   - Action: Add crates/providers/local/tests/smoke.rs mirroring the hosted adapters: assert the backend prefix is stripped before the request body is sent, that pricing returns zero, and add an explicit test documenting/locking the intended allow_local URL policy (especially after hardening the SSRF guard).
 
-- [ ] ⚪ **[gap/low] OpenRouter dynamic /models endpoint remains a TODO (static subset only)** — **🔴 OPEN**
-  - Where: crates/providers/openrouter/src/lib.rs:16-21 (TODO(w5-openrouter-models-endpoint)), :161-163
-  - Issue: OpenRouter aggregates 300+ models but the adapter exposes only the static subset present in the shared catalog for provider 'openrouter'. The module doc has a tracked TODO to fetch and cache GET /models dynamically. Until then, routing/cost estimation only works for the handful of catalogued OpenRouter models; a request for any other OpenRouter-hosted model gets no pricing (pricing() returns None) and won't appear in models(). This is a documented v1 limitation, not a bug.
-  - Action: Either implement the cached dynamic /models fetch or, lower-effort, document in user-facing docs which OpenRouter models are supported so callers aren't surprised by missing pricing on uncatalogued models. The 5% BYOK fee applied to a None price is also a no-op worth noting.
+- [x] ⚪ **[gap/low] OpenRouter exposed only a static model subset** — **✅ DONE in #130 (re-verified 2026-07-29).**
+  - Where: crates/providers/openrouter/src/{lib,dynamic}.rs; crates/providers/openrouter/tests/dynamic_models.rs; crates/core/src/registry.rs (`spawn_openrouter_catalog_refresh`)
+  - Resolution: The adapter fetches `GET /models`, parses string or numeric per-token prices into the gateway's per-million units, caches model metadata and pricing together, and serves the dynamic catalogue through `Provider::models`/`pricing`.
+  - Availability: Gateway boot refreshes immediately and periodically. A failed refresh preserves the last-good dynamic catalogue or the static priced baseline; malformed/unpriced model rows never fabricate rates.
+  - Evidence: All OpenRouter unit, dynamic, smoke, and doc tests pass (`16` checks), with strict package clippy.
 
 ### `pub-cli`
 
