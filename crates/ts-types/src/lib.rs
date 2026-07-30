@@ -28,6 +28,7 @@ const GENERATED_TS_PATH: &str = "bindings/receipt-contracts.generated.ts";
 const MANIFEST_PATH: &str = "docs/receipt-spec/receipt-contracts.manifest.json";
 const PRODUCT_TS_PATH: &str = "bindings/product-contracts.generated.ts";
 const SDK_PRODUCT_TS_PATH: &str = "sdk-typescript/src/product-contracts.generated.ts";
+const SDK_PRODUCT_PY_PATH: &str = "sdk-python/tokentrimmer/product_contracts_generated.py";
 const PRODUCT_MANIFEST_PATH: &str = "docs/contracts/product-contracts.manifest.json";
 const ROUTE_PREVIEW_V2_PATH: &str =
     "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json";
@@ -74,6 +75,10 @@ pub fn generate_artifacts() -> Result<Vec<GeneratedArtifact>> {
     product_artifacts.push(GeneratedArtifact {
         relative_path: SDK_PRODUCT_TS_PATH.into(),
         bytes: product_types,
+    });
+    product_artifacts.push(GeneratedArtifact {
+        relative_path: SDK_PRODUCT_PY_PATH.into(),
+        bytes: schema::render_gateway_python(&product_schemas)?.into_bytes(),
     });
     product_artifacts.push(typed_json_artifact(
         "docs/workflow-contract/workflow-definition-v1.golden.json",
@@ -585,6 +590,7 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
         "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, and request-preflight response types",
         "typescript": PRODUCT_TS_PATH,
         "typescript_sdk": SDK_PRODUCT_TS_PATH,
+        "python_sdk": SDK_PRODUCT_PY_PATH,
         "contracts": [
             {
                 "family": "route",
@@ -721,5 +727,13 @@ mod tests {
         assert!(product_types.contains("export type GatewayCapabilitiesDocument ="));
         assert!(product_types.contains("export type RequestPreflightResponse ="));
         assert!(product_types.contains("export type RequestPreflightBatchResponse ="));
+
+        let python_types = std::str::from_utf8(get(SDK_PRODUCT_PY_PATH)).expect("product Python");
+        assert!(python_types.contains("class ModelsResponse:"));
+        assert!(python_types.contains("class GatewayCapabilitiesDocument:"));
+        assert!(python_types.contains("class ModelTokenTrimmerMeta:"));
+        assert!(python_types.contains("class CapabilityReason:"));
+        assert!(python_types.contains("class RequestPreflightResponse:"));
+        assert!(python_types.contains("class RequestPreflightBatchResponse:"));
     }
 }
