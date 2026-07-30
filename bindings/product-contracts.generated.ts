@@ -240,7 +240,7 @@ export type SchemaVersionEvidence = {
   reason: CapabilityReason;
   source: "gateway_runtime";
   state: "known" | "unversioned";
-  version?: number | null;
+  version: number | null;
 };
 
 export type SchemaVersions = {

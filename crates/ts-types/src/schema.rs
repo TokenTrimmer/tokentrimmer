@@ -143,13 +143,13 @@ pub(crate) fn generate_product_schemas() -> Result<Vec<ContractSchema>> {
     strengthen_models(&mut models)?;
 
     let mut capabilities = root_value(schemars::schema_for!(
-        tt_core::routes::capabilities::GatewayCapabilitiesDocument
+        tt_shared::GatewayCapabilitiesDocument
     ))?;
     prepare_product_root(
         &mut capabilities,
         "urn:tokentrimmer:gateway-capabilities:response-schema:v1",
         "TokenTrimmer gateway runtime capabilities",
-        "Structural GET /v1/capabilities response generated from the exact tt_core::routes::capabilities::GatewayCapabilitiesDocument output type.",
+        "Structural GET /v1/capabilities response generated from the exact tt_shared::GatewayCapabilitiesDocument wire type.",
     )?;
     strengthen_capabilities(&mut capabilities)?;
 
@@ -391,7 +391,7 @@ fn strengthen_capabilities(schema: &mut Value) -> Result<()> {
     set_const(
         schema,
         "schema_version",
-        json!(tt_core::routes::capabilities::CAPABILITIES_SCHEMA_VERSION),
+        json!(tt_shared::CAPABILITIES_SCHEMA_VERSION),
     )?;
     set_const(schema, "scope", json!("gateway_runtime"))?;
     set_const(schema, "snapshot_scope", json!("responding_process"))?;
@@ -453,6 +453,7 @@ fn strengthen_capabilities(schema: &mut Value) -> Result<()> {
     let message = definition_property_mut(schema, "CapabilityReason", "message")?;
     message.insert("minLength".into(), json!(1));
     message.insert("maxLength".into(), json!(600));
+    require_definition_properties(schema, "SchemaVersionEvidence", &["version"])?;
     Ok(())
 }
 

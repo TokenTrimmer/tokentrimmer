@@ -67,11 +67,11 @@
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "1d9fe8fdf670f09fa16bb971da4f00c30c14b9896f5b916a45a1455962941887"
+      "sha256": "c1d83c1ac432f03770f08e551ee317b3c382da9bc915d87eb4097e546cf84f92"
     },
     {
       "path": "docs/capability-contract/gateway-capabilities.schema.json",
-      "sha256": "273191038c0c39dc72626a787f37649495b4a20426c2416fccf7cdfdfe31a783"
+      "sha256": "ba9275ee2fd1b2e187b3efbeef6b74549a37a5d4c8f2421ee7bd1a5940211401"
     },
     {
       "path": "docs/model-contract/models-response.schema.json",

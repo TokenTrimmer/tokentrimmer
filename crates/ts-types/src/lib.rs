@@ -620,7 +620,7 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
             {
                 "family": "gateway_capabilities",
                 "id": "tokentrimmer.gateway-capabilities.v1",
-                "versions": [tt_core::routes::capabilities::CAPABILITIES_SCHEMA_VERSION],
+                "versions": [tt_shared::CAPABILITIES_SCHEMA_VERSION],
                 "schema": "docs/capability-contract/gateway-capabilities.schema.json",
                 "compatibility_corpus": "docs/capability-contract/tokentrimmer.gateway-capabilities.v1.corpus.json",
                 "read": "GET /v1/capabilities"
