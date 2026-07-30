@@ -173,6 +173,15 @@ print(f"cost   ${outcome.usage.cost_usd:.4f}")
 print(f"rounds {outcome.resume_rounds}")  # client-side tool_outputs resumes made
 ```
 
+Paused/resumed transcripts remain in Redis for one hour. You can explicitly
+export or erase that short-lived resume state without deleting durable
+billing/audit metadata:
+
+```python
+transcript = client.agent.export_transcript(outcome.run.id)
+client.agent.delete_transcript(outcome.run.id)  # idempotent
+```
+
 ## LangChain cost callback + OpenTelemetry spans
 
 When you point a LangChain `ChatOpenAI` at the Gateway (a plain `base_url` swap),

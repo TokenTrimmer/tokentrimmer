@@ -42,6 +42,10 @@
     "/v1/agent/runs/{id}": {
       "get": { "summary": "Fetch a run by id", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The run." }, "404": { "description": "Not found (or cross-org)." } } }
     },
+    "/v1/agent/runs/{id}/transcript": {
+      "get": { "summary": "Export a retained agent transcript", "description": "Exports only the caller organization's one-hour Redis transcript with private, no-store response headers. It never falls back to durable run metadata.", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The retained Run including messages." }, "401": { "description": "A verified tenant key is required." }, "404": { "description": "The transcript was never retained, expired, was deleted, or belongs to another organization." }, "503": { "description": "No L1/Redis transcript store is configured." } } },
+      "delete": { "summary": "Erase a retained agent transcript", "description": "Idempotently deletes only the caller organization's short-lived transcript/resume state. Durable billing and audit run metadata is unaffected. Concurrent resume or deletion attempts return conflict.", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "204": { "description": "The transcript is absent." }, "401": { "description": "A verified tenant key is required." }, "409": { "description": "The run is concurrently being resumed or deleted." }, "503": { "description": "No L1/Redis transcript store is configured." } } }
+    },
     "/v1/agent/runs/{id}/tool_outputs": {
       "post": { "summary": "Resume a paused (requires_action) run", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The resumed run." } } }
     },

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -243,6 +244,23 @@ class Agent:
 
         return AgentOutcome(run=run, resume_rounds=resume_rounds)
 
+    def export_transcript(self, run_id: str) -> Run:
+        """Export a still-retained paused/resumed transcript.
+
+        The Gateway returns 404 after the one-hour Redis record expires or is
+        deleted. Durable run metadata remains available through run history.
+        """
+        url = self._transcript_url(run_id)
+        resp = self._http.get(url, headers=self._headers())
+        resp.raise_for_status()
+        return Run._from_payload(resp.json())
+
+    def delete_transcript(self, run_id: str) -> None:
+        """Idempotently erase retained transcript/resume state only."""
+        url = self._transcript_url(run_id)
+        resp = self._http.delete(url, headers=self._headers())
+        resp.raise_for_status()
+
     def _create(
         self,
         model: str,
@@ -266,12 +284,20 @@ class Agent:
         return self._send(url, body, tt_tag)
 
     def _send(self, url: str, body: Dict[str, Any], tt_tag: Optional[str]) -> Run:
-        headers = {
-            "Authorization": f"Bearer {self._client.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = self._headers()
         if tt_tag is not None:
             headers["X-TokenTrimmer-Tag"] = str(tt_tag)
         resp = self._http.post(url, json=body, headers=headers)
         resp.raise_for_status()
         return Run._from_payload(resp.json())
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._client.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _transcript_url(self, run_id: str) -> str:
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        return f"{self._base}/agent/runs/{quote(run_id, safe='')}/transcript"

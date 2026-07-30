@@ -5,6 +5,7 @@ pub mod account_purge;
 pub mod agent_run;
 pub(crate) mod agent_run_budget;
 pub(crate) mod agent_run_store;
+pub mod agent_run_transcript;
 pub mod batches;
 pub mod capabilities;
 pub mod chat;

@@ -192,6 +192,11 @@ pub fn build_router_with_retrieval(
         )
         .route("/v1/agent/runs/:id", get(routes::agent_run::get_run))
         .route(
+            "/v1/agent/runs/:id/transcript",
+            get(routes::agent_run_transcript::export_transcript)
+                .delete(routes::agent_run_transcript::delete_transcript),
+        )
+        .route(
             "/v1/agent/runs/:id/tool_outputs",
             post(routes::agent_run::submit_tool_outputs),
         )
@@ -620,6 +625,24 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["status"], "ready");
         assert_eq!(body["checks"]["postgres"], "not_configured");
+    }
+
+    #[tokio::test]
+    async fn transcript_routes_are_wired_and_require_tenant_auth() {
+        let run_id = "11111111-1111-1111-1111-111111111111";
+        for method in ["GET", "DELETE"] {
+            let response = app()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/v1/agent/runs/{run_id}/transcript"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[tokio::test]

@@ -712,7 +712,7 @@ pub(crate) struct StoredRun {
 }
 
 /// L1 key for a run record, scoped by org so a fetch with the wrong org misses.
-fn run_key(org_id: uuid::Uuid, run_id: uuid::Uuid) -> String {
+pub(crate) fn run_key(org_id: uuid::Uuid, run_id: uuid::Uuid) -> String {
     format!("tt:runs:{org_id}:{run_id}")
 }
 
@@ -1744,14 +1744,13 @@ pub struct ToolOutputsRequest {
 /// 1. Org from the resume request's auth (real key required; dogfood/absent →
 ///    401). The run is fetched scoped by this org, so a wrong-org caller misses.
 /// 2. L1/Redis store required, else 503 (without it the run was never persisted).
-/// 3. Run not found for (org, id) → 404.
-/// 4. Run not in `RequiresAction` → 409 (it is terminal or otherwise not
+/// 3. Single-flight on the run key prevents resume/delete races; a concurrent
+///    resume or transcript deletion loses the leader race → 409.
+/// 4. Run not found for (org, id) → 404.
+/// 5. Run not in `RequiresAction` → 409 (it is terminal or otherwise not
 ///    awaiting outputs).
-/// 5. Submitted `tool_call_id`s must EXACTLY cover the pending client tool_calls
+/// 6. Submitted `tool_call_id`s must EXACTLY cover the pending client tool_calls
 ///    (set equality) → 400 otherwise (lists the expected ids).
-/// 6. Single-flight on the run key: only one resume drives a run at a time; a
-///    concurrent resume loses the leader race → 409. The leader guard is held
-///    across the resume so a second request can't interleave.
 ///
 /// On resume the per-turn completer is rebuilt from the RESUME request's auth +
 /// headers (re-authenticated; org verified equal to `stored.org_id` in step 1)
@@ -1782,11 +1781,20 @@ pub async fn submit_tool_outputs(
         )
     })?;
 
-    // (3) Fetch scoped by (org, id); a wrong-org caller cleanly misses → 404.
+    // (3) Single-flight before the read: transcript deletion uses the same key,
+    // so no resume may read a record, lose the fence to a delete, and then
+    // resurrect the deleted transcript with a later write.
+    let sf_key = run_key(org, id);
+    let _guard = state
+        .single_flight
+        .try_become_leader(&sf_key)
+        .map_err(|_| ApiError::Conflict(format!("run {id} is already being resumed or deleted")))?;
+
+    // (4) Fetch scoped by (org, id); a wrong-org caller cleanly misses → 404.
     let mut stored = fetch_run(l1.cache.as_ref(), org, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no run with id {id}")))?;
-    // (4) Only a paused (`requires_action`) run accepts tool outputs.
+    // (5) Only a paused (`requires_action`) run accepts tool outputs.
     if stored.status != RunStatus::RequiresAction {
         return Err(ApiError::Conflict(format!(
             "run {id} is {:?}, not awaiting tool outputs",
@@ -1794,7 +1802,7 @@ pub async fn submit_tool_outputs(
         )));
     }
 
-    // (5) The submitted ids must EXACTLY cover the pending client tool_calls.
+    // (6) The submitted ids must EXACTLY cover the pending client tool_calls.
     let pending_ids: std::collections::HashSet<&str> = stored
         .pending_tool_calls
         .iter()
@@ -1810,15 +1818,6 @@ pub async fn submit_tool_outputs(
             "tool_outputs must cover exactly the pending tool_call ids {pending_ids:?}"
         )));
     }
-
-    // (6) Single-flight: only one resume drives a given run at a time. The guard
-    // is held across the resume so a concurrent caller (loser) is rejected for
-    // the run's whole resume rather than racing into a second loop.
-    let sf_key = run_key(org, id);
-    let _guard = state
-        .single_flight
-        .try_become_leader(&sf_key)
-        .map_err(|_| ApiError::Conflict(format!("run {id} is already being resumed")))?;
 
     // Append each submitted output as a Tool message answering its pending
     // client tool_call (gateway results were appended at pause, so every
