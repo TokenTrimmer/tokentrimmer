@@ -35,7 +35,7 @@ regexes = [
 paths = [
   # Signed receipt golden vectors intentionally publish Ed25519 *verifying*
   # keys. They are public test data, never signing/private key material.
-  '''docs/receipt-spec/(arr|wfr|vcr|l2)-v[0-9]+\.golden\.json''',
+  '''docs/receipt-spec/(arr|wfr|vcr|l2|ctdr)-v[0-9]+\.golden\.json''',
   # Deleted product-review doc; prose ("Argon2 keys") tripped generic-api-key.
   '''PROJECT_REVIEW\.md''',
   # The secret-detection rule's own source + fixtures legitimately contain
