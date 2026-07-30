@@ -2,7 +2,7 @@
 //! Carlo coverage check: with synthetic data whose true mean is known, the
 //! 95% CI must cover that mean in ~95% of trials (target band 93–97%).
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use tt_plan_core::bootstrap::bootstrap_ci;
 
@@ -10,8 +10,8 @@ use tt_plan_core::bootstrap::bootstrap_ci;
 /// depend on `rand_distr`.
 fn rand_normal(rng: &mut ChaCha8Rng, mean: f64, sd: f64) -> f64 {
     // Both u1 and u2 in (0, 1].
-    let u1: f64 = 1.0 - rng.gen::<f64>();
-    let u2: f64 = 1.0 - rng.gen::<f64>();
+    let u1: f64 = 1.0 - rng.random::<f64>();
+    let u2: f64 = 1.0 - rng.random::<f64>();
     let z = (-2.0_f64 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
     mean + sd * z
 }
@@ -23,7 +23,7 @@ fn rand_normal(rng: &mut ChaCha8Rng, mean: f64, sd: f64) -> f64 {
 /// bump that shifts the RNG value stream *globally* — both runs would shift
 /// together and still compare equal. This test instead pins
 /// `bootstrap_ci(seed → output)` to the EXACT values produced by the currently
-/// pinned RNG crates (`rand = =0.8.6`, `rand_chacha = =0.3.1`).
+/// pinned RNG crates (`rand = =0.10.1`, `rand_chacha = =0.10.0`).
 ///
 /// Because the bootstrap CI feeds the signed savings attestation, a change here
 /// is a determinism break: if a future `cargo update` (or an un-pinning of the
@@ -42,7 +42,7 @@ fn bootstrap_ci_value_stability_pin() {
     let samples: Vec<f64> = (0..10).map(|i| i as f64).collect();
     let (lo, hi) = bootstrap_ci(&samples, 42, 1000, (0.025, 0.975));
 
-    // EXACT expected values for (rand 0.8.6, rand_chacha 0.3.1). A rand-family
+    // EXACT expected values for (rand 0.10.1, rand_chacha 0.10.0). A rand-family
     // value-stream change shifts these and fails CI — that is the point.
     const EXPECTED_LO: f64 = 2.7;
     const EXPECTED_HI: f64 = 6.3;
@@ -50,7 +50,7 @@ fn bootstrap_ci_value_stability_pin() {
         (lo, hi),
         (EXPECTED_LO, EXPECTED_HI),
         "bootstrap_ci value stream drifted from the attested baseline \
-         (rand=0.8.6, rand_chacha=0.3.1). Do NOT blindly accept new values: a \
+         (rand=0.10.1, rand_chacha=0.10.0). Do NOT blindly accept new values: a \
          rand-family bump must first be made value-stream-independent or the \
          attested goldens deliberately regenerated. got=({lo}, {hi})"
     );
@@ -80,12 +80,12 @@ fn ci_coverage_monte_carlo() {
 
     let mut covered = 0_u32;
     for _trial in 0..n_trials {
-        let trial_seed: u64 = outer_rng.gen();
+        let trial_seed: u64 = outer_rng.random();
         let mut sample_rng = ChaCha8Rng::seed_from_u64(trial_seed);
         let samples: Vec<f64> = (0..n_samples_per_trial)
             .map(|_| rand_normal(&mut sample_rng, true_mean, sd))
             .collect();
-        let bootstrap_seed: u64 = outer_rng.gen();
+        let bootstrap_seed: u64 = outer_rng.random();
         let (lo, hi) = bootstrap_ci(&samples, bootstrap_seed, bootstrap_iters, (0.025, 0.975));
         if lo <= true_mean && true_mean <= hi {
             covered += 1;

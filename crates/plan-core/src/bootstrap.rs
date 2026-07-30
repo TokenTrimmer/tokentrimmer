@@ -4,7 +4,7 @@
 //! `StdRng` on most platforms; the explicit choice here is so we don't
 //! inherit a future `rand` default-change as a determinism break.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 /// Resample `samples` with replacement `iterations` times. For each
@@ -31,7 +31,7 @@ pub fn bootstrap_ci(
     for _ in 0..iterations {
         let mut sum = 0.0;
         for _ in 0..n {
-            let idx = rng.gen_range(0..n);
+            let idx = rng.random_range(0..n);
             sum += samples[idx];
         }
         means.push(sum / n_f);
