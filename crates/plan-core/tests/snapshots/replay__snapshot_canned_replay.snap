@@ -1,6 +1,6 @@
 ---
 source: crates/plan-core/tests/replay.rs
-assertion_line: 453
+assertion_line: 1182
 expression: result
 ---
 {
@@ -25,19 +25,19 @@ expression: result
   },
   "confidence_intervals": {
     "savings_usd_95": [
-      0.06541699999999998,
-      0.071555
+      0.06526849999999998,
+      0.07193450000000003
     ],
     "savings_pct_95": [
       91.66666666666666,
       91.66666666666667
     ],
     "cache_hit_rate_95": [
-      0.1,
+      0.12,
       0.32
     ],
     "p50_latency_ms_95": [
-      118.0,
+      119.0,
       133.0
     ],
     "p95_latency_ms_95": [

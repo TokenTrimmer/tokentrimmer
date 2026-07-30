@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
@@ -366,7 +366,7 @@ pub fn stratified_sample(requests: &[RequestLog], n: u32, seed: u64) -> Vec<Uuid
         // uniform without-replacement draw.
         let mut idx: Vec<usize> = (0..stratum.len()).collect();
         for i in (1..idx.len()).rev() {
-            let j = rng.gen_range(0..=i);
+            let j = rng.random_range(0..=i);
             idx.swap(i, j);
         }
         for i in idx.into_iter().take(alloc) {

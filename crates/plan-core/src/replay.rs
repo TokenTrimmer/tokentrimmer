@@ -645,7 +645,7 @@ fn compute_cis(p: &Projection, seed: u64, iterations: u32) -> ConfidenceInterval
 /// replacement, compute the requested percentile on the resample, collect.
 /// Return the 2.5/97.5 percentiles of those resampled-percentile values.
 fn bootstrap_percentile_ci(values: &[f64], q: f64, seed: u64, iterations: u32) -> (f64, f64) {
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     if values.is_empty() || iterations == 0 {
         return (0.0, 0.0);
@@ -657,7 +657,7 @@ fn bootstrap_percentile_ci(values: &[f64], q: f64, seed: u64, iterations: u32) -
     for _ in 0..iterations {
         buf.clear();
         for _ in 0..n {
-            buf.push(values[rng.gen_range(0..n)]);
+            buf.push(values[rng.random_range(0..n)]);
         }
         samples.push(percentile(&buf, q));
     }
@@ -989,7 +989,7 @@ fn bootstrap_pct_savings_ci(
     seed: u64,
     iterations: u32,
 ) -> (f64, f64) {
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -1003,11 +1003,11 @@ fn bootstrap_pct_savings_ci(
         let mut b_sum = 0.0;
         let mut p_sum = 0.0;
         for _ in 0..n {
-            let idx = rng.gen_range(0..n);
+            let idx = rng.random_range(0..n);
             b_sum += baseline[idx];
             p_sum += projected[idx];
         }
-        let pct = if b_sum > 0.0 {
+        let pct: f64 = if b_sum > 0.0 {
             (b_sum - p_sum) / b_sum * 100.0
         } else {
             0.0
