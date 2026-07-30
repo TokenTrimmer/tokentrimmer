@@ -115,8 +115,13 @@
     {
       "path": "docs/workflow-contract/workflow-write.schema.json",
       "sha256": "411dd9deae0591ff7b80d48cefb875e7208e01ec594a368402d3ba79f8c8016e"
+    },
+    {
+      "path": "sdk-typescript/src/product-contracts.generated.ts",
+      "sha256": "82a98f44f254ffb8c594ffede616f145b784b494350143cbea41c4fe8e6f49fa"
     }
   ],
   "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, and request-preflight response types",
-  "typescript": "bindings/product-contracts.generated.ts"
+  "typescript": "bindings/product-contracts.generated.ts",
+  "typescript_sdk": "sdk-typescript/src/product-contracts.generated.ts"
 }
