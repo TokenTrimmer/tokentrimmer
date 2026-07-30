@@ -11,6 +11,8 @@ with three additions:
 3. ``.tt`` metadata accessor on responses surfaces the
    ``X-TokenTrimmer-*`` headers (cost, baseline_cost, saved, cache, provider,
    model_used, trace_id) without parsing them manually.
+4. ``client.gateway`` provides bounded typed model-catalog, capability, and
+   request-preflight operations.
 
 Usage::
 
@@ -35,6 +37,19 @@ from typing import TYPE_CHECKING, Any
 from tokentrimmer import semconv
 from tokentrimmer.agent import Agent, AgentOutcome, Run, RunUsage
 from tokentrimmer.client import StreamCost, TokenTrimmer, TokenTrimmerMeta
+from tokentrimmer.gateway_metadata import (
+    GatewayCapabilitiesDocument,
+    GatewayMetadata,
+    GatewayMetadataError,
+    ModelEntry,
+    ModelPricing,
+    ModelsResponse,
+    PreflightCostEvidence,
+    RequestPreflightBatchRequest,
+    RequestPreflightBatchResponse,
+    RequestPreflightRequest,
+    RequestPreflightResponse,
+)
 # D3: client-side document distillation. The module imports cleanly without the
 # `doc-distill` extra (pypdf is imported lazily inside `distill_document`), so
 # eager import is safe — `import tokentrimmer` still works with no extras.
@@ -61,6 +76,17 @@ __all__ = [
     "AgentOutcome",
     "Run",
     "RunUsage",
+    "GatewayMetadata",
+    "GatewayMetadataError",
+    "ModelsResponse",
+    "ModelEntry",
+    "ModelPricing",
+    "GatewayCapabilitiesDocument",
+    "PreflightCostEvidence",
+    "RequestPreflightBatchRequest",
+    "RequestPreflightBatchResponse",
+    "RequestPreflightRequest",
+    "RequestPreflightResponse",
     "semconv",
     # D3: client-side document distillation (PDF text layers). The distill helpers
     # require the `doc-distill` extra (pypdf) at call time; `user_with_document_raw`
