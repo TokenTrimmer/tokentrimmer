@@ -10,12 +10,14 @@ use std::time::Duration;
 use anyhow::{bail, Context as _};
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::{header, redirect::Policy, Client, Response, StatusCode, Url};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
+use tt_shared::{
+    AccessEvidence, CapabilityReason, EnabledEvidence, GatewayCapabilitiesDocument, NumericLimit,
+    SchemaVersions, TierEvidence, UnknownEvidence, CAPABILITIES_SCHEMA_VERSION,
+};
 
 use crate::context::ResolvedContext;
 
-const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REASON_CODE_BYTES: usize = 96;
@@ -92,94 +94,6 @@ pub struct UnknownFact {
     pub state: &'static str,
     pub source: &'static str,
     pub reason_code: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawDocument {
-    schema_version: u32,
-    scope: String,
-    snapshot_scope: String,
-    generated_at: String,
-    features: RawFeatures,
-    provider_credentials: RawUnknownFact,
-    provider_health: RawUnknownFact,
-    model_support: RawUnknownFact,
-    modality_support: RawUnknownFact,
-    schema_versions: RawSchemaVersions,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawFeatures {
-    fusion: RawFusion,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawFusion {
-    enabled: RawEnabledFact,
-    access: RawAccessFact,
-    current_tier: RawTierFact,
-    minimum_tier: RawTierFact,
-    limits: RawFusionLimits,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawEnabledFact {
-    state: String,
-    source: String,
-    reason: RawReason,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawAccessFact {
-    state: String,
-    reason: RawReason,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawTierFact {
-    state: String,
-    value: String,
-    source: String,
-    reason: RawReason,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawFusionLimits {
-    member_models_max: RawMemberModelsMax,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawMemberModelsMax {
-    value: u64,
-    enforcement: String,
-    reason: RawReason,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawUnknownFact {
-    state: String,
-    source: String,
-    reason: RawReason,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSchemaVersions {
-    capabilities_document: RawSchemaVersionFact,
-    fusion_request: RawSchemaVersionFact,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSchemaVersionFact {
-    state: String,
-    version: Value,
-    source: String,
-    reason: RawReason,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawReason {
-    code: String,
-    message: String,
 }
 
 /// Run `tt capabilities`.
@@ -346,7 +260,7 @@ async fn read_bounded_body(mut response: Response) -> anyhow::Result<Vec<u8>> {
 /// Unknown enums, scopes, versions, readiness claims, and contradictions fail
 /// closed rather than being interpreted as a favorable capability state.
 pub fn parse_snapshot(body: &[u8]) -> anyhow::Result<CapabilitySnapshot> {
-    let document: RawDocument =
+    let document: GatewayCapabilitiesDocument =
         serde_json::from_slice(body).context("parse gateway capabilities document")?;
     if document.schema_version != CAPABILITIES_SCHEMA_VERSION
         || document.scope != "gateway_runtime"
@@ -421,12 +335,12 @@ fn parse_canonical_timestamp(value: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
-fn validate_schema_versions(raw: RawSchemaVersions) -> anyhow::Result<()> {
+fn validate_schema_versions(raw: SchemaVersions) -> anyhow::Result<()> {
     if raw.capabilities_document.state != "known"
-        || raw.capabilities_document.version.as_u64() != Some(CAPABILITIES_SCHEMA_VERSION as u64)
+        || raw.capabilities_document.version != Some(CAPABILITIES_SCHEMA_VERSION)
         || raw.capabilities_document.source != "gateway_runtime"
         || raw.fusion_request.state != "unversioned"
-        || raw.fusion_request.version != Value::Null
+        || raw.fusion_request.version.is_some()
         || raw.fusion_request.source != "gateway_runtime"
     {
         bail!("gateway capabilities document has incompatible schema-version evidence")
@@ -436,7 +350,7 @@ fn validate_schema_versions(raw: RawSchemaVersions) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_kill_switch(raw: RawEnabledFact) -> anyhow::Result<(KillSwitchState, String)> {
+fn parse_kill_switch(raw: EnabledEvidence) -> anyhow::Result<(KillSwitchState, String)> {
     if raw.source != "gateway_runtime" {
         bail!("gateway capabilities document has an invalid Fusion switch source")
     }
@@ -448,7 +362,7 @@ fn parse_kill_switch(raw: RawEnabledFact) -> anyhow::Result<(KillSwitchState, St
     }
 }
 
-fn parse_access(raw: RawAccessFact) -> anyhow::Result<(FusionAccess, String)> {
+fn parse_access(raw: AccessEvidence) -> anyhow::Result<(FusionAccess, String)> {
     let reason_code = validate_reason(raw.reason)?;
     match raw.state.as_str() {
         "available" => Ok((FusionAccess::Available, reason_code)),
@@ -457,7 +371,7 @@ fn parse_access(raw: RawAccessFact) -> anyhow::Result<(FusionAccess, String)> {
     }
 }
 
-fn parse_tier_fact(raw: RawTierFact, allowed_sources: &[TierSource]) -> anyhow::Result<TierFact> {
+fn parse_tier_fact(raw: TierEvidence, allowed_sources: &[TierSource]) -> anyhow::Result<TierFact> {
     if raw.state != "known" {
         bail!("gateway capabilities document has an unknown tier state")
     }
@@ -493,14 +407,17 @@ fn parse_tier_source(value: &str) -> anyhow::Result<TierSource> {
     }
 }
 
-fn parse_member_models_max(raw: RawMemberModelsMax) -> anyhow::Result<(u64, String)> {
+fn parse_member_models_max(raw: NumericLimit) -> anyhow::Result<(u64, String)> {
     if raw.enforcement != "gateway_runtime" || raw.value == 0 {
         bail!("gateway capabilities document has an unsupported Fusion member-model cap")
     }
-    Ok((raw.value, validate_reason(raw.reason)?))
+    Ok((
+        u64::try_from(raw.value).context("convert Fusion member-model cap")?,
+        validate_reason(raw.reason)?,
+    ))
 }
 
-fn parse_unknown_fact(raw: RawUnknownFact) -> anyhow::Result<UnknownFact> {
+fn parse_unknown_fact(raw: UnknownEvidence) -> anyhow::Result<UnknownFact> {
     if raw.state != "unknown" || raw.source != "not_negotiated" {
         bail!("gateway capabilities document made an unsupported provider or model readiness claim")
     }
@@ -511,7 +428,7 @@ fn parse_unknown_fact(raw: RawUnknownFact) -> anyhow::Result<UnknownFact> {
     })
 }
 
-fn validate_reason(raw: RawReason) -> anyhow::Result<String> {
+fn validate_reason(raw: CapabilityReason) -> anyhow::Result<String> {
     if !is_bounded_text(&raw.code, MAX_REASON_CODE_BYTES)
         || !is_bounded_text(&raw.message, MAX_REASON_MESSAGE_BYTES)
         || !raw.code.bytes().all(|byte| {
@@ -582,7 +499,7 @@ fn tier_source_name(source: TierSource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
