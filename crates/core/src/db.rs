@@ -148,7 +148,6 @@ pub async fn verify_migration_ledger(pool: &PgPool) -> anyhow::Result<()> {
 /// deploy pipeline. `database_url` MUST be Neon's direct (non-pooled) endpoint
 /// — the migrator needs session-mode advisory locks.
 pub async fn migrate_only(database_url: &str) -> anyhow::Result<()> {
-    use anyhow::Context as _;
     let pool = crate::connect(database_url, 2)
         .await
         .context("migrate-only: connect failed")?;

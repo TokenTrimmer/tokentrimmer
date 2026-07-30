@@ -14,8 +14,8 @@
 //! * `GET /v1/batches/{id}` — read the org's row (best-effort on-demand provider
 //!   refresh) → return the `Batch`.
 //! * `POST /v1/batches/{id}/cancel` — `cancel_batch` + update the row.
-//! * `GET /v1/files/{id}/content` — proxy `download_file_content` (result /
-//!   error JSONL bytes).
+//! * `GET /v1/files/{id}/content` — authorize against the org's durable batch
+//!   rows, then stream the provider-held result/error JSONL bytes.
 //!
 //! Org-scoping: the org is taken from the authenticated `tt_live_*` key's
 //! [`ApiKeyContext`] (never caller-supplied). Every row write + read filters on

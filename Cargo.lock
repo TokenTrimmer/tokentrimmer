@@ -6622,7 +6622,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "tt-provider-openai",
+ "tt-provider-compat",
  "tt-shared",
  "uuid",
 ]

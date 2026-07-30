@@ -481,6 +481,9 @@ mod tests {
         assert!(store.get(org_a, "batch_abc123").await.unwrap().is_some());
         // org_b does NOT (cross-org isolation).
         assert!(store.get(org_b, "batch_abc123").await.unwrap().is_none());
+        assert!(store.owns_file(org_a, "file-in").await.unwrap());
+        assert!(!store.owns_file(org_b, "file-in").await.unwrap());
+        assert!(!store.owns_file(org_a, "file-unknown").await.unwrap());
 
         // An update under org_b must not touch org_a's row.
         let mut hijack = job.clone();

@@ -4130,13 +4130,11 @@ pub(crate) async fn prepare(
     // force BOTH lookup and insert off for this request. Resolved via the tier
     // resolver so it rides the same per-org `CachedTierResolver` cache the auth
     // middleware already populated earlier in this request (cache hit within the
-    // 30s TTL → no extra DB round-trip on the hot path). Fail-soft: on any
-    // resolver error `resolve_or_free` yields Free defaults with
-    // `semantic_cache_disabled = false`, so a DB blip never disables caching for
-    // a non-opted-out org. Per the documented compliance tradeoff (see
-    // `PostgresTierResolver::fetch_semantic_cache_disabled`), a transient blip
-    // can conversely re-enable caching for an opted-out org — accepted to match
-    // the gateway-wide fail-open precedent. Zero behaviour change when unset.
+    // 30s TTL → no extra DB round-trip on the hot path). The request remains
+    // available on resolver errors, but `resolve_or_free` yields
+    // `semantic_cache_disabled = true`: an unknown privacy value fails closed
+    // for caching and can never silently re-enable storage for an opted-out
+    // org. A successful absent/false read preserves existing cache behaviour.
     if let Some(resolver) = state.tier_resolver.as_ref() {
         let org_cache_disabled = crate::tier_resolver::resolve_or_free(resolver.as_ref(), org_id)
             .await
@@ -10188,6 +10186,23 @@ mod tier_ttl_tests {
         assert_eq!(
             effective_ttl_secs(Some(override_secs), None, SECS_24H),
             override_secs
+        );
+    }
+
+    #[test]
+    fn ttl_is_bounded_to_the_account_purge_fence_window() {
+        assert_eq!(
+            effective_ttl_secs(Some(0), None, SECS_24H),
+            1,
+            "zero-length overrides still need a valid Redis TTL"
+        );
+        assert_eq!(
+            effective_ttl_secs(Some(u64::MAX), None, SECS_24H),
+            crate::state::MAX_L1_TTL_SECS
+        );
+        assert_eq!(
+            effective_ttl_secs(None, None, u64::MAX),
+            crate::state::MAX_L1_TTL_SECS
         );
     }
 }

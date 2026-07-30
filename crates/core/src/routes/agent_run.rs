@@ -1744,14 +1744,13 @@ pub struct ToolOutputsRequest {
 /// 1. Org from the resume request's auth (real key required; dogfood/absent →
 ///    401). The run is fetched scoped by this org, so a wrong-org caller misses.
 /// 2. L1/Redis store required, else 503 (without it the run was never persisted).
-/// 3. Run not found for (org, id) → 404.
-/// 4. Run not in `RequiresAction` → 409 (it is terminal or otherwise not
+/// 3. Single-flight on the run key prevents resume/delete races; a concurrent
+///    resume or transcript deletion loses the leader race → 409.
+/// 4. Run not found for (org, id) → 404.
+/// 5. Run not in `RequiresAction` → 409 (it is terminal or otherwise not
 ///    awaiting outputs).
-/// 5. Submitted `tool_call_id`s must EXACTLY cover the pending client tool_calls
+/// 6. Submitted `tool_call_id`s must EXACTLY cover the pending client tool_calls
 ///    (set equality) → 400 otherwise (lists the expected ids).
-/// 6. Single-flight on the run key: only one resume drives a run at a time; a
-///    concurrent resume loses the leader race → 409. The leader guard is held
-///    across the resume so a second request can't interleave.
 ///
 /// On resume the per-turn completer is rebuilt from the RESUME request's auth +
 /// headers (re-authenticated; org verified equal to `stored.org_id` in step 1)
