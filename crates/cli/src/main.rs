@@ -233,7 +233,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<McpAction>,
     },
-    /// Log in: opens the dashboard to create an API key (paste it back), or pass --token <KEY>.
+    /// Store a key locally: open the dashboard and paste one, or pass --token <KEY>.
     Login {
         /// The tt_live_/tt_test_ key. Use `-` to read it from stdin.
         #[arg(long)]
@@ -248,9 +248,9 @@ enum Command {
     /// Remove the locally stored API key (does not revoke it server-side).
     Logout,
     /// Show the resolved API key (masked), its source, and the gateway base URL.
-    /// Use `--check` to do an authenticated round-trip (verifies the key works end-to-end).
+    /// Local state is unverified unless `--check` succeeds for a live key.
     Whoami {
-        /// Do an authenticated round-trip (GET /v1/models) to verify the key works.
+        /// Verify a tt_live_* key with authenticated GET /v1/capabilities.
         #[arg(long)]
         check: bool,
     },

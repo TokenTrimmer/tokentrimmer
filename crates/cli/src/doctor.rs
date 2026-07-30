@@ -1,7 +1,7 @@
 //! `tt doctor` — self-diagnosis. Runs the probes a support ticket would, and
 //! prints the exact fix per failure:
 //!   1. base-URL reachability — DNS/parse + `GET /health` (liveness).
-//!   2. key validity — one authenticated round-trip (`GET /v1/models`).
+//!   2. live-key validity — authenticated `GET /v1/capabilities`.
 //!   3. gateway-vs-CLI version — the /health `version` + `git_sha` vs this CLI.
 //!   4. MCP config health — whether an installed client's config points at the
 //!      gateway.
@@ -14,16 +14,13 @@
 //! a blocker. Unconfigured (no key) → the key-validity check is skipped with a
 //! clear "run `tt login`" hint, not a failure.
 
-use std::time::Duration;
-
 use anyhow::Context;
 
-use crate::context;
 use crate::mcp_install::{config_path_for, McpClient};
 use crate::ui;
+use crate::{capabilities, context};
 
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(8);
-const AUTHED_TIMEOUT: Duration = Duration::from_secs(12);
+const HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// The entry point for `tt doctor`.
 ///
@@ -58,7 +55,6 @@ pub async fn run() -> anyhow::Result<()> {
 
     // ── 1. base-URL parse + DNS ─────────────────────────────────────────────
     let health_url = format!("{}/health", base.trim_end_matches('/'));
-    let models_url = format!("{}/v1/models", base.trim_end_matches('/'));
     let dns_ok = match reqwest::Url::parse(&health_url) {
         Ok(u) => {
             let host = u.host_str().unwrap_or("(no host)");
@@ -117,27 +113,26 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // ── 4. key validity (one authenticated round-trip) ─────────────────────
+    // ── 4. live-key validity (one authenticated round-trip) ────────────────
     match ctx.as_ref().ok().and_then(|c| c.api_key.as_ref()) {
-        Some(k) => match probe_authed(&models_url, k.expose(), AUTHED_TIMEOUT).await {
-            Ok(status) => {
-                if (200..300).contains(&status) {
-                    ui::ok(&format!(
-                        "key:     GET /v1/models → {status} (authenticated OK)"
-                    ));
-                } else if status == 401 || status == 403 {
-                    ui::error(&format!(
-                        "key:     GET /v1/models → {status} (rejected — key invalid or revoked)"
-                    ));
-                    ui::note("  fix: re-issue the key in the dashboard and `tt login --token <new-key>`.");
-                    failures += 1;
-                } else {
-                    ui::error(&format!("key:     GET /v1/models → {status} (unexpected)"));
-                    failures += 1;
-                }
+        Some(k) if k.expose().starts_with("tt_test_") => {
+            ui::note(
+                "key:     sandbox token format accepted locally; tt_test_* tokens have no \
+                 server-side identity to verify",
+            );
+        }
+        Some(k) => match capabilities::fetch_capabilities(&base, k.expose()).await {
+            Ok(_) => {
+                ui::ok("key:     GET /v1/capabilities → authenticated OK");
             }
             Err(e) => {
-                ui::error(&format!("key:     authenticated round-trip failed: {e}"));
+                ui::error(&format!(
+                    "key:     GET /v1/capabilities verification failed: {e}"
+                ));
+                ui::note(
+                    "  fix: confirm the gateway supports /v1/capabilities; otherwise re-issue",
+                );
+                ui::note("       the key and run `tt login --token <new-key>`.");
                 failures += 1;
             }
         },
@@ -192,20 +187,6 @@ async fn probe_health(url: &str) -> anyhow::Result<(String, String, String)> {
         .await
         .context("decode /health JSON")?;
     Ok((body.status, body.version, body.git_sha))
-}
-
-async fn probe_authed(url: &str, key: &str, timeout: Duration) -> anyhow::Result<u16> {
-    Ok(reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .context("build HTTP client")?
-        .get(url)
-        .bearer_auth(key)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?
-        .status()
-        .as_u16())
 }
 
 /// Check whether any installed MCP client config points at the gateway
