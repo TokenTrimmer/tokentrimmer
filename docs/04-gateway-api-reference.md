@@ -780,10 +780,17 @@ itself, and a paused route suppresses both actions (§10.7).
 ### 6.3 Cache control semantics
 
 `X-TokenTrimmer-Cache` values:
+
 - `bypass` — skip the cache lookup, but still write/refresh the result (forces a fresh upstream call, then repopulates the cache)
 - `force-write` — write to cache even for normally-ineligible requests (e.g. `temperature` > 0, `n` > 1, `seed` set). Tool-call responses are still never cached. USE WITH CAUTION; can poison the shared cache.
 - `read-only` — look up cache but never write
 - `disabled` — neither read nor write cache for this request
+
+An organization's `semantic_cache_disabled` compliance setting has final
+precedence over request-body controls, this header, and route actions: it
+disables both L1 and L2 lookup/write. If the gateway cannot resolve that privacy
+setting, it continues serving the request with Free enforcement limits but
+keeps caching disabled until the setting can be read successfully.
 
 ---
 

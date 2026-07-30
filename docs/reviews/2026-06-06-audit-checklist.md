@@ -4,7 +4,7 @@
 
 **Totals (original):** 82 findings — 4 high · 33 medium · 45 low. By focus: 9 security · 5 backlog · 2 UX. Across 13 areas.
 
-**Current checkbox rollup (reconciled 2026-07-29):** 80 closed · 13 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
+**Current checkbox rollup (reconciled 2026-07-29):** 81 closed · 12 remaining (93 total). A checked item is either implemented or closed by a documented, verified decision such as accepted risk; an unchecked item still requires code or external operations even when its state is partial, deferred, or blocked.
 
 ## 🚩 Priority queue (high-severity + security) — 11
 
@@ -210,10 +210,11 @@ _The caching layer is in strong shape and shows clear evidence of prior security
   - Issue: L2 lookup filters on `&req.model` (the post-routing requested model) while L2 insert stores `model_used = response.model` (the model the provider actually served). For the normal path these match. But on cross-model failover (chat.rs:1570 notes served_model can differ from req.model), the response is stored under the fallback model and a later request for the originally-requested model never recalls it. This is safe for isolation/correctness (no wrong-model hit) but means failover-served responses don't build the cache for their nominal model — a recall/efficiency gap, not a bug.
   - Action: Optionally also index/lookup under the requested model alias, or document that failover responses are cached only under the model that served them. Low priority; current behavior errs on the safe side.
 
-- [ ] ⚪ **[backlog/low] Per-org semantic-cache opt-out (ADR-017) still unimplemented** — **🔴 OPEN**
-  - Where: .claude/BACKLOG.md:78 (rv-l2-org-cache-optout); crates/core/src/tier_resolver.rs; crates/core/src/routes/chat.rs (CacheBehavior::resolve ~407)
-  - Issue: Open backlog item: a per-org `semantic_cache_disabled` flag that forces `cache_behavior.do_lookup=do_insert=false` for sensitive orgs, implementing the ADR-017 control. Until shipped, an org that does not want its prompts/responses stored in the shared (org-scoped but cross-user) L2 store has no toggle short of disabling caching globally. Relevant to privacy-sensitive tenants.
-  - Action: Resolve the flag alongside tier in tier_resolver and short-circuit CacheBehavior::resolve to no-lookup/no-insert when set. The plumbing (CacheBehavior, tier resolution) already exists, so this is a small addition.
+- [x] ⚪ **[backlog/low] Per-org semantic-cache opt-out (ADR-017) was unimplemented** — **✅ DONE (implementation #267; fail-closed hardening re-verified 2026-07-29).**
+  - Where: crates/core/src/tier_resolver.rs; crates/core/src/routes/chat.rs; docs/04-gateway-api-reference.md §6.3; .claude/DECISIONS.md ADR-017
+  - Resolution: `orgs.semantic_cache_disabled` rides the cached tier resolution and has final precedence over request-body controls, cache headers, and route actions. An opted-out org performs neither L1/L2 lookup nor insertion.
+  - Failure posture: A missing/unreadable compliance value keeps the request available with Free enforcement limits but fails closed for caching, so a database blip cannot silently re-enable storage for an opted-out org.
+  - Evidence: Resolver fallback/cache tests and `CacheBehavior` tests cover enabled, disabled, idempotent, cached, and error states.
 
 ### `pub-providers-a`
 
@@ -574,10 +575,10 @@ _The backlog discipline is genuinely strong: the V0–V7 roadmap and the F1–F1
   - Where: .claude/BACKLOG.md (`gw-gdpr-delete-export`); crates/core/src/routes/account_purge.rs; crates/core/src/gateway_purge_auth.rs; crates/cache/src/{lib,memory,redis_impl}.rs; crates/core/src/routes/agent_run_transcript.rs
   - Delivered foundation: The backlog now tracks the full flow. The public gateway has a signed, idempotent, organization-scoped cache-purge primitive with a write fence, plus tenant-scoped Agent transcript export and erasure that preserve durable billing/audit metadata.
   - Remaining: There is still no single self-serve workflow coordinating Cloud identity/subscription teardown, all persisted public and private data stores, a complete organization export, and documented retention windows.
-  - Action: Build the Cloud-owned orchestration on top of the public deletion/export primitives and the cross-repository data inventory; keep the L2 opt-out as a separate privacy control.
+  - Action: Build the Cloud-owned orchestration on top of the public deletion/export primitives and the cross-repository data inventory. The separate L2 opt-out privacy control is now shipped.
 
 - [ ] ⚪ **[backlog/low] Automatic/Anthropic Batch dispatch remains incomplete** — **🟡 PARTIAL (re-verified 2026-07-29).**
   - Where: crates/core/src/routes/batches.rs; crates/core/src/batch_store.rs; crates/providers/openai/src/batch.rs; crates/client/src/batch.rs; crates/cli/src/batch.rs; docs/04-gateway-api-reference.md
   - Delivered foundation: An authenticated, durable, organization-scoped OpenAI Batch Lane now exposes file upload/download and batch create/list/get/cancel through the gateway, Rust client, and CLI. File downloads require exact local ownership before provider I/O and stream successful JSONL content.
   - Remaining: The advisory `then.batch` action does not convert synchronous requests into jobs, and Anthropic Message Batches are not implemented. The manual OpenAI lane therefore does not complete the original automatic multi-provider backlog item.
-  - Action: Specify automatic admission/submission/reconciliation separately, then add an Anthropic batch adapter behind a provider-neutral Batch Lane contract. Per-org semantic-cache opt-out remains tracked by its dedicated checklist item above.
+  - Action: Specify automatic admission/submission/reconciliation separately, then add an Anthropic batch adapter behind a provider-neutral Batch Lane contract.
