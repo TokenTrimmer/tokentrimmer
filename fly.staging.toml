@@ -36,7 +36,9 @@ primary_region = "iad"
     timeout      = "5s"
     grace_period = "10s"
     method       = "GET"
-    path         = "/health"
+    # A resumed machine stays out of rotation until its configured database
+    # has also woken and answered the readiness probe.
+    path         = "/ready"
 
 [[vm]]
   size   = "shared-cpu-1x"
