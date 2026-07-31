@@ -44,7 +44,9 @@ primary_region = "iad"
     timeout      = "5s"
     grace_period = "10s"
     method       = "GET"
-    path         = "/health"
+    # Route traffic only after configured hard dependencies are reachable.
+    # /health remains the process-liveness endpoint for diagnostics.
+    path         = "/ready"
 
 [[vm]]
   size   = "shared-cpu-2x"

@@ -19,6 +19,7 @@ This file is the human-curated counterpart to `.claude/INDEX.md` (auto-generated
 | If you're doing | Read | Why |
 |---|---|---|
 | Adding a route or middleware | `crates/core/src/server.rs`, `crates/core/src/routes/` | Router composition + per-endpoint handlers. |
+| Fly gateway traffic readiness | `fly.toml`, `fly.staging.toml`, `crates/core/src/routes/{health,ready}.rs`, `crates/core/src/state.rs` | Fly routes on `/ready`; `/health` is liveness-only, while configured Postgres is the hard readiness dependency. |
 | Defining a new wire type | `crates/shared/src/messages.rs` | Canonical OpenAI-format types — adapters translate to/from this. |
 | Adding a Provider | `crates/shared/src/provider.rs`, `docs/02-provider-adapter-guide.md`, `crates/providers/anthropic/` (when populated) | Trait contract + worked example. |
 | Provider error mapping | `crates/shared/src/error.rs`, `crates/core/src/error.rs` | `ProviderError` is the adapter contract; `ApiError` is the HTTP shape. |
