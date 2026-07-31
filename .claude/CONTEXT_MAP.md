@@ -171,6 +171,7 @@ Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 - **Workspace**: `Cargo.toml` (20 crates including `crates/providers/*`)
 - **License allowlist**: `deny.toml`
 - **CI workflows**: `.github/workflows/{ci,inspect-self,plan-self,bindings-drift,provider-contract-tests,token-budget-telemetry}.yml`
+- **GitHub Actions provenance policy**: `.github/scripts/workflow-security-policy.{mjs,test.mjs}` enforces immutable action SHAs and OCI digests in source; the repository's `sha_pinning_required` setting independently enforces full-length action SHAs on GitHub.
 - **Local CI mirror**: `make ci` → `scripts/ci-local.sh`
 
 ### Conventions
