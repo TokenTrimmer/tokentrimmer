@@ -223,7 +223,9 @@ pub fn build_router_with_retrieval(
         // cap. Same auth seam; backs the MCP `set_cost_limit` tool.
         .route("/v1/spend/limit", post(routes::spend_api::set_spend_limit))
         // Batch Lane (slice 2): OpenAI-compatible submit/status + file proxy.
-        // Non-streaming, so the short timeout tier. The slice-3 worker owns
+        // Control handlers establish their responses on the short timeout
+        // tier; file content then streams through the response body without
+        // gateway/provider/client accumulation. The slice-3 worker owns
         // long-running polling; these handlers only proxy + persist.
         .route("/v1/files", post(routes::batches::upload_file))
         .route(

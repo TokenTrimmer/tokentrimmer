@@ -9,9 +9,13 @@
 //! objects; [`Batch`] is a partial typed view of that shape (`#[serde(default)]`
 //! on every optional, so a sparse gateway response still deserializes).
 
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{Client, Error, Result};
+
+const BATCH_ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// Per-request progress counters for a batch (mirrors the gateway's
 /// `request_counts` object).
@@ -78,10 +82,21 @@ async fn batch_ok(resp: reqwest::Response) -> Result<reqwest::Response> {
     let cost = crate::parse_cost(resp.headers());
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let mut body = BytesMut::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else {
+                break;
+            };
+            let remaining = BATCH_ERROR_BODY_MAX_BYTES.saturating_sub(body.len());
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if remaining <= chunk.len() {
+                break;
+            }
+        }
         return Err(Error::Status {
             status: status.as_u16(),
-            body,
+            body: String::from_utf8_lossy(&body).into_owned(),
             cost: Box::new(cost),
         });
     }
@@ -197,12 +212,15 @@ impl Client {
         resp.json::<Batch>().await.map_err(Error::Decode)
     }
 
-    /// Download a file's raw bytes (`GET /v1/files/{id}/content`) — the
+    /// Stream a file's raw bytes (`GET /v1/files/{id}/content`) — the
     /// result/error JSONL for a completed batch.
     ///
     /// # Errors
     /// [`Error::Request`] / [`Error::Status`] / [`Error::Decode`].
-    pub async fn download_file_content(&self, file_id: &str) -> Result<bytes::Bytes> {
+    pub async fn stream_file_content(
+        &self,
+        file_id: &str,
+    ) -> Result<impl futures::Stream<Item = Result<Bytes>> + Send + 'static> {
         let resp = self
             .http
             .get(format!("{}/v1/files/{file_id}/content", self.base))
@@ -211,7 +229,26 @@ impl Client {
             .await
             .map_err(Error::Request)?;
         let resp = batch_ok(resp).await?;
-        resp.bytes().await.map_err(Error::Decode)
+        Ok(resp
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(Error::Decode)))
+    }
+
+    /// Download a file into one byte buffer.
+    ///
+    /// This compatibility helper collects [`Self::stream_file_content`].
+    /// Large-file consumers should use the streaming method directly.
+    ///
+    /// # Errors
+    /// [`Error::Request`] / [`Error::Status`] / [`Error::Decode`].
+    pub async fn download_file_content(&self, file_id: &str) -> Result<Bytes> {
+        let stream = self.stream_file_content(file_id).await?;
+        futures::pin_mut!(stream);
+        let mut body = BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk?);
+        }
+        Ok(body.freeze())
     }
 }
 
@@ -355,6 +392,28 @@ mod tests {
         let client = Client::new(server.base_url(), "k");
         let bytes = client.download_file_content("file-out").await.unwrap();
         assert_eq!(&bytes[..], b"{\"id\":\"req-1\"}\n");
+    }
+
+    #[tokio::test]
+    async fn file_content_error_body_is_bounded() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/files/file-out/content");
+            then.status(502)
+                .body("x".repeat(BATCH_ERROR_BODY_MAX_BYTES + 1));
+        });
+        let client = Client::new(server.base_url(), "k");
+        let err = match client.stream_file_content("file-out").await {
+            Err(err) => err,
+            Ok(_) => panic!("expected a status error"),
+        };
+        match err {
+            Error::Status { status, body, .. } => {
+                assert_eq!(status, 502);
+                assert_eq!(body.len(), BATCH_ERROR_BODY_MAX_BYTES);
+            }
+            other => panic!("expected bounded status error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

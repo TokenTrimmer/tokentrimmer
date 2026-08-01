@@ -83,7 +83,7 @@
       "post": { "summary": "Upload a file (Batch Lane)", "responses": { "200": { "description": "The file id." } } }
     },
     "/v1/files/{id}/content": {
-      "get": { "summary": "Download file content", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ], "responses": { "200": { "description": "The file content." } } }
+      "get": { "summary": "Stream provider-held Batch Lane file content", "description": "Requires the exact file id on one of the authenticated organization's retained Batch rows before upstream I/O, then streams the successful provider response without accumulating it. Availability also depends on the provider still retaining the file and the organization retaining both a live gateway key and the matching upstream credential; this is not a retention guarantee.", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ], "responses": { "200": { "description": "The streamed JSONL file content." }, "401": { "description": "A verified tenant key is required." }, "404": { "description": "The file id is not present on this organization's retained Batch rows." }, "503": { "description": "Batch storage or OpenAI is not configured." } } }
     },
     "/v1/batches": {
       "post": { "summary": "Create a batch", "responses": { "200": { "description": "The batch." } } },
