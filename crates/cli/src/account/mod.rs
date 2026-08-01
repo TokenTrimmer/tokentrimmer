@@ -64,7 +64,7 @@ async fn store_key(raw: &str, base_url: Option<String>) -> anyhow::Result<()> {
     }
     let base = store::load_config(&dir)?.unwrap_or_else(|| context::DEFAULT_BASE_URL.to_string());
     ui::success(&format!(
-        "Logged in. Stored {} in {} (base: {}).",
+        "Key stored (not verified): {} in {} (base: {}).",
         context::mask_key(&validated),
         dir.join("credentials.toml").display(),
         base,
@@ -74,9 +74,11 @@ async fn store_key(raw: &str, base_url: Option<String>) -> anyhow::Result<()> {
     // whose `session:` summary includes `saved $…`. A `tt_test_*` sandbox key
     // runs this with no real provider spend (verify the setup before signup).
     if validated.starts_with("tt_test_") {
-        ui::note("  next: `tt chat` → a no-spend sandbox turn that prints saved $…");
+        ui::note(
+            "  next: `tt chat` → a no-spend sandbox turn; sandbox tokens have no server-side identity to verify",
+        );
     } else if validated.starts_with("tt_live_") {
-        ui::note("  next: `tt chat` → a real turn that ends with saved $… (or `tt doctor` to verify the setup)");
+        ui::note("  next: `tt whoami --check` to verify the key, or `tt chat` for a real turn");
     }
     // DX-4: confirm the gateway is reachable (not just that the key format is valid).
     post_login_health_check(&base).await;
@@ -150,10 +152,6 @@ pub async fn login(
 /// `tt login` confirms the gateway is reachable (not just that the key format
 /// is valid). Returns `Ok(())` even if the health check fails — the key is
 /// stored either way; a failed health check prints a warning.
-/// DX-4: after storing a key, hit `/health` + print the resolved base URL so
-/// `tt login` confirms the gateway is reachable (not just that the key format
-/// is valid). Returns `Ok(())` even if the health check fails — the key is
-/// stored either way; a failed health check prints a warning.
 async fn post_login_health_check(base_url: &str) {
     let health_url = format!("{}/health", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
@@ -164,7 +162,7 @@ async fn post_login_health_check(base_url: &str) {
     match result {
         Ok(resp) if resp.status().is_success() => {
             ui::info(&format!(
-                "✓ Gateway reachable at {base_url} ({})",
+                "✓ Gateway reachable at {base_url} ({}, key not verified)",
                 resp.status()
             ));
         }
@@ -177,18 +175,22 @@ async fn post_login_health_check(base_url: &str) {
         Err(e) => {
             ui::warn(&format!(
                 "Could not reach the gateway at {base_url} ({e}) — the key is stored. \
-                 Run `tt doctor` to diagnose."
+                 Run `tt doctor` to diagnose or `tt whoami --check` to verify a live key."
             ));
         }
     }
 }
 
-/// `tt whoami` — local only (no network in V0). Exit 1 when no key is configured.
+/// `tt whoami` — show local configuration and optionally verify a live key.
+///
+/// Without `--check`, no server-side validity claim is made. `tt_test_*`
+/// sandbox tokens intentionally have no durable server-side identity, so the
+/// check reports that boundary rather than pretending to verify them.
 pub async fn whoami(check: bool) -> anyhow::Result<()> {
     let ctx = context::ResolvedContext::load(None, None)?;
     match &ctx.api_key {
         Some(k) => {
-            ui::heading("Logged in");
+            ui::heading("Key configured (not verified)");
             println!(
                 "  {} {} (source: {})",
                 ui::muted().apply_to("key:   "),
@@ -206,37 +208,21 @@ pub async fn whoami(check: bool) -> anyhow::Result<()> {
                 ui::muted().apply_to("config:"),
                 store::config_dir().display()
             );
-            // DX-4: `tt whoami --check` does an authenticated round-trip
-            // (GET /v1/models) so the user knows the key works end-to-end,
-            // not just that it's stored locally.
             if check {
-                let models_url = format!("{}/v1/models", ctx.base_url.trim_end_matches('/'));
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new());
-                let resp = client
-                    .get(&models_url)
-                    .header("Authorization", format!("Bearer {}", k.expose()))
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        ui::info(
-                            "✓ Authenticated round-trip succeeded (GET /v1/models). Key is valid.",
-                        );
-                    }
-                    Ok(r) => {
-                        ui::warn(&format!(
-                            "GET /v1/models returned {} — the key may be revoked or the gateway is misconfigured.",
-                            r.status()
-                        ));
-                    }
-                    Err(e) => {
-                        ui::warn(&format!(
-                            "Could not reach the gateway ({e}) — the key is stored locally but the gateway is unreachable. Run `tt doctor`."
-                        ));
-                    }
+                if k.expose().starts_with("tt_test_") {
+                    ui::note(
+                        "Sandbox token format accepted locally; tt_test_* tokens have no \
+                         server-side identity to verify.",
+                    );
+                } else {
+                    crate::capabilities::fetch_capabilities(&ctx.base_url, k.expose())
+                        .await
+                        .context(
+                            "live-key verification failed; the key may be invalid/revoked, \
+                             the gateway may be unreachable, or it may not support \
+                             GET /v1/capabilities",
+                        )?;
+                    ui::ok("Live key verified (authenticated GET /v1/capabilities).");
                 }
             }
             Ok(())

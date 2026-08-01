@@ -23,8 +23,13 @@ env → `~/.tokentrimmer/credentials.toml` → none**. The gateway base URL reso
 the same way (`--tt-api-base` → `TT_API_BASE` → `~/.tokentrimmer/config.toml` →
 the built-in default `https://api.tokentrimmer.com`).
 
-`tt login` is the easiest way to populate the file; `tt whoami` shows what's
-resolved (masked), and `tt logout` clears it.
+`tt login` is the easiest way to populate the file; it validates key shape but
+stores the key as **not verified** so offline and self-hosted setup still works.
+`tt whoami` shows what's resolved (masked), `tt whoami --check` verifies a
+`tt_live_…` key against authenticated `GET /v1/capabilities`, and `tt logout`
+clears the local key. Sandbox `tt_test_…` tokens have no durable server-side
+identity, so the CLI reports their locally accepted format without claiming
+remote verification.
 
 ---
 
@@ -77,6 +82,8 @@ tt context --task "migrate DB client to async" --token-budget 12000
 
 Store an API key (and optionally a gateway base URL) in
 `~/.tokentrimmer/credentials.toml` so the other commands and the SDKs can use it.
+Success means the key was stored after a local format check, not that the
+gateway accepted it. For a live key, run `tt whoami --check` afterward.
 
 With no `--token`, it runs the **browser-assisted flow**: it opens the dashboard
 keys page so you can mint a key, then reads the pasted key from a hidden prompt.

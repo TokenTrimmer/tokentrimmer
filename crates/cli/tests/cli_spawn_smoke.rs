@@ -26,6 +26,7 @@ const SERVER_GRACE: Duration = Duration::from_secs(4);
 
 struct SpawnResult {
     exited: bool,
+    stdout: String,
     stderr: String,
 }
 
@@ -70,6 +71,7 @@ fn run_tt(home: &std::path::Path, args: &[&str], wait: Duration) -> SpawnResult 
     let out = child.wait_with_output().expect("collect output");
     SpawnResult {
         exited,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
 }
@@ -159,7 +161,28 @@ fn mcp_allow_write_without_database_fails_closed() {
 #[test]
 fn login_spawns_without_panic() {
     // --token path: no browser, writes only under the isolated $HOME.
-    assert_exits_cleanly(&["login", "--token", "tt_test_smoke"]);
+    let home = tempfile::tempdir().unwrap();
+    let args = &[
+        "login",
+        "--token",
+        "tt_test_smoke",
+        "--base-url",
+        REFUSED_BASE,
+    ];
+    let r = run_tt(home.path(), args, EXIT_WAIT);
+    assert!(r.exited, "`tt login` did not exit; stderr:\n{}", r.stderr);
+    assert_no_panic(args, &r.stderr);
+    assert!(
+        r.stdout.contains("Key stored (not verified):"),
+        "login overstated or omitted local-only storage; stdout:\n{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("Logged in"), "stdout:\n{}", r.stdout);
+    assert!(
+        r.stderr.contains("no server-side identity to verify"),
+        "sandbox boundary was omitted; stderr:\n{}",
+        r.stderr
+    );
 }
 
 #[test]
@@ -169,8 +192,41 @@ fn logout_spawns_without_panic() {
 
 #[test]
 fn whoami_spawns_without_panic() {
-    // No key anywhere → documented exit 1, cleanly.
-    assert_exits_cleanly(&["whoami"]);
+    let home = tempfile::tempdir().unwrap();
+    let login_args = &[
+        "login",
+        "--token",
+        "tt_test_smoke",
+        "--base-url",
+        REFUSED_BASE,
+    ];
+    let login = run_tt(home.path(), login_args, EXIT_WAIT);
+    assert!(
+        login.exited,
+        "`tt login` did not exit; stderr:\n{}",
+        login.stderr
+    );
+    assert_no_panic(login_args, &login.stderr);
+
+    let args = &["whoami", "--check"];
+    let r = run_tt(home.path(), args, EXIT_WAIT);
+    assert!(
+        r.exited,
+        "`tt whoami --check` did not exit; stderr:\n{}",
+        r.stderr
+    );
+    assert_no_panic(args, &r.stderr);
+    assert!(
+        r.stdout.contains("Key configured (not verified)"),
+        "whoami overstated or omitted local-only state; stdout:\n{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("Logged in"), "stdout:\n{}", r.stdout);
+    assert!(
+        r.stderr.contains("no server-side identity to verify"),
+        "sandbox check claimed or implied remote verification; stderr:\n{}",
+        r.stderr
+    );
 }
 
 #[test]

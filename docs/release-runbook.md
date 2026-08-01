@@ -104,7 +104,8 @@ This triggers `release-npm.yml` which:
 The Rust CLI (0.1.0 → 0.2.0) gained:
 - `tt doctor` (DX-2) — DNS/key/MCP health diagnostics
 - `tt login` health-check (DX-4) — confirms gateway reachable after login
-- `tt whoami --check` (DX-4) — authenticated round-trip
+- `tt whoami --check` (DX-4) — verifies live keys through authenticated
+  `GET /v1/capabilities`; sandbox tokens are explicitly local-only
 - `verify-receipt` in the Prove help group (DX-7)
 - `tt init` + `tt chat` first-savings moment (DX-3)
 - `x-api-key` Bearer alias (P0-5)
