@@ -9,8 +9,7 @@
 use std::collections::HashMap;
 
 use httpmock::prelude::*;
-use tt_provider_local::{LocalBackend, LocalProvider};
-use tt_provider_openai::ClientConfig;
+use tt_provider_local::{ClientConfig, LocalBackend, LocalProvider};
 use tt_shared::{
     context::{ProviderCredentials, RequestContext, SecretString},
     messages::{Message, MessageContent},

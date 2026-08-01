@@ -9,7 +9,7 @@ description = "Local-LLM provider adapter — Ollama, vLLM, LM Studio (all OpenA
 
 [dependencies]
 tt-shared.workspace = true
-tt-provider-openai.workspace = true
+tt-provider-compat.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true
