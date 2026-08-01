@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -95,6 +95,23 @@ for (const workflow of [
 
 test("the per-PR token-budget comment runner is retired", () => {
   assert.equal(existsSync(".github/workflows/token-budget-telemetry.yml"), false);
+});
+
+test("ordinary pull requests and main merges do not auto-run Public workflows", () => {
+  const allowedPushWorkflows = new Set([
+    "ci.yml",
+    "release-crates.yml",
+    "release-n8n.yml",
+    "release-npm.yml",
+    "release-pypi.yml",
+  ]);
+  for (const workflow of readdirSync(".github/workflows").filter((name) => name.endsWith(".yml"))) {
+    const source = readFileSync(`.github/workflows/${workflow}`, "utf8");
+    assert.doesNotMatch(source, /^  pull_request:/m, `${workflow} must not auto-run for a PR`);
+    if (!allowedPushWorkflows.has(workflow)) {
+      assert.doesNotMatch(source, /^  push:/m, `${workflow} must not auto-run for a main merge`);
+    }
+  }
 });
 
 test("deployment containment rejects an unsafe trigger or inherited secrets", () => {

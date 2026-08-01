@@ -5,17 +5,7 @@ name: shellcheck
 # notes (e.g. intentional single-quoted literals) are not failed on.
 
 on:
-  pull_request:
-    paths:
-      - 'scripts/*.sh'
-      - 'scripts/benchmarks/**/*.sh'
-      - '.github/workflows/shellcheck.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'scripts/*.sh'
-      - 'scripts/benchmarks/**/*.sh'
-      - '.github/workflows/shellcheck.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -6,27 +6,7 @@ name: link-check
 # so this job is green today while still catching genuinely broken links.
 
 on:
-  pull_request:
-    paths:
-      - '*.md'
-      - 'docs/*.md'
-      - 'sdk-python/README.md'
-      - 'sdk-typescript/README.md'
-      - 'n8n-nodes-tokentrimmer/README.md'
-      - 'examples/README.md'
-      - 'lychee.toml'
-      - '.github/workflows/link-check.yml'
-  push:
-    branches: [main]
-    paths:
-      - '*.md'
-      - 'docs/*.md'
-      - 'sdk-python/README.md'
-      - 'sdk-typescript/README.md'
-      - 'n8n-nodes-tokentrimmer/README.md'
-      - 'examples/README.md'
-      - 'lychee.toml'
-      - '.github/workflows/link-check.yml'
+  workflow_dispatch:
   # Weekly run catches links that rot after merge (external sites going away).
   schedule:
     - cron: '17 6 * * 1'
