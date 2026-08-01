@@ -11,11 +11,6 @@ on:
   schedule:
     - cron: '0 9 1 * *' # 09:00 UTC on the 1st of each month
   workflow_dispatch:
-  # Also sanity-check the script + catalog parse on PRs that touch either.
-  pull_request:
-    paths:
-      - 'scripts/refresh-pricing.py'
-      - 'crates/shared/data/pricing.toml'
 
 permissions:
   contents: read

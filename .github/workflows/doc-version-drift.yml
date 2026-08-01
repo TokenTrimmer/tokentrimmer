@@ -6,21 +6,7 @@ name: Doc version drift
 # instructions can't reach users. Pure grep/parse — no build needed.
 
 on:
-  pull_request:
-    paths:
-      - 'GETTING_STARTED.md'
-      - 'sdk-python/pyproject.toml'
-      - 'sdk-typescript/package.json'
-      - 'scripts/check-doc-versions.sh'
-      - '.github/workflows/doc-version-drift.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'GETTING_STARTED.md'
-      - 'sdk-python/pyproject.toml'
-      - 'sdk-typescript/package.json'
-      - 'scripts/check-doc-versions.sh'
-      - '.github/workflows/doc-version-drift.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

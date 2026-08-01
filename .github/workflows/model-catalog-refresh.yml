@@ -8,11 +8,6 @@ on:
   schedule:
     - cron: '0 9 8 * *' # 09:00 UTC on the 8th (offset from pricing-drift on the 1st)
   workflow_dispatch:
-  pull_request:
-    paths:
-      - 'scripts/refresh_models.py'
-      - 'scripts/test_refresh_models.py'
-      - 'crates/shared/data/models.toml'
 
 permissions:
   contents: read
@@ -32,7 +27,6 @@ jobs:
 
   refresh:
     name: open a PR if context windows drifted
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write

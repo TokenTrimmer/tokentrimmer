@@ -24,9 +24,6 @@ on:
     # default branch only; scheduled workflows never run for forks.
     - cron: '17 9 * * *'
   workflow_dispatch: {}
-  pull_request:
-    paths:
-      - '.github/workflows/endpoint-liveness.yml'
 
 permissions:
   contents: read
