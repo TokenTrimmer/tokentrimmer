@@ -1,23 +1,7 @@
 name: sdks
 
 on:
-  pull_request:
-    paths:
-      - 'sdk-python/**'
-      - 'sdk-typescript/**'
-      - 'n8n-nodes-tokentrimmer/**'
-      - 'examples/**'
-      - 'crates/client/**'
-      - '.github/workflows/sdks.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'sdk-python/**'
-      - 'sdk-typescript/**'
-      - 'n8n-nodes-tokentrimmer/**'
-      - 'examples/**'
-      - 'crates/client/**'
-      - '.github/workflows/sdks.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
