@@ -171,6 +171,9 @@ assert(
 );
 
 const typescript = readText(manifest.typescript);
+const sdkTypescript = readText(manifest.typescript_sdk);
+const sdkPython = readText(manifest.python_sdk);
+assert(sdkTypescript === typescript, 'SDK generated product TypeScript drift');
 for (const typeName of [
   'RouteWriteRequest',
   'WorkflowDefinition',
@@ -184,6 +187,17 @@ for (const typeName of [
 }
 assert(typescript.includes('export type Node = {\n  id: string;\n} & ('), 'flattened node id lost');
 assert(!/\bany\b/.test(typescript), 'generated product TypeScript contains any');
+for (const className of [
+  'ModelsResponse',
+  'ModelTokenTrimmerMeta',
+  'GatewayCapabilitiesDocument',
+  'CapabilityReason',
+  'RequestPreflightResponse',
+  'RequestPreflightBatchResponse',
+]) {
+  assert(sdkPython.includes(`class ${className}:`), `missing generated Python ${className}`);
+}
+assert(!/\bAny\b/.test(sdkPython), 'generated product Python contains Any');
 
 console.log(`verified ${manifest.files.length} generated product files across ${families.size} families`);
 

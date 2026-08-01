@@ -67,7 +67,52 @@ print(f"cache {response.tt.cache}        # hit-l1 | hit-l2 | miss | none")
 print(f"trace {response.tt.trace_id}")
 ```
 
-The class is a `openai.OpenAI` subclass — every other method (`embeddings`, `models`, tools, vision) works unchanged.
+The class is a `openai.OpenAI` subclass — inherited methods (`embeddings`,
+`models`, tools, vision) work unchanged. For TokenTrimmer's responder-scoped,
+runtime-validated metadata extensions, use `client.gateway`:
+
+```python
+# Anonymous catalog metadata. No configured bearer is sent.
+catalog = client.gateway.models()
+print(catalog.data[0].tokentrimmer.max_input_tokens)
+
+# Requires a tt_live_* key; evidence from one responding gateway process.
+capabilities = client.gateway.capabilities()
+print(capabilities.features.fusion.limits.member_models_max.value)
+
+# Local responder preflight only: no provider request, tokenization, or
+# credential-validity/readiness claim.
+from tokentrimmer import RequestPreflightRequest
+preflight = client.gateway.preflight(RequestPreflightRequest(
+    schema_version=1,
+    model="gpt-4o-mini",
+    provider=None,
+    required_capabilities=("text", "tools", "streaming"),
+    declared_input_tokens=12_000,
+    requested_max_output_tokens=4_096,
+))
+print(preflight.actions)
+print(preflight.catalog_cost)
+
+from tokentrimmer import RequestPreflightBatchRequest
+batch = client.gateway.preflight_batch(RequestPreflightBatchRequest(
+    schema_version=1,
+    requests=(preflight.request,),
+))
+print(batch.documents)
+```
+
+All four operations return frozen typed dataclasses emitted from the
+authoritative Rust product schemas, refuse redirects, apply a five-second
+transport timeout plus wall-clock checks, stream under body ceilings (256 KiB
+models / 64 KiB capabilities and preflight), require no-store/nosniff and exact
+v1 semantics, and recompute the model snapshot digest. They do not prove
+credentials, provider health, model/modality readiness, live pricing, request
+acceptance, fleet convergence, a quote/reservation, enforced budget,
+settlement, invoice, or later execution. Successful reason messages are
+bounded responder copy; use stable reason codes and the actual request result
+for machine decisions. The batch removes cross-process drift, but composite
+stores and runtime configuration are still not one transaction.
 
 ## Streaming
 

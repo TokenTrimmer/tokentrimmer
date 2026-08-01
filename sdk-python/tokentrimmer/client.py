@@ -10,6 +10,8 @@ Wraps the official ``openai.OpenAI`` client. Override points:
     the matching ``X-TokenTrimmer-*`` request headers;
   - attach parsed ``X-TokenTrimmer-*`` response headers to the result as
     ``.tt`` (a :class:`TokenTrimmerMeta`).
+- ``gateway`` provides bounded, runtime-validated catalog, capability, and
+  request-preflight operations.
 
 Metadata is read from the per-call raw response via the OpenAI SDK's
 ``with_raw_response`` accessor, so there is no shared mutable state and the
@@ -39,6 +41,7 @@ import httpx
 from openai import OpenAI
 
 from tokentrimmer.agent import Agent
+from tokentrimmer.gateway_metadata import GatewayMetadata
 
 # Internals dependency: the streaming strip below imports `ServerSentEvent` and
 # swaps the stream's injectable `_decoder` (built via `client._make_sse_decoder()`).
@@ -251,6 +254,10 @@ class TokenTrimmer(OpenAI):
         # Driver for the server-side agent loop (`POST /v1/agent/runs`). Reuses
         # this client's base URL / key / httpx transport. See agent.py.
         self._agent = Agent(self)
+        self._gateway = GatewayMetadata(
+            str(self.base_url).rstrip("/"),
+            str(self.api_key or ""),
+        )
 
     @property
     def agent(self) -> Agent:
@@ -262,6 +269,11 @@ class TokenTrimmer(OpenAI):
         resumes — until a terminal answer or the resume cap.
         """
         return self._agent
+
+    @property
+    def gateway(self) -> GatewayMetadata:
+        """Bounded catalog, capability, and request-preflight operations."""
+        return self._gateway
 
     def _wrap_chat_completions(self) -> None:
         completions = self.chat.completions
