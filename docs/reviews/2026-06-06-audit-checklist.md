@@ -210,10 +210,11 @@ _The caching layer is in strong shape and shows clear evidence of prior security
   - Issue: L2 lookup filters on `&req.model` (the post-routing requested model) while L2 insert stores `model_used = response.model` (the model the provider actually served). For the normal path these match. But on cross-model failover (chat.rs:1570 notes served_model can differ from req.model), the response is stored under the fallback model and a later request for the originally-requested model never recalls it. This is safe for isolation/correctness (no wrong-model hit) but means failover-served responses don't build the cache for their nominal model — a recall/efficiency gap, not a bug.
   - Action: Optionally also index/lookup under the requested model alias, or document that failover responses are cached only under the model that served them. Low priority; current behavior errs on the safe side.
 
-- [ ] ⚪ **[backlog/low] Per-org semantic-cache opt-out (ADR-017) still unimplemented** — **🔴 OPEN**
-  - Where: .claude/BACKLOG.md:78 (rv-l2-org-cache-optout); crates/core/src/tier_resolver.rs; crates/core/src/routes/chat.rs (CacheBehavior::resolve ~407)
-  - Issue: Open backlog item: a per-org `semantic_cache_disabled` flag that forces `cache_behavior.do_lookup=do_insert=false` for sensitive orgs, implementing the ADR-017 control. Until shipped, an org that does not want its prompts/responses stored in the shared (org-scoped but cross-user) L2 store has no toggle short of disabling caching globally. Relevant to privacy-sensitive tenants.
-  - Action: Resolve the flag alongside tier in tier_resolver and short-circuit CacheBehavior::resolve to no-lookup/no-insert when set. The plumbing (CacheBehavior, tier resolution) already exists, so this is a small addition.
+- [x] ⚪ **[backlog/low] Per-org semantic-cache opt-out (ADR-017) was unimplemented** — **✅ DONE (implementation #267; fail-closed hardening re-verified 2026-07-29).**
+  - Where: crates/core/src/tier_resolver.rs; crates/core/src/routes/chat.rs; docs/04-gateway-api-reference.md §6.3; .claude/DECISIONS.md ADR-017
+  - Resolution: `orgs.semantic_cache_disabled` rides the cached tier resolution and has final precedence over request-body controls, cache headers, and route actions. An opted-out org performs neither L1/L2 lookup nor insertion.
+  - Failure posture: A missing/unreadable compliance value keeps the request available with Free enforcement limits but fails closed for caching, so a database blip cannot silently re-enable storage for an opted-out org.
+  - Evidence: Resolver fallback/cache tests and `CacheBehavior` tests cover enabled, disabled, idempotent, cached, and error states.
 
 ### `pub-providers-a`
 
@@ -579,4 +580,3 @@ _The backlog discipline is genuinely strong: the V0–V7 roadmap and the F1–F1
   - Where: /Users/iansimon/Developer/TokenTrimmer/public/.claude/BACKLOG.md:24,59,78; crates/core/src/ (no trace_parent/batch/semantic_cache_disabled refs); docs/04-gateway-api-reference.md:412
   - Issue: Verified open (unlike the two stale items above): (a) gw-traceparent-ingest — grep for trace_parent/traceparent in crates/core/src returns nothing and the doc row at 04-gateway-api-reference.md:412 correctly still reads 'Planned (not yet honored)'. (b) rv-batch-api — no /v1/batches or 'Message Batches' dispatch path exists; correctly tagged NEEDS-SPEC. (c) rv-l2-org-cache-optout — no semantic_cache_disabled/cache_disabled flag anywhere; this is the only shipped ADR-017 follow-up still pending and is the per-org privacy control. These three are accurately tracked and scoped; calling them out so they aren't lost behind the stale checkboxes.
   - Action: Keep as tracked; prioritize rv-l2-org-cache-optout (P3→P2) since it is a privacy/compliance control rather than a perf feature and complements the missing data-deletion flow above. gw-traceparent is low-value until the /metrics+tracing observability story exists, so sequence it after gw-metrics-endpoint.
-
