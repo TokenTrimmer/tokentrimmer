@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -62,6 +62,39 @@ function deploymentSources() {
 
 test("deployment containment has one push-gated caller and an explicit secret allowlist", () => {
   assert.deepEqual(validateDeployWorkflowTopology(deploymentSources()), []);
+});
+
+test("deployment CI runs automatically only for the protected-main request marker", () => {
+  const sources = deploymentSources();
+  sources.ci = sources.ci.replace(
+    "    paths: [.github/deploy-gateway.request]\n",
+    "",
+  );
+  assert.match(
+    validateDeployWorkflowTopology(sources).join("\n"),
+    /push must be restricted to branches: \[main\] and paths: \[\.github\/deploy-gateway\.request\]/,
+  );
+});
+
+for (const workflow of [
+  "bindings-drift.yml",
+  "cost-gate-self.yml",
+  "coverage-artifacts.yml",
+  "docker-build.yml",
+  "inspect-self.yml",
+  "plan-self.yml",
+  "sdks.yml",
+]) {
+  test(`${workflow} is an explicit checkpoint rather than a per-commit run`, () => {
+    const source = readFileSync(`.github/workflows/${workflow}`, "utf8");
+    assert.match(source, /^  workflow_dispatch:\s*$/m);
+    assert.doesNotMatch(source, /^  pull_request:/m);
+    assert.doesNotMatch(source, /^  push:/m);
+  });
+}
+
+test("the per-PR token-budget comment runner is retired", () => {
+  assert.equal(existsSync(".github/workflows/token-budget-telemetry.yml"), false);
 });
 
 test("deployment containment rejects an unsafe trigger or inherited secrets", () => {

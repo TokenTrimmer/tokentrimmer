@@ -7,6 +7,7 @@ const FULL_GIT_SHA = /^[0-9a-f]{40}$/i;
 const OCI_DIGEST = /@sha256:[0-9a-f]{64}$/i;
 const DEPLOY_WORKFLOW_PATH = ".github/workflows/deploy.yml";
 const CI_WORKFLOW_PATH = ".github/workflows/ci.yml";
+const DEPLOY_REQUEST_PATH = ".github/deploy-gateway.request";
 const DEPLOY_SECRETS = [
   "FLY_API_TOKEN",
   "STAGING_DATABASE_URL_DIRECT",
@@ -162,6 +163,28 @@ export function validateDeployWorkflowTopology({ ci, deploy, workflows }) {
   const errors = [];
   const deployLines = yamlLines(deploy);
   const ciLines = yamlLines(ci);
+
+  const ciOn = rootEntry(ciLines, "on");
+  const ciTriggers = ciOn ? mappingEntries(ciLines, ciOn) : [];
+  if (!ciOn || ciOn.value || !sameKeys(ciTriggers, ["workflow_dispatch", "schedule", "push"])) {
+    errors.push(
+      `${CI_WORKFLOW_PATH}: on must expose only workflow_dispatch, schedule, and the deployment-request push`,
+    );
+  } else {
+    const push = directEntry(ciLines, ciOn, "push");
+    const pushFilters = push ? mappingEntries(ciLines, push) : [];
+    if (
+      !push
+      || push.value
+      || !sameKeys(pushFilters, ["branches", "paths"])
+      || directEntry(ciLines, push, "branches")?.value !== "[main]"
+      || directEntry(ciLines, push, "paths")?.value !== `[${DEPLOY_REQUEST_PATH}]`
+    ) {
+      errors.push(
+        `${CI_WORKFLOW_PATH}: push must be restricted to branches: [main] and paths: [${DEPLOY_REQUEST_PATH}]`,
+      );
+    }
+  }
 
   const deployOn = rootEntry(deployLines, "on");
   const deployTriggers = deployOn ? mappingEntries(deployLines, deployOn) : [];

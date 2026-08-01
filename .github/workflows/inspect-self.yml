@@ -4,9 +4,7 @@ name: inspect-self (dogfood)
 # Any new HIGH or CRITICAL finding blocks merge to main.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

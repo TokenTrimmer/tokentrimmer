@@ -5,9 +5,7 @@ name: plan-self (dogfood)
 # that perturbs the canned-input snapshot fails this check.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

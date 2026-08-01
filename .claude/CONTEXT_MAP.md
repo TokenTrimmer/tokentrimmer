@@ -173,7 +173,7 @@ Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 - **Toolchain pinned**: `rust-toolchain.toml` (1.86.0)
 - **Workspace**: `Cargo.toml` (20 crates including `crates/providers/*`)
 - **License allowlist**: `deny.toml`
-- **CI workflows**: `.github/workflows/{ci,inspect-self,plan-self,bindings-drift,provider-contract-tests,token-budget-telemetry}.yml`
+- **CI workflows**: `.github/workflows/{ci,inspect-self,plan-self,bindings-drift,provider-contract-tests}.yml`; the full matrix and dogfood/SDK/coverage/image workflows are explicit checkpoints, while only `.github/deploy-gateway.request` can trigger protected-main CI/deploy automatically
 - **GitHub Actions provenance policy**: `.github/scripts/workflow-security-policy.{mjs,test.mjs}` enforces immutable action SHAs and OCI digests in source; the repository's `sha_pinning_required` setting independently enforces full-length action SHAs on GitHub.
 - **Local CI mirror**: `make ci` → `scripts/ci-local.sh`
 

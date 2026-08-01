@@ -5,11 +5,10 @@ name: cost-gate (dogfood)
 # is exercising the action end-to-end and surfacing the cost delta as a comment.
 
 on:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   cost-gate:

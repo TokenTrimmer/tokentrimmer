@@ -1,9 +1,20 @@
 name: CI
 
 on:
-  pull_request:
+  # The full Rust/DB/supply-chain matrix is an acceptance checkpoint, not a
+  # per-commit feedback loop. Local gates remain the development loop; run this
+  # explicitly, use the weekly backstop, or change the deployment-request
+  # marker on protected main to validate and deploy that exact revision.
+  workflow_dispatch:
+  schedule:
+    - cron: '23 8 * * 0'
   push:
     branches: [main]
+    paths: [.github/deploy-gateway.request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
