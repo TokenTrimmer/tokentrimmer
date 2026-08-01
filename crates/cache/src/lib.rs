@@ -68,6 +68,7 @@ pub use response_codec::{org_from_l1_key, L1Open, L2Open, ResponseCodec, Respons
 
 use async_trait::async_trait;
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Errors returned by cache operations.
 #[derive(Debug, Error)]
@@ -93,6 +94,18 @@ pub enum CacheError {
     ResponseCodec(#[from] crate::response_codec::ResponseCodecError),
 }
 
+/// Progress from one bounded organization-erasure pass.
+///
+/// Redis implementations may need several passes for a very large tenant;
+/// callers must retain their durable cleanup task until `complete` is true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L1PurgeResult {
+    /// Every indexed key was removed while the organization write fence held.
+    pub complete: bool,
+    /// Number of indexed values removed by this pass.
+    pub deleted: usize,
+}
+
 /// L1 exact-match cache contract. Keys are SHA-256 hashes of normalized requests.
 #[async_trait]
 pub trait L1Cache: Send + Sync {
@@ -102,4 +115,6 @@ pub trait L1Cache: Send + Sync {
     async fn set(&self, key: &str, value: &[u8], ttl_secs: u64) -> Result<(), CacheError>;
     /// Remove a key from the cache.
     async fn delete(&self, key: &str) -> Result<(), CacheError>;
+    /// Fence future writes and remove one organization's indexed values.
+    async fn purge_org(&self, org_id: Uuid) -> Result<L1PurgeResult, CacheError>;
 }

@@ -1,6 +1,7 @@
 //! HTTP route handlers. One file per endpoint family — keeps each well under
 //! the 800-line cap enforced by pre-edit-guard.
 
+pub mod account_purge;
 pub mod agent_run;
 pub(crate) mod agent_run_budget;
 pub(crate) mod agent_run_store;

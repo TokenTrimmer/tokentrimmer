@@ -50,6 +50,7 @@ blake3.workspace = true
 # KDF for the per-org encrypted secret store (workflow/secrets.rs).
 chacha20poly1305.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 hex.workspace = true
 # Redaction guardrail (passes/redaction.rs) — secret/PII pattern matching,
 # ported from the Tier-1 inspect secret rule plus email/SSN matchers.

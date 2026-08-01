@@ -12,7 +12,7 @@
 //! [`get`]: InMemoryL1Cache::get
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::response_codec::{org_from_l1_key, L1Open, ResponseCodec};
-use crate::{CacheError, L1Cache};
+use crate::{CacheError, L1Cache, L1PurgeResult};
 
 /// An in-memory L1 cache backed by a [`DashMap`].
 ///
@@ -50,6 +50,9 @@ pub struct InMemoryL1Cache {
     response_codec: Option<ResponseCodec>,
     /// Orgs whose writes are dropped (the per-org "do not cache" hook).
     no_cache_orgs: Arc<HashSet<Uuid>>,
+    /// Dynamic account-erasure fence. A lock spans each read/write mutation so
+    /// a writer that started before purge cannot reinsert after it completes.
+    purged_orgs: Arc<RwLock<HashSet<Uuid>>>,
 }
 
 impl InMemoryL1Cache {
@@ -59,6 +62,7 @@ impl InMemoryL1Cache {
             inner: Arc::new(DashMap::new()),
             response_codec: None,
             no_cache_orgs: Arc::new(HashSet::new()),
+            purged_orgs: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -94,6 +98,14 @@ impl L1Cache for InMemoryL1Cache {
     /// does not authenticate is a miss; a legacy plaintext value is returned
     /// as-is).
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
+        let org_id = org_from_l1_key(key);
+        let purge_guard = self
+            .purged_orgs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if purge_guard.contains(&org_id) {
+            return Ok(None);
+        }
         let stored = {
             if let Some(entry) = self.inner.get(key) {
                 let (value, expires_at) = entry.value();
@@ -128,6 +140,13 @@ impl L1Cache for InMemoryL1Cache {
         if self.no_cache_orgs.contains(&org_id) {
             return Ok(());
         }
+        let purge_guard = self
+            .purged_orgs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if purge_guard.contains(&org_id) {
+            return Ok(());
+        }
         let payload = match self.response_codec.as_ref() {
             Some(codec) => codec.seal_l1_value(org_id, key, value)?,
             None => value.to_vec(),
@@ -141,6 +160,26 @@ impl L1Cache for InMemoryL1Cache {
     async fn delete(&self, key: &str) -> Result<(), CacheError> {
         self.inner.remove(key);
         Ok(())
+    }
+
+    async fn purge_org(&self, org_id: Uuid) -> Result<L1PurgeResult, CacheError> {
+        if org_id.is_nil() {
+            return Ok(L1PurgeResult {
+                complete: true,
+                deleted: 0,
+            });
+        }
+        let mut purge_guard = self
+            .purged_orgs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        purge_guard.insert(org_id);
+        let before = self.inner.len();
+        self.inner.retain(|key, _| org_from_l1_key(key) != org_id);
+        Ok(L1PurgeResult {
+            complete: true,
+            deleted: before.saturating_sub(self.inner.len()),
+        })
     }
 }
 
@@ -188,6 +227,7 @@ mod tests {
             inner: plain.inner.clone(),
             response_codec: Some(ResponseCodec::new([4u8; 32])),
             no_cache_orgs: Arc::new(HashSet::new()),
+            purged_orgs: Arc::new(RwLock::new(HashSet::new())),
         };
         assert_eq!(encrypted.get(&key).await.unwrap(), Some(value.to_vec()));
     }
@@ -205,6 +245,7 @@ mod tests {
             inner: writer.inner.clone(),
             response_codec: Some(ResponseCodec::new([6u8; 32])),
             no_cache_orgs: Arc::new(HashSet::new()),
+            purged_orgs: Arc::new(RwLock::new(HashSet::new())),
         };
         assert_eq!(reader.get(&key).await.unwrap(), None);
     }
@@ -217,5 +258,28 @@ mod tests {
         let key = key_for(blocked);
         cache.set(&key, b"payload", 60).await.unwrap();
         assert_eq!(cache.get(&key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn org_purge_is_scoped_idempotent_and_fences_late_writes() {
+        let erased = Uuid::from_u128(99);
+        let retained = Uuid::from_u128(100);
+        let cache = InMemoryL1Cache::new();
+        let erased_key = key_for(erased);
+        let retained_key = key_for(retained);
+        let transcript_key = format!("tt:agent-run:{erased}:{}", Uuid::new_v4());
+        cache.set(&erased_key, b"a", 60).await.unwrap();
+        cache.set(&transcript_key, b"transcript", 60).await.unwrap();
+        cache.set(&retained_key, b"b", 60).await.unwrap();
+
+        let first = cache.purge_org(erased).await.unwrap();
+        assert_eq!(first.deleted, 2);
+        assert!(first.complete);
+        assert_eq!(cache.get(&erased_key).await.unwrap(), None);
+        assert_eq!(cache.get(&retained_key).await.unwrap(), Some(b"b".to_vec()));
+
+        cache.set(&erased_key, b"late", 60).await.unwrap();
+        assert_eq!(cache.get(&erased_key).await.unwrap(), None);
+        assert_eq!(cache.purge_org(erased).await.unwrap().deleted, 0);
     }
 }
