@@ -171,11 +171,12 @@ async fn drain_stream(
 // Mock providers
 // ---------------------------------------------------------------------------
 
-/// A judge provider that returns a fixed buffered response (for BestOfN).
+/// A judge provider that reads the blinded candidate envelopes and returns the
+/// candidate number whose content contains a marker.
 struct MockJudge {
     id: &'static str,
     model: &'static str,
-    judge_response: &'static str,
+    best_answer_marker: &'static str,
 }
 
 #[async_trait]
@@ -215,6 +216,30 @@ impl Provider for MockJudge {
         req: ChatCompletionRequest,
         _ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
+        let mut picked_candidate = 1_u64;
+        for message in &req.messages {
+            let Message::User {
+                content: MessageContent::Text(text),
+                ..
+            } = message
+            else {
+                continue;
+            };
+            let Some((_, encoded)) = text.split_once('\n') else {
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_str::<serde_json::Value>(encoded) else {
+                continue;
+            };
+            let Some(content) = envelope["content"].as_str() else {
+                continue;
+            };
+            if content.contains(self.best_answer_marker) {
+                picked_candidate = envelope["candidate"].as_u64().unwrap_or(1);
+                break;
+            }
+        }
+
         Ok(ChatCompletionResponse {
             id: "chatcmpl-judge".into(),
             object: "chat.completion".into(),
@@ -223,7 +248,9 @@ impl Provider for MockJudge {
             choices: vec![Choice {
                 index: 0,
                 message: Message::Assistant {
-                    content: Some(MessageContent::Text(self.judge_response.into())),
+                    content: Some(MessageContent::Text(format!(
+                        "{picked_candidate}\nmost complete answer"
+                    ))),
                     tool_calls: vec![],
                     name: None,
                 },
@@ -361,8 +388,7 @@ async fn best_of_n_streaming_replay_yields_known_plan_and_chosen_leg() {
     registry.register(Arc::new(MockJudge {
         id: "mock-provider-judge",
         model: "mock-judge",
-        // Judge picks candidate 2 (1-indexed), which maps to answers[1] = leg index 1.
-        judge_response: "2\nmost complete answer",
+        best_answer_marker: "the best one",
     }));
 
     let state = AppState::new(registry);
