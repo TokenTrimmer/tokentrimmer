@@ -172,6 +172,14 @@ pub fn build_router_with_retrieval(
         // distinct from `/v1/models`: catalog metadata does not prove gateway
         // feature gates, credential readiness, or provider acceptance.
         .route("/v1/capabilities", get(routes::capabilities::handler))
+        .route(
+            "/v1/capabilities/preflight",
+            post(routes::request_preflight::handler),
+        )
+        .route(
+            "/v1/capabilities/preflight/batch",
+            post(routes::request_preflight::batch_handler),
+        )
         .route("/v1/embeddings", post(routes::embeddings::handler))
         // POST creates a new run; GET lists the caller's runs (org-scoped,
         // newest-first, durable Postgres view — no transcript). The bare list

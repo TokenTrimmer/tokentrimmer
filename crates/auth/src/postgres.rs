@@ -357,6 +357,48 @@ fn decrypt_blob(
 
 #[async_trait]
 impl ProviderCredentialStore for PostgresProviderCredentialStore {
+    async fn is_configured(
+        &self,
+        org_id: Uuid,
+        provider_id: &str,
+    ) -> Result<bool, CredentialError> {
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                   SELECT 1
+                   FROM provider_credentials
+                   WHERE org_id = $1 AND provider = $2
+               )"#,
+        )
+        .bind(org_id)
+        .bind(provider_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(CredentialStoreError::Sql)
+        .map_err(CredentialError::from)
+    }
+
+    async fn configured_snapshot(
+        &self,
+        org_id: Uuid,
+        provider_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, CredentialError> {
+        if provider_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        sqlx::query_scalar::<_, String>(
+            r#"SELECT provider
+               FROM provider_credentials
+               WHERE org_id = $1 AND provider = ANY($2::text[])"#,
+        )
+        .bind(org_id)
+        .bind(provider_ids.to_vec())
+        .fetch_all(&self.pool)
+        .await
+        .map(|providers| providers.into_iter().collect())
+        .map_err(CredentialStoreError::Sql)
+        .map_err(CredentialError::from)
+    }
+
     async fn put(
         &self,
         org_id: Uuid,

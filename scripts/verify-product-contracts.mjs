@@ -21,6 +21,7 @@ for (const family of [
   'workflow_write',
   'models',
   'gateway_capabilities',
+  'request_preflight',
 ]) {
   assert(families.has(family), `missing product contract family: ${family}`);
 }
@@ -131,6 +132,44 @@ assert(
   'model pricing output field must be present, including null',
 );
 
+const requestPreflightFamily = families.get('request_preflight');
+const requestPreflight = load(requestPreflightFamily.schema);
+assert(requestPreflight.properties.schema_version.const === 1, 'preflight version drift');
+assert(requestPreflight.properties.scope.const === 'request_preflight', 'preflight scope drift');
+assert(
+  requestPreflight.properties.snapshot_scope.const === 'responding_process',
+  'preflight snapshot scope drift',
+);
+assert(
+  requestPreflight.$defs.RequestPreflightRequest.properties.required_capabilities.uniqueItems === true &&
+    requestPreflight.$defs.RequestPreflightRequest.properties.required_capabilities.maxItems === 8,
+  'preflight required-capability bound drift',
+);
+assert(
+  requestPreflight.$defs.PreflightCostEvidence.required.includes('standard_cost_usd_high'),
+  'preflight cost interval output must be present, including null',
+);
+assert(
+  requestPreflight.$defs.PreflightAction.properties.code.enum.includes(
+    'execute_request_and_handle_result',
+  ),
+  'preflight authoritative-request action missing',
+);
+
+const requestPreflightBatch = load(requestPreflightFamily.batch_schema);
+assert(requestPreflightBatch.properties.schema_version.const === 1, 'preflight batch version drift');
+assert(requestPreflightBatch.properties.scope.const === 'request_preflight_batch', 'preflight batch scope drift');
+assert(
+  requestPreflightBatch.$defs.RequestPreflightBatchRequest.properties.requests.maxItems === 9 &&
+    requestPreflightBatch.properties.documents.maxItems === 9,
+  'preflight batch bound drift',
+);
+assert(
+  requestPreflightBatch.properties.limitations.minItems === 2 &&
+    requestPreflightBatch.properties.limitations.maxItems === 2,
+  'preflight batch limitation count drift',
+);
+
 const typescript = readText(manifest.typescript);
 for (const typeName of [
   'RouteWriteRequest',
@@ -138,6 +177,8 @@ for (const typeName of [
   'WorkflowWriteRequest',
   'ModelsResponse',
   'GatewayCapabilitiesDocument',
+  'RequestPreflightResponse',
+  'RequestPreflightBatchResponse',
 ]) {
   assert(typescript.includes(`export type ${typeName} =`), `missing generated ${typeName}`);
 }

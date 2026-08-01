@@ -29,6 +29,13 @@ pub use tt_shared::{
     SchemaVersions, TierEvidence, UnknownEvidence,
 };
 
+mod request_preflight;
+pub use tt_shared::{
+    PreflightAction, PreflightCostEvidence, PreflightCredentialEvidence, PreflightLimitEvidence,
+    PreflightModelSupportEvidence, PreflightProviderResolution, RequestPreflightBatchRequest,
+    RequestPreflightBatchResponse, RequestPreflightRequest, RequestPreflightResponse,
+};
+
 mod embeddings;
 pub use embeddings::{EmbedBuilder, EmbedOutcome};
 
@@ -432,6 +439,13 @@ pub enum Error {
     /// The capability endpoint returned or crossed a redirect boundary.
     #[error("gateway capabilities endpoint returned a redirect")]
     UnexpectedGatewayCapabilitiesRedirect,
+    /// A request-preflight document violated the versioned local-evidence
+    /// contract. The reason is a fixed local code.
+    #[error("invalid request preflight contract: {0}")]
+    InvalidRequestPreflight(&'static str),
+    /// The request-preflight endpoint returned or crossed a redirect boundary.
+    #[error("request preflight endpoint returned a redirect")]
+    UnexpectedRequestPreflightRedirect,
     /// The client's dedicated no-redirect control-metadata transport could not
     /// be initialized. No metadata request was sent.
     #[error("failed to initialize the control-metadata HTTP client")]

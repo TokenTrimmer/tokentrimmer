@@ -18,6 +18,7 @@ pub mod pricing;
 pub mod provider;
 pub mod providers;
 pub mod request_delta;
+pub mod request_preflight;
 pub mod url_guard;
 pub mod usage;
 
@@ -52,6 +53,14 @@ pub use provider::Provider;
 pub use request_delta::{
     estimate_request_delta_v1, RequestDeltaEstimate, RequestDeltaInput, RequestDeltaReceiptError,
     RequestDeltaReceiptFields, REQUEST_DELTA_ESTIMATE_V1,
+};
+pub use request_preflight::{
+    PreflightAction, PreflightCostEvidence, PreflightCredentialEvidence, PreflightLimitEvidence,
+    PreflightModelSupportEvidence, PreflightProviderResolution, RequestPreflightBatchRequest,
+    RequestPreflightBatchResponse, RequestPreflightRequest, RequestPreflightResponse,
+    REQUEST_PREFLIGHT_BATCH_MAX_REQUESTS, REQUEST_PREFLIGHT_BATCH_SCHEMA_VERSION,
+    REQUEST_PREFLIGHT_BATCH_SCOPE, REQUEST_PREFLIGHT_SCHEMA_VERSION, REQUEST_PREFLIGHT_SCOPE,
+    REQUEST_PREFLIGHT_TOKEN_VALUE_MAX,
 };
 pub use url_guard::{
     filter_extra_headers, filter_outbound_headers, find_denied_header, find_outbound_denied_header,
