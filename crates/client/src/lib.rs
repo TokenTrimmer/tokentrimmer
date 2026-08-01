@@ -16,6 +16,19 @@ pub use tt_shared::messages::{
 };
 pub use tt_shared::Usage;
 
+mod models;
+pub use tt_shared::{
+    Capability, ModelCatalogLimitations, ModelEntry, ModelTokenTrimmerMeta, ModelsDocumentMeta,
+    ModelsResponse,
+};
+
+mod capabilities;
+pub use tt_shared::{
+    AccessEvidence, CapabilityReason, EnabledEvidence, FusionCapability, FusionLimits,
+    GatewayCapabilitiesDocument, GatewayFeatures, NumericLimit, SchemaVersionEvidence,
+    SchemaVersions, TierEvidence, UnknownEvidence,
+};
+
 mod embeddings;
 pub use embeddings::{EmbedBuilder, EmbedOutcome};
 
@@ -399,6 +412,30 @@ pub enum Error {
     },
     #[error("failed to decode the gateway response: {0}")]
     Decode(#[source] reqwest::Error),
+    /// A bounded JSON response had the wrong shape.
+    #[error("failed to decode the bounded gateway response: {0}")]
+    InvalidResponse(#[source] serde_json::Error),
+    /// A control-plane response crossed its endpoint-specific byte ceiling.
+    #[error("gateway response exceeded the {limit}-byte safety limit")]
+    ResponseTooLarge { limit: usize },
+    /// The model catalog parsed structurally but violated the versioned
+    /// responder contract. The reason is a fixed local code, never remote text.
+    #[error("invalid model catalog contract: {0}")]
+    InvalidModelCatalog(&'static str),
+    /// The catalog endpoint returned or crossed a redirect boundary.
+    #[error("model catalog endpoint returned a redirect")]
+    UnexpectedModelCatalogRedirect,
+    /// A capability document parsed structurally but violated the versioned
+    /// responding-process contract. The reason is a fixed local code.
+    #[error("invalid gateway capabilities contract: {0}")]
+    InvalidGatewayCapabilities(&'static str),
+    /// The capability endpoint returned or crossed a redirect boundary.
+    #[error("gateway capabilities endpoint returned a redirect")]
+    UnexpectedGatewayCapabilitiesRedirect,
+    /// The client's dedicated no-redirect control-metadata transport could not
+    /// be initialized. No metadata request was sent.
+    #[error("failed to initialize the control-metadata HTTP client")]
+    ControlMetadataClientUnavailable,
     /// The `tag` is not a valid HTTP header value. Rejected bytes are the
     /// control chars (`< 0x20`, incl. CR/LF/NUL) and DEL (`0x7F`); high bytes
     /// (`0x80..=0xFF`, e.g. non-ASCII UTF-8) pass through as opaque octets.
@@ -457,6 +494,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// A typed TokenTrimmer gateway client.
 pub struct Client {
     http: reqwest::Client,
+    control_http: Option<reqwest::Client>,
     base: String,
     key: String,
 }
@@ -495,7 +533,10 @@ impl Client {
         Self::with_http_client(http, base, key)
     }
 
-    /// New client reusing an existing `reqwest::Client`.
+    /// New client reusing an existing `reqwest::Client` for ordinary data/API
+    /// calls. Bounded model/capability metadata reads use a separate
+    /// no-redirect client so an authenticated capability bearer cannot inherit
+    /// the caller's redirect policy.
     #[must_use]
     pub fn with_http_client(
         http: reqwest::Client,
@@ -504,6 +545,10 @@ impl Client {
     ) -> Self {
         Self {
             http,
+            // Control metadata uses an independent, no-redirect transport so
+            // an authenticated capability bearer is never forwarded through a
+            // caller-configured redirect policy.
+            control_http: control_metadata_http(),
             base: base.into().trim_end_matches('/').to_string(),
             key: key.into(),
         }
@@ -540,6 +585,15 @@ impl Client {
             max_tool_rounds: 8,
         }
     }
+}
+
+fn control_metadata_http() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("tt-client/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()
 }
 
 /// Fluent builder for a chat completion. See [`Client::chat`].

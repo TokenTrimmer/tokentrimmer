@@ -45,6 +45,15 @@
       "write": "POST /v1/workflows"
     },
     {
+      "family": "models",
+      "id": "tokentrimmer.models.v1",
+      "read": "GET /v1/models",
+      "schema": "docs/model-contract/models-response.schema.json",
+      "versions": [
+        1
+      ]
+    },
+    {
       "compatibility_corpus": "docs/capability-contract/tokentrimmer.gateway-capabilities.v1.corpus.json",
       "family": "gateway_capabilities",
       "id": "tokentrimmer.gateway-capabilities.v1",
@@ -58,11 +67,15 @@
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "22726bc1dddad42d4c1bd10325e88fd8207876c8c170d734adcf96882a5432c2"
+      "sha256": "c1d83c1ac432f03770f08e551ee317b3c382da9bc915d87eb4097e546cf84f92"
     },
     {
       "path": "docs/capability-contract/gateway-capabilities.schema.json",
-      "sha256": "273191038c0c39dc72626a787f37649495b4a20426c2416fccf7cdfdfe31a783"
+      "sha256": "ba9275ee2fd1b2e187b3efbeef6b74549a37a5d4c8f2421ee7bd1a5940211401"
+    },
+    {
+      "path": "docs/model-contract/models-response.schema.json",
+      "sha256": "481e75eac2764c78fbcc67dd60cdcfd48f67496bbf76001c21e78b039013ebb3"
     },
     {
       "path": "docs/route-contract/route-write.schema.json",
@@ -85,6 +98,6 @@
       "sha256": "411dd9deae0591ff7b80d48cefb875e7208e01ec594a368402d3ba79f8c8016e"
     }
   ],
-  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, and gateway capability response type",
+  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, and gateway capability response type",
   "typescript": "bindings/product-contracts.generated.ts"
 }

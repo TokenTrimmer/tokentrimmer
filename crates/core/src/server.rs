@@ -354,7 +354,8 @@ mod tests {
     use crate::ProviderRegistry;
 
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{header, Request, StatusCode};
+    use sha2::{Digest, Sha256};
     use tower::util::ServiceExt;
 
     // ── Mock provider ──────────────────────────────────────────────────────────
@@ -616,6 +617,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
 
         let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
             .await
@@ -623,6 +635,32 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["object"], "list");
         assert_eq!(body["data"].as_array().unwrap().len(), 0);
+        assert_eq!(body["tokentrimmer"]["schema_version"], 1);
+        assert_eq!(body["tokentrimmer"]["snapshot_scope"], "responding_process");
+        assert_eq!(
+            body["tokentrimmer"]["source"],
+            "registered_provider_catalog"
+        );
+        assert_eq!(
+            body["tokentrimmer"]["limitations"]["provider_credentials"],
+            "not_inspected"
+        );
+        assert_eq!(
+            body["tokentrimmer"]["limitations"]["provider_health"],
+            "not_probed"
+        );
+        assert_eq!(
+            body["tokentrimmer"]["limitations"]["request_acceptance"],
+            "not_negotiated"
+        );
+        assert_eq!(
+            body["tokentrimmer"]["limitations"]["fleet_consistency"],
+            "not_attested"
+        );
+        let digest = body["tokentrimmer"]["snapshot_sha256"]
+            .as_str()
+            .expect("snapshot digest");
+        assert_eq!(digest, hex::encode(Sha256::digest(b"[]")));
     }
 
     #[tokio::test]
@@ -662,6 +700,14 @@ mod tests {
             .find(|m| m["id"] == "gpt-4o")
             .expect("gpt-4o present");
         assert_eq!(gpt4o["tokentrimmer"]["provider"], "openai");
+        assert!(
+            gpt4o["tokentrimmer"]["capabilities"]
+                .as_array()
+                .expect("capabilities")
+                .iter()
+                .any(|capability| capability == "json_mode"),
+            "multiword capability names must retain their snake_case wire form"
+        );
 
         // Anthropic models should appear too once the adapter registers.
         for expected in ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"] {

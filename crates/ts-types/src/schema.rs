@@ -133,14 +133,23 @@ pub(crate) fn generate_product_schemas() -> Result<Vec<ContractSchema>> {
         "Structural POST /v1/workflows request generated from the exact tt_core::routes::workflows::CreateWorkflowRequest parser.",
     )?;
 
+    let mut models = root_value(schemars::schema_for!(tt_shared::ModelsResponse))?;
+    prepare_product_root(
+        &mut models,
+        "urn:tokentrimmer:models:response-schema:v1",
+        "TokenTrimmer model catalog response",
+        "Structural GET /v1/models response generated from the exact tt_shared::ModelsResponse wire type.",
+    )?;
+    strengthen_models(&mut models)?;
+
     let mut capabilities = root_value(schemars::schema_for!(
-        tt_core::routes::capabilities::GatewayCapabilitiesDocument
+        tt_shared::GatewayCapabilitiesDocument
     ))?;
     prepare_product_root(
         &mut capabilities,
         "urn:tokentrimmer:gateway-capabilities:response-schema:v1",
         "TokenTrimmer gateway runtime capabilities",
-        "Structural GET /v1/capabilities response generated from the exact tt_core::routes::capabilities::GatewayCapabilitiesDocument output type.",
+        "Structural GET /v1/capabilities response generated from the exact tt_shared::GatewayCapabilitiesDocument wire type.",
     )?;
     strengthen_capabilities(&mut capabilities)?;
 
@@ -159,6 +168,11 @@ pub(crate) fn generate_product_schemas() -> Result<Vec<ContractSchema>> {
             relative_path: "docs/workflow-contract/workflow-write.schema.json",
             ts_name: "WorkflowWriteRequest",
             value: workflow_write,
+        },
+        ContractSchema {
+            relative_path: "docs/model-contract/models-response.schema.json",
+            ts_name: "ModelsResponse",
+            value: models,
         },
         ContractSchema {
             relative_path: "docs/capability-contract/gateway-capabilities.schema.json",
@@ -276,11 +290,108 @@ fn definition_property_mut<'a>(
         })
 }
 
+fn require_definition_properties(
+    schema: &mut Value,
+    definition: &str,
+    properties: &[&str],
+) -> Result<()> {
+    let definition_value = schema
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .and_then(|definitions| definitions.get_mut(definition))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("generated schema is missing $defs.{definition}"))?;
+    let available = definition_value
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("generated schema is missing $defs.{definition}.properties"))?;
+    for property in properties {
+        if !available.contains_key(*property) {
+            return Err(anyhow!(
+                "generated schema is missing $defs.{definition}.properties.{property}"
+            ));
+        }
+    }
+
+    let mut required = definition_value
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    required.extend(properties.iter().map(|property| (*property).to_string()));
+    definition_value.insert("required".into(), json!(required));
+    Ok(())
+}
+
+fn strengthen_models(schema: &mut Value) -> Result<()> {
+    set_const(schema, "object", json!("list"))?;
+    for (definition, property, value) in [
+        ("ModelEntry", "object", json!("model")),
+        (
+            "ModelsDocumentMeta",
+            "schema_version",
+            json!(tt_shared::MODELS_SCHEMA_VERSION),
+        ),
+        (
+            "ModelsDocumentMeta",
+            "snapshot_scope",
+            json!("responding_process"),
+        ),
+        (
+            "ModelsDocumentMeta",
+            "source",
+            json!("registered_provider_catalog"),
+        ),
+        (
+            "ModelCatalogLimitations",
+            "provider_credentials",
+            json!("not_inspected"),
+        ),
+        (
+            "ModelCatalogLimitations",
+            "provider_health",
+            json!("not_probed"),
+        ),
+        (
+            "ModelCatalogLimitations",
+            "request_acceptance",
+            json!("not_negotiated"),
+        ),
+        (
+            "ModelCatalogLimitations",
+            "fleet_consistency",
+            json!("not_attested"),
+        ),
+    ] {
+        definition_property_mut(schema, definition, property)?.insert("const".into(), value);
+    }
+    definition_property_mut(schema, "ModelsDocumentMeta", "snapshot_sha256")?
+        .insert("pattern".into(), json!("^[0-9a-f]{64}$"));
+    require_definition_properties(
+        schema,
+        "ModelPricing",
+        &[
+            "batch_input_per_million",
+            "batch_output_per_million",
+            "cache_write_per_million",
+            "cached_input_per_million",
+            "flex_input_per_million",
+            "flex_output_per_million",
+            "prompt_cache_min_tokens",
+        ],
+    )?;
+    require_definition_properties(schema, "ModelTokenTrimmerMeta", &["pricing"])?;
+    Ok(())
+}
+
 fn strengthen_capabilities(schema: &mut Value) -> Result<()> {
     set_const(
         schema,
         "schema_version",
-        json!(tt_core::routes::capabilities::CAPABILITIES_SCHEMA_VERSION),
+        json!(tt_shared::CAPABILITIES_SCHEMA_VERSION),
     )?;
     set_const(schema, "scope", json!("gateway_runtime"))?;
     set_const(schema, "snapshot_scope", json!("responding_process"))?;
@@ -342,6 +453,7 @@ fn strengthen_capabilities(schema: &mut Value) -> Result<()> {
     let message = definition_property_mut(schema, "CapabilityReason", "message")?;
     message.insert("minLength".into(), json!(1));
     message.insert("maxLength".into(), json!(600));
+    require_definition_properties(schema, "SchemaVersionEvidence", &["version"])?;
     Ok(())
 }
 

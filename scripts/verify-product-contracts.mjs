@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Dependency-free cross-language smoke for generated route/workflow/capability
+// Dependency-free cross-language smoke for generated route/workflow/model/capability
 // artifacts. Rust owns generation and semantic validation; this independently
 // checks manifest hashes plus the TypeScript/schema/vector seams consumers use.
 
@@ -19,6 +19,7 @@ for (const family of [
   'route_preview_coverage',
   'workflow_definition',
   'workflow_write',
+  'models',
   'gateway_capabilities',
 ]) {
   assert(families.has(family), `missing product contract family: ${family}`);
@@ -93,12 +94,49 @@ assert(
   capabilities.$defs.NumericLimit.properties.value.minimum === 1,
   'capability positive member limit missing',
 );
+assert(
+  capabilities.$defs.SchemaVersionEvidence.required.includes('version'),
+  'capability schema version output must be present, including null',
+);
+
+const models = load(families.get('models').schema);
+assert(models.properties.object.const === 'list', 'model list discriminator drift');
+assert(models.$defs.ModelEntry.properties.object.const === 'model', 'model row discriminator drift');
+assert(models.$defs.ModelsDocumentMeta.properties.schema_version.const === 1, 'model version drift');
+assert(
+  models.$defs.ModelsDocumentMeta.properties.snapshot_scope.const === 'responding_process',
+  'model snapshot scope drift',
+);
+assert(
+  models.$defs.ModelsDocumentMeta.properties.source.const === 'registered_provider_catalog',
+  'model source drift',
+);
+assert(
+  models.$defs.ModelsDocumentMeta.properties.snapshot_sha256.pattern === '^[0-9a-f]{64}$',
+  'model digest shape drift',
+);
+for (const field of [
+  'batch_input_per_million',
+  'batch_output_per_million',
+  'cache_write_per_million',
+  'cached_input_per_million',
+  'flex_input_per_million',
+  'flex_output_per_million',
+  'prompt_cache_min_tokens',
+]) {
+  assert(models.$defs.ModelPricing.required.includes(field), `model pricing output field is optional: ${field}`);
+}
+assert(
+  models.$defs.ModelTokenTrimmerMeta.required.includes('pricing'),
+  'model pricing output field must be present, including null',
+);
 
 const typescript = readText(manifest.typescript);
 for (const typeName of [
   'RouteWriteRequest',
   'WorkflowDefinition',
   'WorkflowWriteRequest',
+  'ModelsResponse',
   'GatewayCapabilitiesDocument',
 ]) {
   assert(typescript.includes(`export type ${typeName} =`), `missing generated ${typeName}`);
