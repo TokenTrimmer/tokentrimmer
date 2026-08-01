@@ -267,7 +267,7 @@ mod tests {
         let cache = InMemoryL1Cache::new();
         let erased_key = key_for(erased);
         let retained_key = key_for(retained);
-        let transcript_key = format!("tt:agent-run:{erased}:{}", Uuid::new_v4());
+        let transcript_key = format!("tt:runs:{erased}:{}", Uuid::new_v4());
         cache.set(&erased_key, b"a", 60).await.unwrap();
         cache.set(&transcript_key, b"transcript", 60).await.unwrap();
         cache.set(&retained_key, b"b", 60).await.unwrap();

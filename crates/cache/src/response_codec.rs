@@ -315,17 +315,21 @@ pub enum L1Open {
 /// The gateway namespaces every L1 key as `"{org_id}:{request_hash}"`
 /// (`tt_core`'s `namespaced_l1_key`) and prefixes negative-cache keys with
 /// `"neg:"` (→ `"neg:{org_id}:{request_hash}"`). Retained agent transcripts
-/// use `"tt:agent-run:{org_id}:{run_id}"`. This parses the org from every
-/// owned shape so encryption and account-purge indexing use the same tenant.
+/// use `"tt:runs:{org_id}:{run_id}"`; the earlier `"tt:agent-run:"` draft
+/// prefix remains recognized so pre-release cache entries cannot evade purge.
+/// This parses the org from every owned shape so encryption and account-purge
+/// indexing use the same tenant.
 ///
 /// Returns [`Uuid::nil`] for any key whose prefix is not a UUID — the value is
 /// still encrypted, just under the deployment-wide (nil-org) key, so a key whose
 /// format we do not recognize is never silently left in plaintext.
 #[must_use]
 pub fn org_from_l1_key(key: &str) -> Uuid {
-    if let Some(agent_key) = key.strip_prefix("tt:agent-run:") {
-        let org = agent_key.split(':').next().unwrap_or("");
-        return Uuid::parse_str(org).unwrap_or_else(|_| Uuid::nil());
+    for prefix in ["tt:runs:", "tt:agent-run:"] {
+        if let Some(agent_key) = key.strip_prefix(prefix) {
+            let org = agent_key.split(':').next().unwrap_or("");
+            return Uuid::parse_str(org).unwrap_or_else(|_| Uuid::nil());
+        }
     }
     let candidate = key.strip_prefix("neg:").unwrap_or(key);
     let first_segment = candidate.split(':').next().unwrap_or("");
@@ -469,6 +473,10 @@ mod tests {
         let org = Uuid::from_u128(123456789);
         assert_eq!(org_from_l1_key(&format!("{org}:deadbeef")), org);
         assert_eq!(org_from_l1_key(&format!("neg:{org}:deadbeef")), org);
+        assert_eq!(
+            org_from_l1_key(&format!("tt:runs:{org}:{}", Uuid::new_v4())),
+            org
+        );
         assert_eq!(
             org_from_l1_key(&format!("tt:agent-run:{org}:{}", Uuid::new_v4())),
             org

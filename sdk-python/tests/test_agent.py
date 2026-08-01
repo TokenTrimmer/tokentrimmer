@@ -10,6 +10,7 @@ Endpoint shape (docs + crates/client/src/agent.rs):
 - ``POST /v1/agent/runs`` with ``{ model, messages, tools?, max_turns?, stream }``.
 - Resume: ``POST /v1/agent/runs/{id}/tool_outputs`` with
   ``{ tool_outputs: [{ tool_call_id, output }] }``.
+- Transcript: ``GET|DELETE /v1/agent/runs/{id}/transcript``.
 - A ``Run`` body = ``{ id, status, messages, turns, usage{...,cost_usd}, ... }``.
   There are NO ``x-tokentrimmer-*`` headers on this endpoint; aggregate cost is
   ``run.usage.cost_usd``.
@@ -29,6 +30,7 @@ GATEWAY = "http://gw.test/v1"
 RUNS = f"{GATEWAY}/agent/runs"
 RUN_ID = "11111111-1111-1111-1111-111111111111"
 RESUME = f"{RUNS}/{RUN_ID}/tool_outputs"
+TRANSCRIPT = f"{RUNS}/{RUN_ID}/transcript"
 
 
 def _client() -> TokenTrimmer:
@@ -86,6 +88,28 @@ def _completed_run_after_resume() -> dict:
             {"role": "assistant", "content": "All done."},
         ],
     }
+
+
+@respx.mock
+def test_export_and_delete_retained_transcript():
+    export = respx.get(TRANSCRIPT).mock(
+        return_value=httpx.Response(200, json=_requires_action_run())
+    )
+    delete = respx.delete(TRANSCRIPT).mock(return_value=httpx.Response(204))
+
+    agent = _client().agent
+    run = agent.export_transcript(RUN_ID)
+    assert run.id == RUN_ID
+    assert run.status == "requires_action"
+    agent.delete_transcript(RUN_ID)
+    assert export.called
+    assert delete.called
+    assert export.calls.last.request.headers["authorization"] == "Bearer tt_test_x"
+
+
+def test_export_transcript_rejects_empty_run_id():
+    with pytest.raises(ValueError):
+        _client().agent.export_transcript("")
 
 
 @respx.mock

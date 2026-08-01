@@ -187,6 +187,15 @@ console.log(`cost   $${outcome.usage.costUsd.toFixed(4)}`);
 console.log(`rounds ${outcome.resumeRounds}`);      // client-side tool_outputs resumes made
 ```
 
+Paused/resumed transcripts remain in Redis for one hour. You can explicitly
+export or erase that short-lived resume state without deleting durable
+billing/audit metadata:
+
+```ts
+const transcript = await client.agent.exportTranscript(outcome.run.id);
+await client.agent.deleteTranscript(outcome.run.id); // idempotent
+```
+
 ### Batch (50% cheaper, async)
 
 The Gateway's `/v1/files` + `/v1/batches` endpoints are OpenAI-compatible, so the

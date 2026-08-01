@@ -42,7 +42,8 @@ async fn indexed_org_purge_is_scoped_and_fences_future_writes() {
     let erased = Uuid::new_v4();
     let retained = Uuid::new_v4();
     let erased_request = format!("{erased}:request");
-    let erased_transcript = format!("tt:agent-run:{erased}:{}", Uuid::new_v4());
+    // This is the exact key emitted by tt_core::routes::agent_run::run_key.
+    let erased_transcript = format!("tt:runs:{erased}:{}", Uuid::new_v4());
     let retained_request = format!("{retained}:request");
 
     cache.set(&erased_request, b"a", 60).await.unwrap();
