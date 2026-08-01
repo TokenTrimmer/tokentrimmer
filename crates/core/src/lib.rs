@@ -10,6 +10,7 @@ pub mod document_lane;
 pub mod error;
 pub mod failover;
 pub mod gateway_purge_auth;
+pub mod master_key_rotation;
 pub(crate) mod measurement;
 pub mod metrics;
 pub mod middleware;
@@ -38,7 +39,7 @@ pub use budget::{
     InMemoryBudgetEnforcer, SpendSink,
 };
 pub use cache_volatility::{classify_volatility, l2_ttl_with_volatility, VolatilityClass};
-pub use db::{connect, migrate, migrate_only, MIGRATOR};
+pub use db::{connect, migrate, migrate_only, verify_migration_ledger, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use gateway_purge_auth::GatewayPurgeAuthorizer;

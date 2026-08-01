@@ -1837,11 +1837,31 @@ fn build_credential_store(
 
 /// Boot the Gateway HTTP server.
 ///
-/// Reads config from env (see [`tt_config::Config::from_env`]). Every external
-/// dependency (DB, Redis) is best-effort at boot: a failure logs + continues
-/// rather than crash-looping the process. Bind / serve are fatal — including
-/// the fail-closed refusal to bind a non-loopback address without a key store
-/// (see [`resolve_gateway_bind`]).
+/// Reads config from env (see [`tt_config::Config::from_env`]). A configured
+/// database is a hard dependency: connect, migration, and exact-ledger
+/// readback must all succeed before bind. An absent database remains supported
+/// only for the explicit loopback dev mode. Redis stays optional/best-effort.
+/// Bind / serve are fatal, including the refusal to expose a DB-less gateway
+/// without an explicit unsafe public-bind opt-in.
+async fn connect_configured_gateway_database(
+    url: &str,
+    boot_timeout: std::time::Duration,
+) -> anyhow::Result<sqlx::PgPool> {
+    let pool = tokio::time::timeout(boot_timeout, tt_core::connect(url, 10))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "configured DATABASE_URL connection timed out after {} seconds; refusing to start without persistence",
+                boot_timeout.as_secs()
+            )
+        })?
+        .context("configured DATABASE_URL connection failed; refusing to start without persistence")?;
+    tt_core::migrate(&pool).await.context(
+        "gateway schema migration or exact-ledger verification failed; refusing to bind HTTP",
+    )?;
+    Ok(pool)
+}
+
 async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // Fail-closed bind decision, BEFORE any best-effort dependency connects:
     // a misconfigured public + unauthenticated gateway must not boot at all.
@@ -1872,34 +1892,19 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // hostname can't hang the process past Fly's health-check grace window.
     let boot_timeout = std::time::Duration::from_secs(5);
 
-    // DB best-effort: keep the pool around for downstream wiring
-    // (Postgres credential store, request_logs writer when that lands).
-    // Serverless Postgres (Neon scale-to-zero) can exceed sqlx's default
-    // acquire timeout on first connect, so the connect is guarded by a
-    // boot-time budget.
+    // A configured DB is hard. Serverless Postgres (Neon scale-to-zero) can
+    // exceed sqlx's default acquire timeout on first connect, so the connect
+    // still has a finite boot budget; expiration is fatal rather than silently
+    // dropping auth/routing/telemetry persistence.
     let db_pool: Option<sqlx::PgPool> = match config.database_url.as_deref() {
         Some(url) => {
             tracing::info!("connecting to database");
-            match tokio::time::timeout(boot_timeout, tt_core::connect(url, 10)).await {
-                Ok(Ok(pool)) => {
-                    match tt_core::migrate(&pool).await {
-                        Ok(()) => tracing::info!("migrations applied"),
-                        Err(e) => tracing::error!(error = %e, "migrations failed; continuing"),
-                    }
-                    Some(pool)
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(error = %e, "db connect failed; continuing without persistence");
-                    None
-                }
-                Err(_) => {
-                    tracing::error!(
-                        timeout_secs = boot_timeout.as_secs(),
-                        "db connect timed out; continuing without persistence"
-                    );
-                    None
-                }
-            }
+            let pool = connect_configured_gateway_database(url, boot_timeout).await?;
+            tt_core::master_key_rotation::ensure_normal_boot_allowed_from_env(&pool)
+                .await
+                .context("master-key rotation boot fence")?;
+            tracing::info!("database migrations and exact ledger verified");
+            Some(pool)
         }
         None => {
             tracing::warn!("DATABASE_URL not set; gateway running without persistence");
@@ -2449,6 +2454,20 @@ mod gateway_fail_closed_tests {
     const PUBLIC: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
 
     // -- startup-config matrix ------------------------------------------------
+
+    #[tokio::test]
+    async fn malformed_configured_database_fails_boot_instead_of_degrading() {
+        let error = connect_configured_gateway_database(
+            "not-a-postgres-url",
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("configured database errors must be fatal");
+        assert!(
+            format!("{error:#}").contains("refusing to start without persistence"),
+            "error should preserve the fail-closed boot reason: {error:#}"
+        );
+    }
 
     #[test]
     fn with_key_store_default_bind_is_unspecified_unchanged() {
