@@ -22,6 +22,13 @@ dist/
 .astro/
 .solid/
 
+# Standalone SDK/package workspaces are not inputs to the Rust gateway image.
+# Excluding them also keeps nested virtualenvs, caches, and node_modules out of
+# every remote Fly/Depot upload.
+sdk-python/
+sdk-typescript/
+n8n-nodes-tokentrimmer/
+
 # Claude Code session state (never ship)
 .claude/
 .cursor/
