@@ -11,11 +11,22 @@
 //! until we commit. Other orgs are unaffected.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Timelike, Utc};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{compute_hash, Actor, AuditEntry, AuditError, AuditWriter, PayloadFields};
+
+/// Normalize a wall-clock timestamp to PostgreSQL's microsecond precision
+/// before it enters the signed payload. PostgreSQL discards sub-microsecond
+/// digits on insert; hashing the higher-precision value would make a freshly
+/// persisted entry fail verification after it is read back.
+fn postgres_timestamp(now: DateTime<Utc>) -> DateTime<Utc> {
+    let nanoseconds = now.nanosecond();
+    now.with_nanosecond(nanoseconds - (nanoseconds % 1_000))
+        .expect("microsecond-normalized nanoseconds are always in range")
+}
 
 /// Postgres-backed audit writer.
 ///
@@ -100,7 +111,7 @@ impl AuditWriter for PostgresAuditWriter {
         };
 
         let id = Uuid::new_v4();
-        let timestamp = chrono::Utc::now();
+        let timestamp = postgres_timestamp(Utc::now());
 
         let fields = PayloadFields {
             id,
@@ -239,7 +250,20 @@ pub fn signing_key_from_hex(hex_str: &str) -> Result<SigningKey, String> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Timelike};
+
     use super::*;
+
+    #[test]
+    fn signed_timestamp_is_stable_after_postgres_round_trip() {
+        let higher_precision = DateTime::parse_from_rfc3339("2026-08-02T12:34:56.123456789Z")
+            .expect("fixed timestamp")
+            .to_utc();
+
+        let normalized = postgres_timestamp(higher_precision);
+        assert_eq!(normalized.nanosecond(), 123_456_000);
+        assert_eq!(postgres_timestamp(normalized), normalized);
+    }
 
     #[test]
     fn signing_key_from_hex_rejects_short() {
