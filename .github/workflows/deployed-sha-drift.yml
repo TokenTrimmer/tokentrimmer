@@ -3,7 +3,7 @@
 #
 # The deploy workflow bakes the commit into the image via
 # `flyctl deploy --build-arg TT_GIT_SHA=…` (deploy.yml) and the gateway surfaces
-# it as `git_sha` in /health. This daily job fails — and opens-or-updates a
+# it as `git_sha` in /health. This weekly job fails — and opens-or-updates a
 # single pinned issue (stable title, comment on repeat) — when prod is
 # unreachable, reports `git_sha: "unknown"` (image built without TT_GIT_SHA),
 # or is running a commit other than main HEAD (e.g. an unapproved prod deploy
@@ -13,7 +13,10 @@ name: Deployed SHA drift
 
 on:
   schedule:
-    - cron: '23 6 * * *' # daily 06:23 UTC
+    # Pre-launch production is intentionally promotion-gated and may remain
+    # behind main for days. Weekly detection avoids daily duplicate failure
+    # runs while manual dispatch remains available after every promotion.
+    - cron: '23 6 * * 2' # Tuesday 06:23 UTC
   workflow_dispatch:
 
 jobs:

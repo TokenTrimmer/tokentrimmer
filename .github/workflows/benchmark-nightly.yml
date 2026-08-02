@@ -1,4 +1,4 @@
-name: benchmark-nightly
+name: benchmark-weekly
 
 # Non-blocking, scheduled proxy-OVERHEAD benchmark.
 #
@@ -13,8 +13,9 @@ name: benchmark-nightly
 
 on:
   schedule:
-    # 07:00 UTC daily — off the PR critical path.
-    - cron: '0 7 * * *'
+    # 07:00 UTC Wednesday — enough trend data before launch without paying for
+    # an unchanged release build every day.
+    - cron: '0 7 * * 3'
   workflow_dispatch: {}
 
 # No special permissions needed; read-only checkout + artifact upload.
