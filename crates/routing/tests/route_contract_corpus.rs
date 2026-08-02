@@ -3,7 +3,7 @@
 //! The authoritative JSON lives in `docs/route-contract` so hosted consumers
 //! can vendor the exact artifact associated with their pinned gateway revision.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -13,6 +13,7 @@ use tt_routing::{
 };
 
 const CORPUS: &str = include_str!("../../../docs/route-contract/tokentrimmer.route.v1.corpus.json");
+const SCHEMA: &str = include_str!("../../../docs/route-contract/route-write.schema.json");
 const CORPUS_FORMAT_ID: &str = "tokentrimmer.route-contract-corpus";
 const CORPUS_FORMAT_VERSION: u32 = 1;
 
@@ -159,6 +160,123 @@ fn v1_corpus_matches_gateway_and_control_plane_canonicalizers() {
             );
         }
     }
+}
+
+#[test]
+fn accepted_corpus_covers_every_structural_route_field() {
+    let corpus: RouteContractCorpus =
+        serde_json::from_str(CORPUS).expect("route contract corpus must remain valid JSON");
+    let schema: Value =
+        serde_json::from_str(SCHEMA).expect("generated route schema must remain valid JSON");
+
+    let mut gateway_fields = BTreeSet::new();
+    let mut condition_fields = BTreeSet::new();
+    let mut action_fields = BTreeSet::new();
+    let mut agentic_budget_fields = BTreeSet::new();
+    let mut panel_fields = BTreeSet::new();
+    let mut workflow_fields = BTreeSet::new();
+
+    for case in &corpus.cases {
+        let Some(ExpectedOutcome::Accepted { canonical }) = case.expected.gateway.as_ref() else {
+            continue;
+        };
+        let gateway = case
+            .gateway
+            .as_ref()
+            .expect("accepted gateway expectation must have an input");
+        extend_object_keys(&mut gateway_fields, gateway, &case.id, "gateway");
+        extend_object_keys(
+            &mut condition_fields,
+            &canonical.conditions,
+            &case.id,
+            "canonical conditions",
+        );
+        extend_object_keys(
+            &mut action_fields,
+            &canonical.target,
+            &case.id,
+            "canonical target",
+        );
+        extend_nested_keys(
+            &mut agentic_budget_fields,
+            &canonical.target,
+            "agentic_budget",
+            &case.id,
+        );
+        extend_nested_keys(&mut panel_fields, &canonical.target, "panel", &case.id);
+        extend_nested_keys(
+            &mut workflow_fields,
+            &canonical.target,
+            "workflow",
+            &case.id,
+        );
+    }
+
+    assert_eq!(
+        gateway_fields,
+        schema_property_names(&schema, "/properties"),
+        "accepted gateway cases must exercise every route-write envelope field"
+    );
+    assert_eq!(
+        condition_fields,
+        schema_property_names(&schema, "/$defs/RouteConditions/properties"),
+        "accepted cases must exercise every canonical route-condition field"
+    );
+    assert_eq!(
+        action_fields,
+        schema_property_names(&schema, "/$defs/RouteAction/properties"),
+        "accepted cases must exercise every canonical route-action field"
+    );
+    assert_eq!(
+        agentic_budget_fields,
+        schema_property_names(&schema, "/$defs/AgenticBudget/properties"),
+        "accepted cases must exercise every agentic-budget field"
+    );
+    assert_eq!(
+        panel_fields,
+        schema_property_names(&schema, "/$defs/RoutePanel/properties"),
+        "accepted cases must exercise every Fusion-panel field"
+    );
+    assert_eq!(
+        workflow_fields,
+        schema_property_names(&schema, "/$defs/RouteWorkflow/properties"),
+        "accepted cases must exercise every governed-workflow field"
+    );
+}
+
+fn extend_object_keys(
+    destination: &mut BTreeSet<String>,
+    value: &Value,
+    case_id: &str,
+    field: &str,
+) {
+    let object = value
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case_id} {field} must be an object"));
+    destination.extend(object.keys().cloned());
+}
+
+fn extend_nested_keys(
+    destination: &mut BTreeSet<String>,
+    target: &Value,
+    field: &str,
+    case_id: &str,
+) {
+    let Some(value) = target.get(field) else {
+        return;
+    };
+    extend_object_keys(destination, value, case_id, field);
+}
+
+fn schema_property_names(schema: &Value, pointer: &str) -> BTreeSet<String> {
+    schema
+        .pointer(pointer)
+        .unwrap_or_else(|| panic!("generated schema is missing {pointer}"))
+        .as_object()
+        .unwrap_or_else(|| panic!("generated schema {pointer} must be an object"))
+        .keys()
+        .cloned()
+        .collect()
 }
 
 fn assert_projection_pairing(has_input: bool, has_expected: bool, case_id: &str, surface: &str) {

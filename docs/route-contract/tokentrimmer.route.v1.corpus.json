@@ -67,6 +67,243 @@
       }
     },
     {
+      "id": "accepted_dense_rewrite_covers_all_condition_and_direct_action_fields",
+      "gateway": {
+        "schema_version": 1,
+        "name": "dense-rewrite",
+        "priority": 2147483647,
+        "enabled": false,
+        "when": {
+          "model_in": ["gpt-4o", "claude-3-5-sonnet"],
+          "input_tokens_lt": 8192,
+          "input_tokens_gt": 1024,
+          "tag_equals": "interactive",
+          "has_images": false,
+          "has_audio": false,
+          "has_documents": true,
+          "content_type": "json",
+          "prompt_contains_any_of": ["invoice", "usage"],
+          "estimated_cost_gt": 0.01,
+          "estimated_cost_lt": 1.5,
+          "upstream_latency_ms_p95_gt": 750,
+          "not_reasoning_class": true
+        },
+        "then": {
+          "target_model": "gpt-4o-mini",
+          "fallbacks": ["claude-3-haiku", "gemini-1.5-flash"],
+          "disable_cache": true,
+          "max_cost_usd": 0.5,
+          "flex": true,
+          "batch": true,
+          "compress": true,
+          "doc_compaction": true,
+          "document_lane": true,
+          "content_compress": true,
+          "redact": true,
+          "format_switch": "csv",
+          "traffic_pct": 25,
+          "shadow_model": "claude-3-5-haiku",
+          "auto_pause": true,
+          "pause_floor_pass_rate": 0.95,
+          "pause_min_verdicts": 30,
+          "minify_json": true,
+          "reasoning_max_effort": "low",
+          "reasoning_budget_tokens": 2048,
+          "agentic_budget": {
+            "cache_prefix": true,
+            "elide_stale_tools": true,
+            "keep_recent_pairs": 4,
+            "clear_at_least_tokens": 512,
+            "route_mechanical_to": "gpt-4o-mini",
+            "semantic_substep_cache": true
+          }
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "accepted",
+          "canonical": {
+            "schema_version": 1,
+            "name": "dense-rewrite",
+            "priority": 2147483647,
+            "enabled": false,
+            "conditions": {
+              "model_in": ["gpt-4o", "claude-3-5-sonnet"],
+              "input_tokens_lt": 8192,
+              "input_tokens_gt": 1024,
+              "tag_equals": "interactive",
+              "has_images": false,
+              "has_audio": false,
+              "has_documents": true,
+              "content_type": "json",
+              "prompt_contains_any_of": ["invoice", "usage"],
+              "estimated_cost_gt": 0.01,
+              "estimated_cost_lt": 1.5,
+              "upstream_latency_ms_p95_gt": 750,
+              "not_reasoning_class": true
+            },
+            "target": {
+              "target_model": "gpt-4o-mini",
+              "fallbacks": ["claude-3-haiku", "gemini-1.5-flash"],
+              "disable_cache": true,
+              "max_cost_usd": 0.5,
+              "flex": true,
+              "batch": true,
+              "compress": true,
+              "doc_compaction": true,
+              "document_lane": true,
+              "content_compress": true,
+              "redact": true,
+              "format_switch": "csv",
+              "traffic_pct": 25,
+              "shadow_model": "claude-3-5-haiku",
+              "auto_pause": true,
+              "pause_floor_pass_rate": 0.95,
+              "pause_min_verdicts": 30,
+              "minify_json": true,
+              "reasoning_max_effort": "low",
+              "reasoning_budget_tokens": 2048,
+              "agentic_budget": {
+                "cache_prefix": true,
+                "elide_stale_tools": true,
+                "keep_recent_pairs": 4,
+                "clear_at_least_tokens": 512,
+                "route_mechanical_to": "gpt-4o-mini",
+                "semantic_substep_cache": true
+              }
+            },
+            "canonical_hash": "sha256:3586603412de04a2e078d3d1f426b16bedbe1f2ca75e55f7581c8aed1d53abb9"
+          }
+        }
+      }
+    },
+    {
+      "id": "accepted_diff_output_shape",
+      "gateway": {
+        "schema_version": 1,
+        "name": "diff-output",
+        "priority": 90,
+        "enabled": false,
+        "when": {},
+        "then": {
+          "target_model": "gpt-4o-mini",
+          "diff": true
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "accepted",
+          "canonical": {
+            "schema_version": 1,
+            "name": "diff-output",
+            "priority": 90,
+            "enabled": false,
+            "conditions": {
+              "model_in": [],
+              "input_tokens_lt": null,
+              "input_tokens_gt": null,
+              "tag_equals": null
+            },
+            "target": {
+              "target_model": "gpt-4o-mini",
+              "diff": true
+            },
+            "canonical_hash": "sha256:5e5ffc074dfa3874d4046a7c7123c146c861449cc15b03f3134d8f5d0ee42135"
+          }
+        }
+      }
+    },
+    {
+      "id": "accepted_fusion_panel_covers_all_fields",
+      "gateway": {
+        "schema_version": 1,
+        "name": "fusion-panel",
+        "priority": 80,
+        "enabled": false,
+        "when": {},
+        "then": {
+          "panel": {
+            "strategy": "majority",
+            "members": ["gpt-4o-mini", "claude-3-haiku", "gemini-1.5-flash"],
+            "arbiter": "gpt-4o",
+            "quorum": 2,
+            "max_cost_usd": 0.75
+          }
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "accepted",
+          "canonical": {
+            "schema_version": 1,
+            "name": "fusion-panel",
+            "priority": 80,
+            "enabled": false,
+            "conditions": {
+              "model_in": [],
+              "input_tokens_lt": null,
+              "input_tokens_gt": null,
+              "tag_equals": null
+            },
+            "target": {
+              "panel": {
+                "strategy": "majority",
+                "members": ["gpt-4o-mini", "claude-3-haiku", "gemini-1.5-flash"],
+                "arbiter": "gpt-4o",
+                "quorum": 2,
+                "max_cost_usd": 0.75
+              }
+            },
+            "canonical_hash": "sha256:5b9c91f08e3d1f990e2aba72d68a23e56261dadd846ecfb471f6be60c8e02b1a"
+          }
+        }
+      }
+    },
+    {
+      "id": "accepted_governed_workflow_covers_all_fields",
+      "gateway": {
+        "schema_version": 1,
+        "name": "governed-workflow",
+        "priority": 70,
+        "enabled": false,
+        "when": {},
+        "then": {
+          "workflow": {
+            "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+            "max_cost_usd": 1.25,
+            "environment": "staging",
+            "mode": "shadow"
+          }
+        }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "accepted",
+          "canonical": {
+            "schema_version": 1,
+            "name": "governed-workflow",
+            "priority": 70,
+            "enabled": false,
+            "conditions": {
+              "model_in": [],
+              "input_tokens_lt": null,
+              "input_tokens_gt": null,
+              "tag_equals": null
+            },
+            "target": {
+              "workflow": {
+                "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+                "max_cost_usd": 1.25,
+                "environment": "staging",
+                "mode": "shadow"
+              }
+            },
+            "canonical_hash": "sha256:90a9d6b50bc070af225cbbcc304195f70144c46eeb28feb8c43f003d7d44b119"
+          }
+        }
+      }
+    },
+    {
       "id": "rejects_zero_panel_quorum",
       "gateway": {
         "name": "zero-panel-quorum",
