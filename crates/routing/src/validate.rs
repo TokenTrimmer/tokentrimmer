@@ -7,6 +7,11 @@ use tt_shared::pricing::{Capability, ModelInfo};
 
 use crate::{RouteAction, RouteConditions};
 
+/// The auto-pause evaluator never reads more classified verdicts than this.
+/// A larger configured minimum can therefore never trigger and must fail at
+/// route-write time instead of becoming a silent no-op.
+pub const PAUSE_MIN_VERDICTS_MAX: u32 = 100;
+
 // `Eq` dropped (not just `PartialEq`) because `InvalidPauseFloor` carries the
 // rejected f64; no caller relied on `Eq`.
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -22,6 +27,10 @@ pub enum ValidationError {
     InvalidPauseFloor { got: f64 },
     #[error("pause_min_verdicts must be >= 1")]
     InvalidPauseMinVerdicts,
+    #[error(
+        "pause_min_verdicts must be <= {max} because the evaluator retains at most that many classified verdicts, got {got}"
+    )]
+    UnreachablePauseMinVerdicts { got: u32, max: u32 },
     #[error("reasoning_max_effort must be \"low\" or \"medium\", got {got:?}")]
     InvalidReasoningEffortCap { got: String },
     #[error("reasoning_budget_tokens must be >= 1024 (Anthropic's documented minimum), got {got}")]
@@ -63,6 +72,15 @@ pub fn validate_auto_pause(then: &RouteAction) -> Result<(), ValidationError> {
     }
     if then.pause_min_verdicts == Some(0) {
         return Err(ValidationError::InvalidPauseMinVerdicts);
+    }
+    if let Some(got) = then
+        .pause_min_verdicts
+        .filter(|minimum| *minimum > PAUSE_MIN_VERDICTS_MAX)
+    {
+        return Err(ValidationError::UnreachablePauseMinVerdicts {
+            got,
+            max: PAUSE_MIN_VERDICTS_MAX,
+        });
     }
     Ok(())
 }
@@ -410,8 +428,9 @@ mod tests {
     }
 
     /// Auto-pause config bounds: the floor must be a fraction in (0, 1] (NaN
-    /// rejected), `pause_min_verdicts` must be >= 1 — validated even when
-    /// `auto_pause` is false (bad config is bad config).
+    /// rejected), and `pause_min_verdicts` must fit the evaluator's 1–100
+    /// classified-verdict window — validated even when `auto_pause` is false
+    /// (bad config is bad config).
     #[test]
     fn validate_auto_pause_bounds() {
         // No auto-pause config at all → OK.
@@ -444,6 +463,16 @@ mod tests {
         );
         b.pause_min_verdicts = Some(1);
         assert!(validate_auto_pause(&b).is_ok());
+        b.pause_min_verdicts = Some(PAUSE_MIN_VERDICTS_MAX);
+        assert!(validate_auto_pause(&b).is_ok());
+        b.pause_min_verdicts = Some(PAUSE_MIN_VERDICTS_MAX + 1);
+        assert_eq!(
+            validate_auto_pause(&b),
+            Err(ValidationError::UnreachablePauseMinVerdicts {
+                got: PAUSE_MIN_VERDICTS_MAX + 1,
+                max: PAUSE_MIN_VERDICTS_MAX,
+            })
+        );
         b.pause_min_verdicts = None;
         assert!(validate_auto_pause(&b).is_ok());
         // Validated even when auto_pause itself is off.

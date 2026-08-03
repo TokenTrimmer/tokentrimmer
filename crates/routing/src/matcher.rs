@@ -661,6 +661,28 @@ mod tests {
     }
 
     #[test]
+    fn prompt_matching_uses_runtime_unicode_lowercase() {
+        let conditions = RouteConditions {
+            prompt_contains_any_of: vec!["CAFÉ".into()],
+            ..Default::default()
+        };
+        let snapshot = RouteFeatureSnapshot::from_retained_features("gpt-4o".into(), 10, None)
+            .with_input_text("Please review the Café invoice");
+
+        let evaluation = evaluate_route_conditions(&conditions, &snapshot);
+
+        assert!(evaluation.matches());
+        assert_eq!(
+            evaluation
+                .decisions
+                .iter()
+                .find(|decision| decision.field == RouteConditionField::PromptContainsAnyOf)
+                .map(|decision| decision.outcome),
+            Some(RouteConditionOutcome::Matched)
+        );
+    }
+
+    #[test]
     fn missing_requested_model_is_unavailable_not_served_model_inference() {
         let conditions = RouteConditions {
             model_in: vec!["served-model".into()],
