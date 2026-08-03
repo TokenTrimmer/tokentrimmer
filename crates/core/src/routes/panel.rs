@@ -510,7 +510,10 @@ pub struct LegResult {
     pub leg_index: usize,
     /// Whether this is a regular member leg or the arbiter call.
     pub role: LegRole,
-    /// The model id that was dispatched.
+    /// Exact model id requested for this leg before provider alias resolution.
+    pub requested_model: String,
+    /// Provider-reported resolved model id. This can be a dated revision of
+    /// `requested_model` and must not be used to infer the caller's intent.
     pub model: String,
     /// The provider name used for dispatch.
     pub provider: String,
@@ -1745,6 +1748,7 @@ async fn run_panel_legs_and_quorum(
             legs_out.push(LegResult {
                 leg_index: i,
                 role: LegRole::Leg,
+                requested_model: m.model.clone(),
                 model: m.model.clone(),
                 provider: pid,
                 status: LegStatus::SkippedNoCred,
@@ -1776,6 +1780,7 @@ async fn run_panel_legs_and_quorum(
                 Ok(md) => LegResult {
                     leg_index: i,
                     role: LegRole::Leg,
+                    requested_model: model_id.clone(),
                     model: md.response.model.clone(),
                     provider: pid,
                     status: LegStatus::Ok,
@@ -1787,6 +1792,7 @@ async fn run_panel_legs_and_quorum(
                 Err(_) => LegResult {
                     leg_index: i,
                     role: LegRole::Leg,
+                    requested_model: model_id.clone(),
                     model: model_id,
                     provider: pid,
                     status: LegStatus::Error,
@@ -1815,6 +1821,7 @@ async fn run_panel_legs_and_quorum(
                 legs_out.push(LegResult {
                     leg_index: usize::MAX,
                     role: LegRole::Leg,
+                    requested_model: String::new(),
                     model: String::new(),
                     provider: String::new(),
                     status: LegStatus::Error,
@@ -1892,6 +1899,7 @@ pub async fn run_panel(
     let arbiter_leg = LegResult {
         leg_index: usize::MAX,
         role: LegRole::Arbiter,
+        requested_model: cfg.arbiter_model.model.clone(),
         model: cfg.arbiter_model.model.clone(),
         provider: arbiter_provider_id,
         status: LegStatus::Ok,
@@ -1997,6 +2005,7 @@ pub(crate) fn panel_body_json(
             json!({
                 "leg_index": wire_leg_index,
                 "role": role,
+                "requested_model": l.requested_model,
                 "model": l.model,
                 "provider": l.provider,
                 "cost_usd": l.cost_usd,
@@ -2508,6 +2517,7 @@ pub(crate) async fn complete_panel_streaming(
     let arbiter_leg = LegResult {
         leg_index: usize::MAX,
         role: LegRole::Arbiter,
+        requested_model: arbiter_model.clone(),
         model: arbiter_model.clone(),
         provider: arbiter_provider_id.clone(),
         status: LegStatus::Ok,
@@ -2657,6 +2667,7 @@ mod tests {
             LegResult {
                 leg_index: 0,
                 role: LegRole::Leg,
+                requested_model: "m1".to_string(),
                 model: "m1".to_string(),
                 provider: "p1".to_string(),
                 status: LegStatus::Error,
@@ -2668,6 +2679,7 @@ mod tests {
             LegResult {
                 leg_index: 1,
                 role: LegRole::Leg,
+                requested_model: "m2".to_string(),
                 model: "m2".to_string(),
                 provider: "p2".to_string(),
                 status: LegStatus::Timeout,
@@ -3297,6 +3309,7 @@ mod tests {
             LegResult {
                 leg_index: 7,
                 role: LegRole::Leg,
+                requested_model: "member-late-alias".to_string(),
                 model: "member-late".to_string(),
                 provider: "mock".to_string(),
                 status: LegStatus::Ok,
@@ -3308,6 +3321,7 @@ mod tests {
             LegResult {
                 leg_index: 2,
                 role: LegRole::Leg,
+                requested_model: "member-chosen-alias".to_string(),
                 model: "member-chosen".to_string(),
                 provider: "mock".to_string(),
                 status: LegStatus::Ok,
@@ -3319,6 +3333,7 @@ mod tests {
             LegResult {
                 leg_index: usize::MAX,
                 role: LegRole::Arbiter,
+                requested_model: "arbiter".to_string(),
                 model: "arbiter".to_string(),
                 provider: "mock".to_string(),
                 status: LegStatus::Ok,
@@ -3348,6 +3363,8 @@ mod tests {
             .collect();
         assert_eq!(indexes, vec![0, 1, 2]);
         assert_eq!(wire_legs[2]["role"], "arbiter");
+        assert_eq!(wire_legs[0]["requested_model"], "member-late-alias");
+        assert_eq!(wire_legs[0]["model"], "member-late");
         assert_eq!(
             body["arbiter"]["chosen_leg"].as_u64(),
             Some(1),

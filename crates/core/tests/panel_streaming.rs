@@ -76,6 +76,7 @@ fn make_ok_leg(leg_index: usize, answer: &str) -> LegResult {
     LegResult {
         leg_index,
         role: LegRole::Leg,
+        requested_model: format!("mock-leg{leg_index}"),
         model: format!("mock-leg{leg_index}"),
         provider: format!("mock-provider-leg{leg_index}"),
         status: LegStatus::Ok,
