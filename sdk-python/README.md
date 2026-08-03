@@ -2,6 +2,13 @@
 
 Thin Python SDK over the official OpenAI client — routes through the TokenTrimmer Gateway, surfaces cost + cache metadata.
 
+For a reproducible development environment, use the checked-in uv lock:
+
+```bash
+uv sync --locked --extra test
+uv run --locked python -m pytest tests/ -q
+```
+
 > **Not yet on PyPI** — published packages land at launch. Until then, install from git:
 
 ```bash

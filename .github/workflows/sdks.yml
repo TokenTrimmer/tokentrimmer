@@ -13,15 +13,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: '0.11.16'
           python-version: '3.11'
+          working-directory: sdk-python
+          enable-cache: true
       - name: Install
-        run: pip install -e "sdk-python[test]"
+        run: uv sync --directory sdk-python --locked --extra test
       - name: Compile examples
-        run: python -m py_compile examples/python/*.py
+        run: uv run --project sdk-python --locked python -m py_compile examples/python/*.py
       - name: Test
-        run: cd sdk-python && python -m pytest tests/ -q
+        run: uv run --directory sdk-python --locked python -m pytest tests/ -q
 
   typescript:
     runs-on: ubuntu-latest

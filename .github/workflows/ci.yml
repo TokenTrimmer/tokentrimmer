@@ -283,18 +283,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo install --locked cargo-audit
-      # Transitive advisories with no reachable fix in our tree (see deny.toml
-      # for the rustls-webpki / rsa rationale). The two RUSTSEC-2025 entries are
-      # `unmaintained` warnings (async-std, rustls-pemfile) pulled transitively.
-      - run: >
-          cargo audit
-          --ignore RUSTSEC-2026-0104
-          --ignore RUSTSEC-2026-0099
-          --ignore RUSTSEC-2026-0098
-          --ignore RUSTSEC-2026-0049
-          --ignore RUSTSEC-2023-0071
-          --ignore RUSTSEC-2025-0052
-          --ignore RUSTSEC-2025-0134
+      # Project-scoped, justified exceptions live in .cargo/audit.toml so
+      # hosted and local audits execute the same policy.
+      - run: cargo audit
 
   # No deployment secret is reachable until every required CI job has passed
   # and the event is proven to be the current protected-main push. The policy
