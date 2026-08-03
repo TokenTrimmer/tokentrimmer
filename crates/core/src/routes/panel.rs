@@ -1936,6 +1936,8 @@ pub async fn run_panel(
 /// gateway owns the schema, rather than turning a verbose judge explanation
 /// into a rejected otherwise-valid terminal panel receipt downstream.
 const MAX_PANEL_ARBITER_REASON_UTF16_UNITS: usize = 2_000;
+const FUSION_TERMINAL_RECEIPT_SCHEMA: &str = "tokentrimmer.fusion-terminal-receipt.v1";
+const MAX_FUSION_CANDIDATE_CONTENT_BYTES: usize = 12 * 1024;
 
 fn bounded_panel_arbiter_reason(value: &str) -> String {
     let mut used = 0usize;
@@ -1951,6 +1953,109 @@ fn bounded_panel_arbiter_reason(value: &str) -> String {
     value[..end].to_owned()
 }
 
+fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    hex::encode(Sha256::digest(value))
+}
+
+fn leg_answer_text(leg: &LegResult) -> Option<&str> {
+    let response = leg.response.as_ref()?;
+    response
+        .choices
+        .first()
+        .and_then(|choice| match &choice.message {
+            Message::Assistant {
+                content: Some(MessageContent::Text(text)),
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+}
+
+fn panel_cache_provenance(usage: Option<&Usage>) -> serde_json::Value {
+    let Some(usage) = usage else {
+        return json!({
+            "state": "unavailable",
+            "source": "no_terminal_usage",
+            "read_tokens": null,
+            "write_tokens": null,
+        });
+    };
+    let state = match usage.cache_read_input_tokens {
+        Some(0) => "provider_reported_zero",
+        Some(_) => "provider_reported_hit",
+        None => "provider_did_not_report",
+    };
+    json!({
+        "state": state,
+        "source": "provider_terminal_usage",
+        "read_tokens": usage.cache_read_input_tokens,
+        "write_tokens": usage.cache_creation_input_tokens,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fusion_terminal_receipt(
+    strategy: ArbiterStrategyKind,
+    legs: &[LegResult],
+    legs_json: &[serde_json::Value],
+    arbiter: &serde_json::Value,
+    quorum_required: usize,
+    quorum_met: usize,
+    total_cost_usd: Option<f64>,
+    cost_incomplete: bool,
+) -> serde_json::Value {
+    let successful_member_legs = legs
+        .iter()
+        .filter(|leg| leg.role == LegRole::Leg && leg.status == LegStatus::Ok)
+        .count();
+    let candidates: Vec<serde_json::Value> = legs
+        .iter()
+        .enumerate()
+        .filter(|(_, leg)| leg.role == LegRole::Leg && leg.status == LegStatus::Ok)
+        .filter_map(|(wire_leg_index, leg)| {
+            let answer = leg_answer_text(leg)?;
+            let retained = bounded_utf8_prefix(answer, MAX_FUSION_CANDIDATE_CONTENT_BYTES);
+            Some(json!({
+                "leg_index": wire_leg_index,
+                "content": retained,
+                "answer_bytes": answer.len(),
+                "retained_bytes": retained.len(),
+                "truncated": retained.len() != answer.len(),
+                "answer_sha256": sha256_hex(answer.as_bytes()),
+                "retained_sha256": sha256_hex(retained.as_bytes()),
+            }))
+        })
+        .collect();
+
+    json!({
+        "schema": FUSION_TERMINAL_RECEIPT_SCHEMA,
+        "strategy": strategy.as_str(),
+        "legs": legs_json,
+        "total_cost_usd": total_cost_usd,
+        "quorum": {
+            "required": quorum_required,
+            "met": quorum_met,
+        },
+        "cost_incomplete": cost_incomplete,
+        "arbiter": arbiter,
+        "candidate_content_limit_bytes": MAX_FUSION_CANDIDATE_CONTENT_BYTES,
+        "successful_member_legs": successful_member_legs,
+        "captured_candidate_answers": candidates.len(),
+        "candidates": candidates,
+    })
+}
+
 /// Build the `tokentrimmer.panel` attribution object.
 ///
 /// Single source of truth shared by the non-streaming response body
@@ -1963,18 +2068,24 @@ fn bounded_panel_arbiter_reason(value: &str) -> String {
 /// - `arbiter_detail`   — per-strategy metadata (chosen_leg, reason, majority fields…).
 /// - `quorum_required`  — quorum threshold.
 /// - `quorum_met`       — how many legs satisfied quorum.
-/// - `total_cost_usd`   — aggregate cost (Σ legs + arbiter). `None` ⇒ JSON null.
-/// - `arbiter_cost_usd` — the arbiter leg's individual cost for the `arbiter.cost_usd`
-///   field. For non-streaming callers this is extracted from the legs slice; streaming
-///   callers pass in the finalized figure from `ArbiterCostPlan::finalize`.
+/// - `accounting`       — finalized aggregate/arbiter cost plus optional streamed
+///   arbiter terminal usage.
+pub(crate) struct PanelTerminalAccounting<'a> {
+    /// Aggregate cost (Σ legs + arbiter). `None` becomes JSON null.
+    pub(crate) total_cost_usd: Option<f64>,
+    /// The arbiter leg's individual cost for `arbiter.cost_usd`.
+    pub(crate) arbiter_cost_usd: Option<f64>,
+    /// Streaming learns this only after its arbiter leg record was created.
+    pub(crate) arbiter_usage: Option<&'a Usage>,
+}
+
 pub(crate) fn panel_body_json(
     strategy: ArbiterStrategyKind,
     legs: &[LegResult],
     arbiter_detail: &ArbiterDetail,
     quorum_required: usize,
     quorum_met: usize,
-    total_cost_usd: Option<f64>,
-    arbiter_cost_usd: Option<f64>,
+    accounting: PanelTerminalAccounting<'_>,
 ) -> serde_json::Value {
     // `LegResult::leg_index` is an internal member index. The arbiter has no
     // member slot and therefore historically carried `usize::MAX` internally.
@@ -1994,8 +2105,16 @@ pub(crate) fn panel_body_json(
                 LegRole::Leg => "leg",
                 LegRole::Arbiter => "arbiter",
             };
-            // Token attribution from the leg's recorded usage, when present.
-            let tokens = l.usage.as_ref().map(|u| {
+            // Streaming Synthesize learns the arbiter's terminal usage only
+            // after the leg record is created. Let that exact terminal value
+            // override the otherwise-empty arbiter record without changing
+            // any member-leg attribution.
+            let usage = if l.role == LegRole::Arbiter {
+                l.usage.as_ref().or(accounting.arbiter_usage)
+            } else {
+                l.usage.as_ref()
+            };
+            let tokens = usage.map(|u| {
                 json!({
                     "input_tokens": u.prompt_tokens,
                     "output_tokens": u.completion_tokens,
@@ -2011,6 +2130,8 @@ pub(crate) fn panel_body_json(
                 "cost_usd": l.cost_usd,
                 "status": l.status.as_str(),
                 "tokens": tokens,
+                "latency_ms": l.latency_ms.min(u32::MAX as u64),
+                "cache": panel_cache_provenance(usage),
             })
         })
         .collect();
@@ -2028,7 +2149,7 @@ pub(crate) fn panel_body_json(
     let d = arbiter_detail;
     let mut arbiter = serde_json::Map::new();
     arbiter.insert("strategy".into(), json!(strategy.as_str()));
-    arbiter.insert("cost_usd".into(), json!(arbiter_cost_usd));
+    arbiter.insert("cost_usd".into(), json!(accounting.arbiter_cost_usd));
     // best-of-n detail.
     if let Some(cl) = wire_chosen_leg {
         arbiter.insert("chosen_leg".into(), json!(cl));
@@ -2056,16 +2177,29 @@ pub(crate) fn panel_body_json(
         arbiter.insert("degraded".into(), json!(true));
     }
 
+    let arbiter = serde_json::Value::Object(arbiter);
+    let terminal_receipt = fusion_terminal_receipt(
+        strategy,
+        legs,
+        &legs_json,
+        &arbiter,
+        quorum_required,
+        quorum_met,
+        accounting.total_cost_usd,
+        cost_incomplete,
+    );
+
     json!({
         "strategy": strategy.as_str(),
         "legs": legs_json,
-        "total_cost_usd": total_cost_usd,
+        "total_cost_usd": accounting.total_cost_usd,
         "quorum": {
             "required": quorum_required,
             "met": quorum_met,
         },
         "cost_incomplete": cost_incomplete,
-        "arbiter": serde_json::Value::Object(arbiter),
+        "arbiter": arbiter,
+        "terminal_receipt": terminal_receipt,
     })
 }
 
@@ -2087,8 +2221,11 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
         &result.arbiter_detail,
         result.quorum_required,
         result.quorum_met,
-        result.total_cost_usd,
-        arbiter_cost_usd,
+        PanelTerminalAccounting {
+            total_cost_usd: result.total_cost_usd,
+            arbiter_cost_usd,
+            arbiter_usage: None,
+        },
     )
 }
 
@@ -3352,8 +3489,11 @@ mod tests {
             },
             1,
             2,
-            Some(0.004),
-            Some(0.002),
+            PanelTerminalAccounting {
+                total_cost_usd: Some(0.004),
+                arbiter_cost_usd: Some(0.002),
+                arbiter_usage: None,
+            },
         );
 
         let wire_legs = body["legs"].as_array().expect("legs array");
@@ -3374,6 +3514,127 @@ mod tests {
             !body.to_string().contains(&usize::MAX.to_string()),
             "internal sentinel must never reach dashboard JSON"
         );
+    }
+
+    #[test]
+    fn panel_body_emits_a_bounded_versioned_terminal_receipt_with_cache_provenance() {
+        let answer = format!("prefix🙂{}", "x".repeat(MAX_FUSION_CANDIDATE_CONTENT_BYTES));
+        let member_usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: 80,
+            cache_creation_input_tokens: Some(20),
+            cache_read_input_tokens: Some(80),
+        };
+        let member_response = ChatCompletionResponse {
+            id: "candidate-1".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "member-resolved".to_string(),
+            choices: vec![tt_shared::messages::Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text(answer.clone())),
+                    name: None,
+                    tool_calls: vec![],
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: member_usage.clone(),
+        };
+        let legs = vec![
+            LegResult {
+                leg_index: 0,
+                role: LegRole::Leg,
+                requested_model: "member".to_string(),
+                model: "member-resolved".to_string(),
+                provider: "provider-a".to_string(),
+                status: LegStatus::Ok,
+                response: Some(member_response),
+                cost_usd: Some(0.001),
+                usage: Some(member_usage),
+                latency_ms: 42,
+            },
+            LegResult {
+                leg_index: usize::MAX,
+                role: LegRole::Arbiter,
+                requested_model: "arbiter".to_string(),
+                model: "arbiter-resolved".to_string(),
+                provider: "provider-b".to_string(),
+                status: LegStatus::Ok,
+                response: None,
+                cost_usd: None,
+                usage: None,
+                latency_ms: 84,
+            },
+        ];
+        let arbiter_usage = Usage {
+            prompt_tokens: 200,
+            completion_tokens: 60,
+            total_tokens: 260,
+            cached_tokens: 0,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+        };
+        let body = panel_body_json(
+            ArbiterStrategyKind::Synthesize,
+            &legs,
+            &ArbiterDetail::default(),
+            1,
+            1,
+            PanelTerminalAccounting {
+                total_cost_usd: Some(0.003),
+                arbiter_cost_usd: Some(0.002),
+                arbiter_usage: Some(&arbiter_usage),
+            },
+        );
+
+        assert_eq!(
+            body["terminal_receipt"]["schema"],
+            FUSION_TERMINAL_RECEIPT_SCHEMA
+        );
+        assert_eq!(body["terminal_receipt"]["strategy"], body["strategy"]);
+        assert_eq!(body["terminal_receipt"]["legs"], body["legs"]);
+        assert_eq!(
+            body["terminal_receipt"]["total_cost_usd"],
+            body["total_cost_usd"]
+        );
+        assert_eq!(body["terminal_receipt"]["quorum"], body["quorum"]);
+        assert_eq!(
+            body["terminal_receipt"]["cost_incomplete"],
+            body["cost_incomplete"]
+        );
+        assert_eq!(body["terminal_receipt"]["arbiter"], body["arbiter"]);
+        assert_eq!(
+            body["terminal_receipt"]["candidate_content_limit_bytes"],
+            MAX_FUSION_CANDIDATE_CONTENT_BYTES
+        );
+        assert_eq!(body["terminal_receipt"]["successful_member_legs"], 1);
+        assert_eq!(body["terminal_receipt"]["captured_candidate_answers"], 1);
+
+        let candidate = &body["terminal_receipt"]["candidates"][0];
+        let retained = candidate["content"].as_str().expect("candidate content");
+        assert!(retained.len() <= MAX_FUSION_CANDIDATE_CONTENT_BYTES);
+        assert!(retained.is_char_boundary(retained.len()));
+        assert_eq!(candidate["answer_bytes"], answer.len());
+        assert_eq!(candidate["retained_bytes"], retained.len());
+        assert_eq!(candidate["truncated"], true);
+        assert_eq!(candidate["answer_sha256"], sha256_hex(answer.as_bytes()));
+        assert_eq!(
+            candidate["retained_sha256"],
+            sha256_hex(retained.as_bytes())
+        );
+
+        assert_eq!(body["legs"][0]["requested_model"], "member");
+        assert_eq!(body["legs"][0]["model"], "member-resolved");
+        assert_eq!(body["legs"][0]["latency_ms"], 42);
+        assert_eq!(body["legs"][0]["cache"]["state"], "provider_reported_hit");
+        assert_eq!(body["legs"][0]["cache"]["read_tokens"], 80);
+        assert_eq!(body["legs"][0]["cache"]["write_tokens"], 20);
+        assert_eq!(body["legs"][1]["cache"]["state"], "provider_reported_zero");
+        assert_eq!(body["legs"][1]["tokens"]["input_tokens"], 200);
+        assert_eq!(body["legs"][1]["tokens"]["cached_tokens"], 0);
     }
 
     #[test]
