@@ -5,10 +5,12 @@
 //! Concurrent writes for the same org could otherwise race and produce two
 //! entries with the same `prev_hash`, breaking [`super::verify_chain`].
 //!
-//! Concurrency strategy: a SERIALIZABLE transaction with an explicit
-//! `SELECT ... FOR UPDATE` against the last row. The `FOR UPDATE` lock
-//! holds across the INSERT so a parallel append on the same org blocks
-//! until we commit. Other orgs are unaffected.
+//! Concurrency strategy: a transaction-scoped advisory lock derived from the
+//! organization UUID, followed by an explicit `SELECT ... FOR UPDATE` against
+//! the last row. The advisory lock is load-bearing for an empty chain, where
+//! there is no predecessor row for `FOR UPDATE` to lock. It holds through the
+//! INSERT and commit, so parallel appends for the same org serialize from the
+//! very first entry while other organizations remain independent.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Timelike, Utc};
@@ -76,9 +78,24 @@ impl AuditWriter for PostgresAuditWriter {
             .await
             .map_err(|e| AuditError::Storage(e.to_string()))?;
 
-        // Lock the most recent row for this org so concurrent appends
-        // block until we commit. Without FOR UPDATE two writers could
-        // observe the same prev_hash and break the chain.
+        // Serialize the entire read-sign-insert decision, including genesis.
+        // `FOR UPDATE` alone cannot lock the absence of a predecessor row, so
+        // two first writes could otherwise both sign seq=0 against zeroes.
+        // `hashtextextended` maps the UUID to PostgreSQL's bigint advisory-lock
+        // namespace; a hash collision only causes harmless extra serialization.
+        // Keep the seed in sync with migration 0083's defensive INSERT trigger.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                 hashtextextended($1::text, 1953792361)\
+             )",
+        )
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AuditError::Storage(e.to_string()))?;
+
+        // The advisory lock is the cross-process fence. Retain the row lock as
+        // defense in depth and to make the protected predecessor explicit.
         let last: Option<(String, i64)> = sqlx::query_as(
             "SELECT hash, seq FROM audit_entries \
              WHERE org_id = $1 \
@@ -198,6 +215,103 @@ impl AuditWriter for PostgresAuditWriter {
         .map_err(|e| AuditError::Storage(e.to_string()))?;
 
         rows.into_iter().map(AuditRow::into_entry).collect()
+    }
+}
+
+#[cfg(test)]
+mod genesis_race_tests {
+    use std::{str::FromStr as _, sync::Arc};
+
+    use sqlx::{postgres::PgConnectOptions, Executor as _};
+
+    use super::*;
+
+    /// Regression for the empty-chain race found in staging on 2026-08-03.
+    ///
+    /// The test owns a UUID-named schema and connects every pool session with
+    /// that schema first in `search_path`, so it cannot touch an application's
+    /// real `audit_entries`. Run through the existing Postgres CI gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "requires TEST_DATABASE_URL (Postgres; creates an isolated temporary schema)"]
+    async fn concurrent_genesis_appends_are_one_gap_free_chain() {
+        let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let admin_pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect test database");
+        let schema = format!("audit_genesis_{}", Uuid::new_v4().simple());
+        admin_pool
+            .execute(format!("CREATE SCHEMA \"{schema}\"").as_str())
+            .await
+            .expect("create isolated schema");
+
+        let options = PgConnectOptions::from_str(&database_url)
+            .expect("parse TEST_DATABASE_URL")
+            .options([("search_path", schema.clone())]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(16)
+            .connect_with(options)
+            .await
+            .expect("connect isolated audit schema");
+        pool.execute(
+            "CREATE TABLE audit_entries (\
+                 id UUID PRIMARY KEY,\
+                 org_id UUID NOT NULL,\
+                 ts TIMESTAMPTZ NOT NULL,\
+                 actor JSONB NOT NULL,\
+                 event TEXT NOT NULL,\
+                 payload JSONB NOT NULL,\
+                 prev_hash TEXT NOT NULL,\
+                 hash TEXT NOT NULL,\
+                 signature TEXT NOT NULL,\
+                 seq BIGINT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create isolated audit table");
+
+        let writer = Arc::new(PostgresAuditWriter::new(
+            pool.clone(),
+            super::super::generate_signing_key(),
+        ));
+        let verifying_key = writer.verifying_key();
+        let org_id = Uuid::new_v4();
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let writer = writer.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                writer
+                    .write(
+                        org_id,
+                        Actor::System,
+                        format!("concurrent.genesis.{index}"),
+                        serde_json::json!({"index": index}),
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("join concurrent append")
+                .expect("append concurrent entry");
+        }
+
+        let entries = writer.list(org_id).await.expect("list audit chain");
+        assert_eq!(entries.len(), 16);
+        for (expected, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.seq, expected as i64);
+        }
+        super::super::verify_chain(&entries, &verifying_key)
+            .expect("concurrent chain verifies end to end");
+
+        pool.close().await;
+        admin_pool
+            .execute(format!("DROP SCHEMA \"{schema}\" CASCADE").as_str())
+            .await
+            .expect("drop isolated schema");
+        admin_pool.close().await;
     }
 }
 

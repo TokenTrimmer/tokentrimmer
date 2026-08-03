@@ -91,7 +91,7 @@ pub fn build_entry(
 ///
 /// Implementations are responsible for atomic `prev_hash` lookup + append to
 /// prevent races. The in-memory writer uses a `Mutex`; Postgres uses a
-/// serializable transaction.
+/// transaction-scoped, per-organization advisory lock.
 #[async_trait]
 pub trait AuditWriter: Send + Sync {
     /// Append a new entry to the chain, returning the constructed [`AuditEntry`].
