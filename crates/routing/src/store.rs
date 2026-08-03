@@ -722,7 +722,7 @@ mod pg {
           LEFT JOIN public.route_pauses p
             ON p.route_id = r.id AND p.resumed_at IS NULL
          WHERE r.org_id = $1 AND r.enabled = TRUE
-         ORDER BY r.priority DESC, r.created_at ASC
+         ORDER BY r.priority DESC, r.created_at ASC, r.id ASC
     "#;
 
     // Rolling-deploy compatibility for a gateway released before the cloud
@@ -737,8 +737,15 @@ mod pg {
           LEFT JOIN public.route_pauses p
             ON p.route_id = r.id AND p.resumed_at IS NULL
          WHERE r.org_id = $1 AND r.enabled = TRUE
-         ORDER BY r.priority DESC, r.created_at ASC
+         ORDER BY r.priority DESC, r.created_at ASC, r.id ASC
     "#;
+
+    const MANAGEMENT_ROUTE_ROWS_SQL: &str =
+        "SELECT r.id, r.revision, r.name, r.priority, r.enabled, r.conditions, r.target, \
+                (p.route_id IS NOT NULL) AS paused \
+         FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id AND p.resumed_at IS NULL \
+         WHERE r.org_id = $1 \
+         ORDER BY r.priority DESC, r.created_at ASC, r.id ASC";
 
     fn route_versions_table_is_absent(error: &sqlx::Error) -> bool {
         error
@@ -837,16 +844,11 @@ mod pg {
         }
 
         async fn list_all_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
-            let rows = sqlx::query_as::<_, MgmtRouteRow>(
-                "SELECT r.id, r.revision, r.name, r.priority, r.enabled, r.conditions, r.target, \
-                        (p.route_id IS NOT NULL) AS paused \
-                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id AND p.resumed_at IS NULL \
-                 WHERE r.org_id = $1 ORDER BY r.priority DESC, r.created_at ASC",
-            )
-            .bind(org_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            let rows = sqlx::query_as::<_, MgmtRouteRow>(MANAGEMENT_ROUTE_ROWS_SQL)
+                .bind(org_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
             Ok(rows
                 .into_iter()
                 .filter_map(MgmtRouteRow::into_route)
@@ -857,16 +859,11 @@ mod pg {
             &self,
             org_id: Uuid,
         ) -> Result<Vec<RouteManagementView>, RoutingStoreError> {
-            let rows = sqlx::query_as::<_, MgmtRouteRow>(
-                "SELECT r.id, r.revision, r.name, r.priority, r.enabled, r.conditions, r.target, \
-                        (p.route_id IS NOT NULL) AS paused \
-                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id AND p.resumed_at IS NULL \
-                 WHERE r.org_id = $1 ORDER BY r.priority DESC, r.created_at ASC",
-            )
-            .bind(org_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            let rows = sqlx::query_as::<_, MgmtRouteRow>(MANAGEMENT_ROUTE_ROWS_SQL)
+                .bind(org_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
             Ok(rows
                 .into_iter()
                 .map(MgmtRouteRow::into_management_view)
@@ -1249,6 +1246,20 @@ mod pg {
                 RUNTIME_ROUTE_ROWS_WITHOUT_LEDGER_SQL.contains("NULL::BIGINT AS route_version_id"),
                 "rolling-deploy fallback must preserve unknown provenance as NULL"
             );
+        }
+
+        #[test]
+        fn every_postgres_route_list_has_a_stable_uuid_tie_break() {
+            for query in [
+                RUNTIME_ROUTE_ROWS_SQL,
+                RUNTIME_ROUTE_ROWS_WITHOUT_LEDGER_SQL,
+                MANAGEMENT_ROUTE_ROWS_SQL,
+            ] {
+                assert!(
+                    query.contains("ORDER BY r.priority DESC, r.created_at ASC, r.id ASC"),
+                    "same-priority, same-timestamp rows must use the UUID as the final stable order"
+                );
+            }
         }
     }
 }
