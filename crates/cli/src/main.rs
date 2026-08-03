@@ -2064,16 +2064,21 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         tracing::warn!("no DB pool; per-org tier limits + budget caps NOT enforced");
     }
 
-    // Request-log writer: Postgres when available. The dashboard's
-    // `/api/telemetry` endpoint reads from this table for spend / savings
-    // / cache hit rate cards.
+    // Request + panel-leg telemetry writers: Postgres when available. The
+    // dashboard reads `request_logs` for aggregate spend/savings/cache cards,
+    // while `panel_legs` preserves the provider/model/cost attribution for
+    // every Fusion member and arbiter. They share the same parent request ID,
+    // so production must never install one writer without the other.
     if let Some(pool) = db_pool.as_ref() {
         state = state.with_request_log_writer(Arc::new(
             tt_telemetry::request_logs::postgres::PostgresRequestLogWriter::new(pool.clone()),
         ));
-        tracing::info!("request_logs writer: Postgres-backed");
+        state = state.with_panel_leg_writer(Arc::new(
+            tt_telemetry::panel_legs::postgres::PostgresPanelLegWriter::new(pool.clone()),
+        ));
+        tracing::info!("request_logs + panel_legs writers: Postgres-backed");
     } else {
-        tracing::warn!("no DB pool; request_logs writes disabled");
+        tracing::warn!("no DB pool; request_logs + panel_legs writes disabled");
     }
 
     // Encrypted body capture: DB + TT_MASTER_KEY arms the sink, but writes
@@ -3500,6 +3505,31 @@ mod plan_apply_tests {
         )
         .await
         .expect("projection without --apply should succeed");
+    }
+}
+
+#[cfg(test)]
+mod hosted_telemetry_wiring_tests {
+    #[test]
+    fn database_startup_installs_aggregate_and_panel_leg_writers_together() {
+        let source = include_str!("main.rs");
+        let block = source
+            .split("// Request + panel-leg telemetry writers:")
+            .nth(1)
+            .and_then(|rest| rest.split("// Encrypted body capture:").next())
+            .expect("hosted telemetry startup block");
+        let aggregate_builder = ["with", "request", "log", "writer"].join("_");
+        let leg_builder = ["with", "panel", "leg", "writer"].join("_");
+        let leg_writer = ["Postgres", "Panel", "Leg", "Writer"].join("");
+
+        assert!(
+            block.contains(&aggregate_builder),
+            "database startup must install the aggregate request writer"
+        );
+        assert!(
+            block.contains(&leg_builder) && block.contains(&leg_writer),
+            "database startup must install the Postgres panel-leg writer beside the aggregate writer"
+        );
     }
 }
 
