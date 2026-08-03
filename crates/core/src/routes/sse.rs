@@ -804,13 +804,13 @@ impl TrackedEventStream {
         //   - Get the streamed arbiter cost by repricing the accumulated usage.
         //   - Pass it through `arbiter_cost_plan.finalize` (Known discards it).
         //   - Sum with `leg_cost_total`.
+        let streamed_arbiter_usage = {
+            let guard = self.inner.lock().expect("tracking stream mutex poisoned");
+            partial_to_usage(&guard.snapshot())
+        };
         let streamed_arbiter_cost: Option<f64> = if let Some(pricing) = self.pricing.as_ref() {
-            let usage = {
-                let guard = self.inner.lock().expect("tracking stream mutex poisoned");
-                guard.snapshot()
-            };
             let breakdown = crate::routes::chat::compute_cost_full(
-                &partial_to_usage(&usage),
+                &streamed_arbiter_usage,
                 Some(pricing),
                 self.baseline_pricing.as_ref(),
                 self.fee_multiplier,
@@ -834,8 +834,11 @@ impl TrackedEventStream {
             &p.arbiter_detail,
             p.quorum_required,
             p.quorum_met,
-            total_cost_usd,
-            arbiter_cost_usd,
+            crate::routes::panel::PanelTerminalAccounting {
+                total_cost_usd,
+                arbiter_cost_usd,
+                arbiter_usage: Some(&streamed_arbiter_usage),
+            },
         );
         match serde_json::to_string(&value) {
             Ok(json) => Some(Event::default().event("tokentrimmer.panel").data(json)),

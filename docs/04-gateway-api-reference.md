@@ -1732,7 +1732,7 @@ data: [DONE]
 | `quorum.required` | integer | Minimum legs required to succeed. |
 | `quorum.met` | integer | Legs that actually succeeded. |
 | `legs[]` | array | One entry per dispatched leg (members + arbiter), in dispatch order. |
-| `legs[].leg_index` | integer | Zero-based index into the member list; arbiter entry uses a sentinel value. |
+| `legs[].leg_index` | integer | Compact zero-based index into the emitted `legs` array, including the arbiter entry. |
 | `legs[].role` | string | `"leg"` for a panel member, `"arbiter"` for the arbitration call. |
 | `legs[].requested_model` | string | Exact model id requested for this leg before provider alias resolution. |
 | `legs[].model` | string | Provider-reported resolved model id; this can be a dated revision of `requested_model`. |
@@ -1740,6 +1740,8 @@ data: [DONE]
 | `legs[].cost_usd` | float\|null | Cost for this leg; `null` when the model is unpriced. |
 | `legs[].status` | string | `"ok"`, `"error"`, `"timeout"`, or `"skipped_no_cred"`. |
 | `legs[].tokens` | object\|null | `{ input_tokens, output_tokens, cached_tokens }`; `null` on non-ok legs. |
+| `legs[].latency_ms` | integer | Gateway-observed wall-clock dispatch latency for this leg, capped at a 32-bit unsigned value. |
+| `legs[].cache` | object | Closed terminal cache provenance: provider-reported hit, provider-reported zero, provider omission, or unavailable usage, with nullable raw read/write token fields. |
 | `arbiter.strategy` | string | Strategy name. |
 | `arbiter.cost_usd` | float\|null | Cost of the arbiter call alone; `null` for `majority` (no LLM call). |
 | `arbiter.chosen_leg` | integer | (`best-of-n` only) leg_index of the chosen answer. |
@@ -1749,6 +1751,27 @@ data: [DONE]
 | `arbiter.total_clusters` | integer | (`majority` only) Total distinct clusters found. |
 | `arbiter.no_majority` | boolean | (`majority` only) `true` when all answers were distinct (global medoid returned). |
 | `arbiter.degraded` | boolean | (`majority` only) `true` when embedding failed; fell back to first leg. |
+| `terminal_receipt` | object | Versioned `tokentrimmer.fusion-terminal-receipt.v1` candidate-answer receipt described below. |
+
+`terminal_receipt` repeats the terminal strategy, legs, aggregate cost, quorum,
+cost-completeness flag, and arbiter object under the exact
+`tokentrimmer.fusion-terminal-receipt.v1` schema so it can be exported and
+validated as one self-contained object. Its `candidates[]` contains one bounded
+plain-text answer for each successful member leg whose first assistant choice
+is text. Each row binds the emitted `leg_index`, the retained content, exact
+full/retained UTF-8 byte counts, a truncation flag, and separate SHA-256 digests
+for the complete answer and retained prefix. Candidate content is capped at 12
+KiB per member and is therefore a review/export preview, not an unbounded
+archive. The receipt also reports the successful-member count and
+captured-answer count so a client cannot mistake missing non-text candidates
+for agreement.
+
+This terminal receipt is gateway-authored, additive, and unsigned. Candidate
+answers can contain the same sensitive material as ordinary model output; store
+or export them only under the caller's applicable retention policy. Digests
+prove byte identity within the receipt but do not prove provider authorship,
+semantic correctness, claim agreement, calibrated confidence, quality, or
+invoice reconciliation.
 
 The `tokentrimmer.panel` shape is **identical across all three ingresses** — `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` all carry or emit the same object.
 
