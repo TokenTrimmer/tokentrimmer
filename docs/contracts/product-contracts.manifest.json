@@ -98,7 +98,7 @@
     },
     {
       "path": "docs/route-contract/route-write.schema.json",
-      "sha256": "e2f2c6d224350fe17cf15b91e6ca56c63947fbb30ba422b55d5662392cf25a09"
+      "sha256": "d5bc7e9b324de50af0f0ef9d4e7a97e15aeb39495e757882b9ad23d4cc57833f"
     },
     {
       "path": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json",

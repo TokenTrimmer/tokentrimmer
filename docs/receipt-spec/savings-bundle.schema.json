@@ -1466,7 +1466,7 @@
         },
         "quorum": {
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 1.0,
           "type": [
             "integer",
             "null"

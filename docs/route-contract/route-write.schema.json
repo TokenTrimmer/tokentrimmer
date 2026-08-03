@@ -141,9 +141,10 @@
           ]
         },
         "pause_min_verdicts": {
-          "description": "Minimum classified verdicts (acceptable + degraded) in-window before the floor can trigger. `None` = the gateway default (`DEFAULT_PAUSE_MIN_VERDICTS` = 20 in tt-core). Omitted from JSON when `None`.",
+          "description": "Minimum classified verdicts (acceptable + degraded) in-window before the floor can trigger. `None` = the gateway default (`DEFAULT_PAUSE_MIN_VERDICTS` = 20 in tt-core). Explicit values are bounded to the evaluator's finite 100-verdict window. Omitted from JSON when `None`.",
           "format": "uint32",
-          "minimum": 0.0,
+          "maximum": 100.0,
+          "minimum": 1.0,
           "type": [
             "integer",
             "null"
@@ -152,7 +153,7 @@
         "reasoning_budget_tokens": {
           "description": "Cap Anthropic-style extended-thinking spend: when the request carries a `thinking` config (`extra[\"thinking\"].budget_tokens`) above this, the budget is lowered to this value. NEVER expressed via `max_tokens` (Anthropic's max_tokens INCLUDES thinking — bounding it would truncate the answer). Never ENABLES thinking on a request that didn't ask for it. Minimum 1024 (Anthropic's floor). Same class gate / $0 booking as `reasoning_max_effort`. `None` = off (default); omitted when `None`.",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 1024.0,
           "type": [
             "integer",
             "null"
@@ -184,8 +185,9 @@
           ]
         },
         "traffic_pct": {
-          "description": "Canary traffic split (0-100). When `Some(pct)`, only a deterministic `pct`% of the matched requests are routed to `target_model` (the canary arm); the remaining `(100 - pct)%` pass through on their originally-requested model (the control arm). The arm is chosen by the replica-independent [`sticky_traffic_split`] hash so the same logical request always lands in the same arm across replicas and retries.\n\n`None` (the default) = 100% of matched requests take the route (unconditional rewrite, today's behavior). `Some(0)` = 0% canary (the route never rewrites, only its `shadow_model`/side-effects could fire). Values above 100 are clamped to 100 by the split function. Omitted from JSON when `None` (back-compat with existing rows).",
+          "description": "Canary traffic split (0-100). When `Some(pct)`, only a deterministic `pct`% of the matched requests are routed to `target_model` (the canary arm); the remaining `(100 - pct)%` pass through on their originally-requested model (the control arm). The arm is chosen by the replica-independent [`sticky_traffic_split`] hash so the same logical request always lands in the same arm across replicas and retries.\n\n`None` (the default) = 100% of matched requests take the route (unconditional rewrite, today's behavior). `Some(0)` = 0% canary (the route never rewrites, only its `shadow_model`/side-effects could fire). Route validation rejects values above 100; the split function still clamps them defensively for direct library callers. Omitted from JSON when `None` (back-compat with existing rows).",
           "format": "uint32",
+          "maximum": 100.0,
           "minimum": 0.0,
           "type": [
             "integer",
@@ -341,7 +343,7 @@
         },
         "quorum": {
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 1.0,
           "type": [
             "integer",
             "null"
