@@ -123,13 +123,12 @@ pub mod postgres {
     /// child from creating a new orphan without turning the response path into
     /// a cross-writer transaction.
     ///
-    /// A batch whose parent is still missing (for example, its detached
-    /// request-log write has not committed, or was already purged) is a
-    /// deliberate best-effort drop: it returns `Ok(())` and emits a
-    /// count-only warning rather than storing unowned telemetry. This cannot
-    /// repair legacy orphans or guarantee attribution if the parent writer
-    /// never commits; the shared FK prevents a committed orphan but a
-    /// coordinated parent/child writer plus legacy remediation remain needed.
+    /// The parent request-log and child-leg writes are detached sibling tasks.
+    /// A normal child can therefore reach Postgres just before its parent
+    /// commits. An all-missing batch receives a short bounded retry here; a
+    /// parent still absent after that window (for example, because it failed or
+    /// was purged) remains a deliberate best-effort drop. The response path is
+    /// never blocked, and the parent lock/FK boundary still prevents orphans.
     #[derive(Clone)]
     pub struct PostgresPanelLegWriter {
         pool: PgPool,
@@ -153,6 +152,20 @@ pub mod postgres {
     /// Must stay in sync with the `push_values` closure and the table schema.
     pub const INSERT_COLUMN_COUNT: usize = 12;
 
+    /// One initial parent-gated insert plus four short retries covers the
+    /// aggregate writer's normal commit and its bounded 50ms/100ms transient
+    /// retry schedule without retaining a detached telemetry task indefinitely.
+    pub(super) const PARENT_COMMIT_ATTEMPTS: u32 = 5;
+    const PARENT_COMMIT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+
+    pub(super) fn should_retry_missing_parent(
+        inserted: u64,
+        requested: usize,
+        attempt: u32,
+    ) -> bool {
+        inserted == 0 && requested > 0 && attempt < PARENT_COMMIT_ATTEMPTS
+    }
+
     #[async_trait]
     impl PanelLegWriter for PostgresPanelLegWriter {
         async fn write_legs(&self, rows: Vec<PanelLegRow>) -> Result<(), RequestLogError> {
@@ -161,66 +174,85 @@ pub mod postgres {
             }
 
             let requested = rows.len();
-            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-                "WITH input \
-                 (request_log_id, leg_index, role, provider, model, \
-                  input_tokens, output_tokens, cached_tokens, \
-                  cost_usd, latency_ms, status, error_class) AS (",
-            );
+            let mut backoff = PARENT_COMMIT_BACKOFF;
+            for attempt in 1..=PARENT_COMMIT_ATTEMPTS {
+                let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                    "WITH input \
+                     (request_log_id, leg_index, role, provider, model, \
+                      input_tokens, output_tokens, cached_tokens, \
+                      cost_usd, latency_ms, status, error_class) AS (",
+                );
 
-            qb.push_values(rows, |mut b, r| {
-                b.push_bind(r.request_log_id) // request_log_id
-                    .push_bind(r.leg_index) // leg_index
-                    .push_bind(r.role) // role
-                    .push_bind(r.provider) // provider
-                    .push_bind(r.model) // model
-                    .push_bind(r.input_tokens) // input_tokens
-                    .push_bind(r.output_tokens) // output_tokens
-                    .push_bind(r.cached_tokens) // cached_tokens
-                    .push_bind(r.cost_usd) // cost_usd
-                    .push_bind(r.latency_ms) // latency_ms
-                    .push_bind(r.status) // status
-                    .push_bind(r.error_class); // error_class
-            });
+                // Panel batches are capped at nine rows, so cloning for a
+                // bounded retry is cheap and keeps every attempt byte-for-byte
+                // equivalent without retaining bind references across await.
+                qb.push_values(rows.clone(), |mut b, r| {
+                    b.push_bind(r.request_log_id) // request_log_id
+                        .push_bind(r.leg_index) // leg_index
+                        .push_bind(r.role) // role
+                        .push_bind(r.provider) // provider
+                        .push_bind(r.model) // model
+                        .push_bind(r.input_tokens) // input_tokens
+                        .push_bind(r.output_tokens) // output_tokens
+                        .push_bind(r.cached_tokens) // cached_tokens
+                        .push_bind(r.cost_usd) // cost_usd
+                        .push_bind(r.latency_ms) // latency_ms
+                        .push_bind(r.status) // status
+                        .push_bind(r.error_class); // error_class
+                });
 
-            // The parent row lock is deliberately inside the same statement as
-            // the insert. `FOR KEY SHARE` conflicts with the `FOR UPDATE` used
-            // by cloud retention/account purge, so either side wins as one
-            // atomic lifecycle decision. Joining the locked IDs also makes a
-            // missing/deleted parent a no-op instead of an orphan leg.
-            qb.push(
-                "), locked_parents AS MATERIALIZED (\
-                    SELECT log.id \
-                    FROM request_logs AS log \
-                    WHERE log.id IN (SELECT DISTINCT request_log_id FROM input) \
-                    FOR KEY SHARE\
-                 ) \
-                 INSERT INTO panel_legs \
-                 (request_log_id, leg_index, role, provider, model, \
-                  input_tokens, output_tokens, cached_tokens, \
-                  cost_usd, latency_ms, status, error_class) \
-                 SELECT input.request_log_id, input.leg_index, input.role, \
-                        input.provider, input.model, input.input_tokens, \
-                        input.output_tokens, input.cached_tokens, input.cost_usd, \
-                        input.latency_ms, input.status, input.error_class \
-                 FROM input \
-                 JOIN locked_parents AS parent \
-                   ON parent.id = input.request_log_id",
-            );
+                // The parent row lock is deliberately inside the same statement
+                // as the insert. `FOR KEY SHARE` conflicts with the `FOR UPDATE`
+                // used by cloud retention/account purge, so either side wins as
+                // one atomic lifecycle decision. Joining the locked IDs also
+                // makes a missing/deleted parent a no-op instead of an orphan.
+                qb.push(
+                    "), locked_parents AS MATERIALIZED (\
+                        SELECT log.id \
+                        FROM request_logs AS log \
+                        WHERE log.id IN (SELECT DISTINCT request_log_id FROM input) \
+                        FOR KEY SHARE\
+                     ) \
+                     INSERT INTO panel_legs \
+                     (request_log_id, leg_index, role, provider, model, \
+                      input_tokens, output_tokens, cached_tokens, \
+                      cost_usd, latency_ms, status, error_class) \
+                     SELECT input.request_log_id, input.leg_index, input.role, \
+                            input.provider, input.model, input.input_tokens, \
+                            input.output_tokens, input.cached_tokens, input.cost_usd, \
+                            input.latency_ms, input.status, input.error_class \
+                     FROM input \
+                     JOIN locked_parents AS parent \
+                       ON parent.id = input.request_log_id",
+                );
 
-            let inserted = qb
-                .build()
-                .execute(&self.pool)
-                .await
-                .map_err(classify_sqlx_error)?
-                .rows_affected();
-            if inserted < requested as u64 {
+                let inserted = qb
+                    .build()
+                    .execute(&self.pool)
+                    .await
+                    .map_err(classify_sqlx_error)?
+                    .rows_affected();
+                if inserted == requested as u64 {
+                    return Ok(());
+                }
+                if should_retry_missing_parent(inserted, requested, attempt) {
+                    tracing::debug!(
+                        attempt,
+                        max_attempts = PARENT_COMMIT_ATTEMPTS,
+                        requested,
+                        "panel_legs parent not committed yet; retrying bounded detached write"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                    continue;
+                }
                 tracing::warn!(
                     requested,
                     inserted,
                     dropped = requested.saturating_sub(inserted as usize),
                     "panel_legs skipped because request_logs parent was missing or deleted"
                 );
+                return Ok(());
             }
             Ok(())
         }
@@ -340,7 +372,7 @@ mod tests {
 
         let source = include_str!("panel_legs.rs");
         let start = source
-            .find("qb.push_values(rows,")
+            .find("qb.push_values(rows.clone(),")
             .expect("write_legs() must call push_values");
         let rest = &source[start..];
         let end = rest
@@ -357,13 +389,11 @@ mod tests {
     }
 
     /// The Postgres batch insert must parent-gate every child in the same SQL
-    /// statement. A detached leg arriving after cloud retention/account purge
-    /// has deleted its request log is intentionally dropped rather than
-    /// persisted as an orphan; `write_legs` remains `Ok(())` because this is
-    /// best-effort attribution telemetry and the count-only warning is the
-    /// observable signal. Keep this source contract even with the shared-cloud
-    /// FK: standalone schemas and pre-parent detached writes still rely on it,
-    /// and a transactional parent/child writer remains a separate improvement.
+    /// statement. A detached leg arriving before its aggregate request-log
+    /// commit gets a bounded retry; a leg arriving after cloud retention or
+    /// account purge has deleted its parent is still dropped rather than
+    /// persisted as an orphan. Keep the parent gate even with the shared-cloud
+    /// FK because standalone schemas also use this writer.
     #[cfg(feature = "postgres")]
     #[test]
     fn postgres_batch_insert_parent_gates_missing_parent_rows() {
@@ -396,5 +426,21 @@ mod tests {
                 .contains("panel_legs skipped because request_logs parent was missing or deleted"),
             "missing-parent drops must be observable without logging tenant identifiers"
         );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn missing_parent_retry_is_bounded_and_never_retries_partial_inserts() {
+        use crate::panel_legs::postgres::{should_retry_missing_parent, PARENT_COMMIT_ATTEMPTS};
+
+        assert!(should_retry_missing_parent(0, 3, 1));
+        assert!(should_retry_missing_parent(
+            0,
+            3,
+            PARENT_COMMIT_ATTEMPTS - 1
+        ));
+        assert!(!should_retry_missing_parent(0, 3, PARENT_COMMIT_ATTEMPTS));
+        assert!(!should_retry_missing_parent(1, 3, 1));
+        assert!(!should_retry_missing_parent(0, 0, 1));
     }
 }
