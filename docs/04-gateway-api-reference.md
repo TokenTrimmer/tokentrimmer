@@ -1663,7 +1663,8 @@ On a successful non-streaming panel request the response body is the standard ch
         {
           "leg_index": 0,
           "role": "leg",
-          "model": "gpt-4o",
+          "requested_model": "gpt-4o",
+          "model": "gpt-4o-2024-08-06",
           "provider": "openai",
           "cost_usd": 0.00080,
           "status": "ok",
@@ -1672,6 +1673,7 @@ On a successful non-streaming panel request the response body is the standard ch
         {
           "leg_index": 1,
           "role": "leg",
+          "requested_model": "claude-3-5-sonnet-20241022",
           "model": "claude-3-5-sonnet-20241022",
           "provider": "anthropic",
           "cost_usd": 0.00109,
@@ -1681,6 +1683,7 @@ On a successful non-streaming panel request the response body is the standard ch
         {
           "leg_index": 2,
           "role": "leg",
+          "requested_model": "gemini-1.5-pro",
           "model": "gemini-1.5-pro",
           "provider": "google",
           "cost_usd": 0.00021,
@@ -1690,7 +1693,8 @@ On a successful non-streaming panel request the response body is the standard ch
         {
           "leg_index": 3,
           "role": "arbiter",
-          "model": "gpt-4o",
+          "requested_model": "gpt-4o",
+          "model": "gpt-4o-2024-08-06",
           "provider": "openai",
           "cost_usd": 0.00131,
           "status": "ok",
@@ -1730,7 +1734,8 @@ data: [DONE]
 | `legs[]` | array | One entry per dispatched leg (members + arbiter), in dispatch order. |
 | `legs[].leg_index` | integer | Zero-based index into the member list; arbiter entry uses a sentinel value. |
 | `legs[].role` | string | `"leg"` for a panel member, `"arbiter"` for the arbitration call. |
-| `legs[].model` | string | Model id dispatched for this leg. |
+| `legs[].requested_model` | string | Exact model id requested for this leg before provider alias resolution. |
+| `legs[].model` | string | Provider-reported resolved model id; this can be a dated revision of `requested_model`. |
 | `legs[].provider` | string | Provider id used for dispatch. |
 | `legs[].cost_usd` | float\|null | Cost for this leg; `null` when the model is unpriced. |
 | `legs[].status` | string | `"ok"`, `"error"`, `"timeout"`, or `"skipped_no_cred"`. |
