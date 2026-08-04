@@ -205,12 +205,13 @@ default of `100` is applied when you don't set one.
 tt route list                 # table of NAME, ROUTE, PRIO, STATUS
 tt route show <id>            # the full JSON for one route
 tt route rm <id>              # delete one route by id
-tt route add ...              # create a route (see below)
+tt route add ...              # create a disabled route draft (see below)
 ```
 
 ### `tt route add`
 
-The CLI maps friendly flags onto the `when` / `then` JSON above. A target is
+The CLI maps friendly flags onto the `when` / `then` JSON above and always
+creates a disabled draft. Review and activate it in Dashboard → Routes. A target is
 required: pass `--always <model>` (match-all) **or** `--from <m> --to <m>`
 (rewrite one model to another) — not both.
 
@@ -232,11 +233,11 @@ required: pass `--always <model>` (match-all) **or** `--from <m> --to <m>`
 | `--fallback <model>`          | appended to `then.fallbacks` (repeatable)        |
 | `--priority <n>`              | `priority` (default `100`)                       |
 | `--name <name>`               | `name` (default `<from>-><target>` or `all-><target>`) |
-| `--disabled`                  | create the route `enabled: false`                |
+| `--disabled`                  | compatibility no-op; drafts are always disabled |
 
 > `tt route add` does **not** expose `input_tokens_lt` / `input_tokens_gt`. To
 > match on token count, POST the JSON directly to `/v1/routes` (the field names
-> are in the conditions table above).
+> are in the conditions table above). Direct POST also creates a disabled draft.
 
 There is **no update** — to change a route, `rm` it and `add` it again
 (the gateway serves no `PATCH /v1/routes/:id`).

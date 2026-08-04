@@ -204,7 +204,8 @@ async fn create_list_get_delete_round_trip() {
     assert!(created["canonical_hash"]
         .as_str()
         .is_some_and(|hash| hash.starts_with("sha256:")));
-    assert_eq!(created["activation"]["state"], json!("active"));
+    assert_eq!(created["enabled"], json!(false));
+    assert_eq!(created["activation"]["state"], json!("disabled"));
 
     let r = app
         .clone()
@@ -219,7 +220,7 @@ async fn create_list_get_delete_round_trip() {
     assert!(listed[0]["canonical_hash"]
         .as_str()
         .is_some_and(|hash| hash.starts_with("sha256:")));
-    assert_eq!(listed[0]["activation"]["state"], json!("active"));
+    assert_eq!(listed[0]["activation"]["state"], json!("disabled"));
 
     let r = app
         .clone()
@@ -1073,26 +1074,25 @@ async fn savings_endpoint_shape() {
 }
 
 #[tokio::test]
-async fn created_route_applies_immediately_without_ttl_wait() {
+async fn generic_create_rejects_explicit_activation_without_writing() {
     let (app, key, served) = app_with_key().await;
-    let spec = json!({ "name": "downgrade", "when": {"model_in":["gpt-4o"]}, "then": {"target_model":"gpt-4o-mini"} });
+    let spec = json!({ "name": "downgrade", "enabled": true, "when": {"model_in":["gpt-4o"]}, "then": {"target_model":"gpt-4o-mini"} });
     let r = app
         .clone()
         .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::CREATED);
-
-    let chat =
-        json!({ "model": "gpt-4o", "messages": [{"role":"user","content":"hi"}], "stream": false });
-    let r = app
-        .oneshot(req("POST", "/v1/chat/completions", Some(&key), Some(chat)))
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let error = body_json(r).await;
+    assert_eq!(error["error"]["param"], json!("enabled"));
+    assert_eq!(
+        error["error"]["issues"][0]["code"],
+        json!("activation_confirmation_required")
+    );
+    let listed = app
+        .oneshot(req("GET", "/v1/routes", Some(&key), None))
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    // Cache was invalidated on create → the brand-new route applied on the very next request.
-    assert_eq!(
-        served.lock().unwrap().clone(),
-        vec!["gpt-4o-mini".to_string()]
-    );
+    assert_eq!(body_json(listed).await, json!([]));
+    assert!(served.lock().unwrap().is_empty());
 }

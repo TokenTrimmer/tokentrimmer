@@ -73,7 +73,7 @@ that is **off by default** — when disabled they are omitted from `tools/list`
 entirely and calling them returns `MethodNotFound` (-32601), so a read-only
 server stays read-only:
 
-- `add_route` — create a routing rule for your authenticated organization
+- `add_route` — create a disabled routing-rule draft for your authenticated organization
 - `apply_plan` — apply a previously-simulated plan (a `plan_run` UUID from
   `simulate_plan`)
 

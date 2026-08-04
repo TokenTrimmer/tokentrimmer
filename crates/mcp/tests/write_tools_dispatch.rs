@@ -91,12 +91,13 @@ async fn enabled_add_route_dispatches_to_gateway() {
         .mock_async(|when, then| {
             when.method(POST)
                 .path("/v1/routes")
-                .header("authorization", "Bearer tt_live_operator");
+                .header("authorization", "Bearer tt_live_operator")
+                .json_body_includes(r#"{ "enabled": false }"#);
             then.status(201).json_body(json!({
                 "id": route_id.to_string(),
                 "name": "all->cheap",
                 "priority": 100,
-                "enabled": true,
+                "enabled": false,
                 "when": {},
                 "then": { "target_model": "gpt-4o-mini" }
             }));
