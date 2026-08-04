@@ -51,7 +51,8 @@ pub use model_catalog::{
 pub use pricing::{CacheWriteTier, Capability, ModelInfo, ModelPricing};
 pub use provider::Provider;
 pub use request_delta::{
-    estimate_request_delta_v1, RequestDeltaEstimate, RequestDeltaInput, RequestDeltaReceiptError,
+    classify_request_delta_evidence_v1, estimate_request_delta_v1, RequestDeltaEstimate,
+    RequestDeltaEvidenceState, RequestDeltaInput, RequestDeltaReceiptError,
     RequestDeltaReceiptFields, REQUEST_DELTA_ESTIMATE_V1,
 };
 pub use request_preflight::{

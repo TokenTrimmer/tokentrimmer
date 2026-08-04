@@ -3346,6 +3346,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 baseline_cost_usd: None,
+                request_delta_evidence_state: Default::default(),
                 hit_count: 0,
                 quality_score: None,
                 judge_verdict: None,

@@ -75,6 +75,12 @@ pub struct RequestLogRow {
     /// can reconcile without hiding the spend. `0.0` when no summarizer ran.
     #[serde(default)]
     pub summarizer_tax_usd: f64,
+    /// Write-time provenance for the strict request-delta tuple. This closed
+    /// state prevents reporting from treating an absent catalog price flattened
+    /// to `$0` as a genuinely measured zero-price request. Historical rows and
+    /// older rolling-deploy writers default to `missing_evidence`.
+    #[serde(default)]
+    pub request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState,
     /// `true` when ANY cache layer served the response (L1 or L2).
     pub cached: bool,
     /// `Some("l1")` / `Some("l2")` / `None`. Matches the SQL CHECK constraint.
@@ -523,7 +529,8 @@ pub mod postgres {
                       content_compress_saved_est_usd, content_compress_kind,
                       l2_matched_entry_id, l2_similarity, l2_verdict,
                       flex_saved_usd, doc_compaction_saved_usd, summarizer_tax_usd,
-                      route_version_id, requested_model)
+                      route_version_id, requested_model,
+                      request_delta_evidence_state)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -549,11 +556,12 @@ pub mod postgres {
                       $46, $47,
                       $48, $49, $50,
                       $51, $52, $53,
-                      $54, $55)"#;
+                      $54, $55,
+                      $56)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 55;
+    pub const INSERT_BIND_COUNT: usize = 56;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -614,6 +622,7 @@ pub mod postgres {
                 .bind(row.summarizer_tax_usd) // $53
                 .bind(row.route_version_id) // $54
                 .bind(row.requested_model.as_deref()) // $55
+                .bind(row.request_delta_evidence_state.as_str()) // $56
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -707,6 +716,7 @@ mod tests {
             flex_saved_usd: 0.0,
             doc_compaction_saved_usd: 0.0,
             summarizer_tax_usd: 0.0,
+            request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::MissingEvidence,
             cached: false,
             cache_layer: None,
             route_id: None,

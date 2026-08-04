@@ -265,6 +265,10 @@ async fn sse_truncated_drop_writes_row_with_truncated_true() {
     assert_eq!(row.provider, "mock");
     assert_eq!(row.requested_model.as_deref(), Some("caller-stream-model"));
     assert_eq!(row.model, "test-model");
+    assert_eq!(
+        row.request_delta_evidence_state,
+        tt_shared::RequestDeltaEvidenceState::MissingEvidence
+    );
 }
 
 // ─── Test 2: clean completion with usage block ────────────────────────────────
@@ -307,6 +311,10 @@ async fn sse_clean_completion_writes_row_with_truncated_false_and_authoritative_
     );
     assert_eq!(row.input_tokens, 20);
     assert_eq!(row.cached_tokens, 0);
+    assert_eq!(
+        row.request_delta_evidence_state,
+        tt_shared::RequestDeltaEvidenceState::Measured
+    );
 }
 
 // ─── Test 4: routed stream prices baseline against the original model ─────────

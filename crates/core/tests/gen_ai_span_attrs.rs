@@ -834,6 +834,7 @@ fn l2_hit_span_carries_gen_ai_and_cost_attributes() {
                 input_tokens: 100,
                 output_tokens: 50,
                 baseline_cost_usd: Some(stored_baseline),
+                request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::Measured,
                 hit_count: 0,
                 quality_score: None,
                 judge_verdict: None,

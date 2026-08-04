@@ -43,7 +43,8 @@ use tracing::Span;
 use tt_cache::{CacheEntry, L1Entry};
 use tt_shared::{
     messages::{ChunkChoice, ChunkDelta, Message, MessageContent},
-    ChatCompletionChunk, ChatCompletionResponse, ModelPricing, Provider, ProviderError, Usage,
+    ChatCompletionChunk, ChatCompletionResponse, ModelPricing, Provider, ProviderError,
+    RequestDeltaEvidenceState, RequestDeltaInput, Usage,
 };
 use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
 use tt_tokenize;
@@ -1091,6 +1092,9 @@ pub fn stream_response(
 
             // Pricing drives both the terminal usage event and the request_logs row.
             let pricing = ctx.pricing.clone();
+            // `None` means "same as served" for the baseline, so served pricing
+            // is sufficient evidence when no distinct routed baseline exists.
+            let baseline_pricing_known = ctx.baseline_pricing.is_some() || pricing.is_some();
             // Baseline against the originally-requested model; falls back to the
             // served model's pricing when no separate baseline was supplied.
             let baseline_pricing = ctx.baseline_pricing.clone().or_else(|| pricing.clone());
@@ -1210,6 +1214,67 @@ pub fn stream_response(
                         )
                     };
 
+                // Preserve why this row is or is not safe to include in strict
+                // request-delta sums. Truncated rows are excluded downstream,
+                // but still carry missing_evidence rather than a fabricated
+                // measured state. For panels, every successful member plus the
+                // arbiter must be priced; a live arbiter also needs authoritative
+                // terminal usage. Replay arbiters use their independently-known
+                // cost and do not depend on streamed usage.
+                let request_delta_evidence_state = if truncated {
+                    RequestDeltaEvidenceState::MissingEvidence
+                } else if let Some(p) = panel.as_ref() {
+                    let members_priced = p.leg_records.iter().all(|leg| {
+                        !(leg.role == crate::routes::panel::LegRole::Leg
+                            && leg.status == crate::routes::panel::LegStatus::Ok)
+                            || leg.cost_usd.is_some()
+                    });
+                    let arbiter_state = match &p.arbiter_cost_plan {
+                        crate::routes::panel::ArbiterCostPlan::Known(Some(_)) => {
+                            RequestDeltaEvidenceState::Measured
+                        }
+                        crate::routes::panel::ArbiterCostPlan::Known(None) => {
+                            RequestDeltaEvidenceState::Unpriceable
+                        }
+                        crate::routes::panel::ArbiterCostPlan::Live if pricing.is_none() => {
+                            RequestDeltaEvidenceState::Unpriceable
+                        }
+                        crate::routes::panel::ArbiterCostPlan::Live if !authoritative => {
+                            RequestDeltaEvidenceState::MissingEvidence
+                        }
+                        crate::routes::panel::ArbiterCostPlan::Live => {
+                            RequestDeltaEvidenceState::Measured
+                        }
+                    };
+                    if !members_priced {
+                        RequestDeltaEvidenceState::Unpriceable
+                    } else if arbiter_state != RequestDeltaEvidenceState::Measured {
+                        arbiter_state
+                    } else {
+                        tt_shared::classify_request_delta_evidence_v1(
+                            true,
+                            true,
+                            RequestDeltaInput {
+                                baseline_cost_usd: Some(baseline_cost_usd),
+                                cost_usd: Some(cost_usd),
+                                provider_cache_saved_usd: Some(0.0),
+                                cache_bust_penalty_usd: Some(0.0),
+                                summarizer_tax_usd: Some(0.0),
+                            },
+                        )
+                    }
+                } else {
+                    let priced_state = breakdown
+                        .request_delta_evidence_state(pricing.is_some(), baseline_pricing_known);
+                    if priced_state == RequestDeltaEvidenceState::Unpriceable {
+                        priced_state
+                    } else if !authoritative {
+                        RequestDeltaEvidenceState::MissingEvidence
+                    } else {
+                        priced_state
+                    }
+                };
+
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, api_key_id, cost_usd, Utc::now());
                 // P0-1/P0-3: settle the served request. This DropGuard fires
@@ -1327,6 +1392,7 @@ pub fn stream_response(
                     } else {
                         breakdown.summarizer_tax_usd
                     },
+                    request_delta_evidence_state,
                     cached: false,
                     cache_layer: None,
                     route_id,
@@ -1550,6 +1616,7 @@ pub fn stream_response(
                         baseline_cost_usd,
                         cost_usd,
                         ins.provider_id.clone(),
+                        request_delta_evidence_state,
                     );
                     if let Some(l1) = ins.l1 {
                         let key = ins.l1_key.clone();
@@ -1597,6 +1664,7 @@ pub fn stream_response(
                                 model_l2,
                                 ttl_secs,
                                 baseline_l2,
+                                request_delta_evidence_state,
                                 // No streaming L2 lookup occurred, so there is
                                 // no embedding to reuse — embed here (COST-3).
                                 None,
@@ -1803,6 +1871,7 @@ async fn stream_insert_into_l2(
     model_used: String,
     ttl_secs: u64,
     baseline_cost_usd: Option<f64>,
+    request_delta_evidence_state: RequestDeltaEvidenceState,
     // A pre-computed embedding to reuse instead of embedding `query_text` again
     // (COST-3, mirroring `insert_into_l2`). The streaming path performs no L2
     // *lookup* (only an L1 fake-stream check), so there is no prior embedding to
@@ -1841,6 +1910,7 @@ async fn stream_insert_into_l2(
         input_tokens: response.usage.prompt_tokens,
         output_tokens: response.usage.completion_tokens,
         baseline_cost_usd,
+        request_delta_evidence_state,
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,

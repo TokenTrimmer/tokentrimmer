@@ -36,7 +36,8 @@ use tt_shared::{
     context::{ProviderCredentials, SecretString},
     messages::Choice,
     parse_cache_control, CacheControlConfig, CacheMode, CacheWriteTier, ChatCompletionRequest,
-    ChatCompletionResponse, Message, MessageContent, ModelPricing, RequestContext, Usage,
+    ChatCompletionResponse, Message, MessageContent, ModelPricing, RequestContext,
+    RequestDeltaEvidenceState, RequestDeltaInput, Usage,
 };
 
 use crate::{
@@ -868,6 +869,7 @@ async fn try_l2_hit(
             // Resolve the baseline ONCE so the response headers and the
             // request_logs row report the same figure.
             let baseline_cost_usd = l2_entry_baseline(&entry, current_pricing);
+            let request_delta_evidence_state = entry.request_delta_evidence_state;
             spawn_request_log(
                 state.telemetry_tracker.as_ref(),
                 request_log_writer,
@@ -881,6 +883,7 @@ async fn try_l2_hit(
                     matched_route_version_id,
                     route_paused,
                     baseline_cost_usd,
+                    request_delta_evidence_state,
                     retrieval_tokens_saved,
                     similarity,
                     decision,
@@ -1972,6 +1975,8 @@ async fn complete_once_with_retry_policy(
     }
     let cost_usd = cost_breakdown.cost_usd;
     let baseline_cost_usd = cost_breakdown.baseline_cost_usd;
+    let request_delta_evidence_state =
+        cost_breakdown.request_delta_evidence_state(pricing.is_some(), baseline_pricing.is_some());
     // headline saved_usd (header) is TT-attributed only — the provider's
     // automatic cache discount is excluded by `CostBreakdown::tt_saved_usd`
     // and surfaced via its own header/ledger field.
@@ -2018,6 +2023,7 @@ async fn complete_once_with_retry_policy(
                 baseline_cost_usd,
                 cost_usd,
                 provider_id.clone(),
+                request_delta_evidence_state,
             );
             match entry.to_bytes() {
                 Ok(bytes) => {
@@ -2112,6 +2118,7 @@ async fn complete_once_with_retry_policy(
                         l2_model_used,
                         l2_ttl_secs,
                         l2_baseline,
+                        request_delta_evidence_state,
                         l2_lookup_embedding,
                     )
                     .await;
@@ -2160,6 +2167,7 @@ async fn complete_once_with_retry_policy(
         flex_saved_usd: cost_breakdown.flex_saved_usd,
         doc_compaction_saved_usd: cost_breakdown.doc_compaction_saved_usd,
         summarizer_tax_usd: cost_breakdown.summarizer_tax_usd,
+        request_delta_evidence_state,
         cached: false,
         cache_layer: None,
         route_id: matched_route_id,
@@ -5534,6 +5542,7 @@ async fn insert_into_l2(
     model_used: String,
     ttl_secs: u64,
     baseline_cost_usd: Option<f64>,
+    request_delta_evidence_state: RequestDeltaEvidenceState,
     // Embedding the L2 lookup already computed for this exact `query_text`
     // (COST-3). When `Some`, it is reused verbatim — avoiding a second,
     // identical embedding call (COGS + latency). When `None` (no lookup ran,
@@ -5581,6 +5590,7 @@ async fn insert_into_l2(
         input_tokens: response.usage.prompt_tokens,
         output_tokens: response.usage.completion_tokens,
         baseline_cost_usd,
+        request_delta_evidence_state,
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,
@@ -5758,6 +5768,27 @@ pub(crate) struct CostBreakdown {
 }
 
 impl CostBreakdown {
+    /// Classify the provenance behind this exact strict-formula tuple. Pricing
+    /// presence is passed separately because an absent catalog entry is
+    /// intentionally flattened to numeric zero by the cost calculator.
+    pub(crate) fn request_delta_evidence_state(
+        &self,
+        served_pricing_known: bool,
+        baseline_pricing_known: bool,
+    ) -> RequestDeltaEvidenceState {
+        tt_shared::classify_request_delta_evidence_v1(
+            served_pricing_known,
+            baseline_pricing_known,
+            RequestDeltaInput {
+                baseline_cost_usd: Some(self.baseline_cost_usd),
+                cost_usd: Some(self.cost_usd),
+                provider_cache_saved_usd: Some(self.provider_cache_saved_usd),
+                cache_bust_penalty_usd: Some(self.cache_bust_penalty_usd),
+                summarizer_tax_usd: Some(self.summarizer_tax_usd),
+            },
+        )
+    }
+
     /// TokenTrimmer-attributed savings: baseline minus actual cost, minus the
     /// provider-side cache discount (which TokenTrimmer did not cause), minus
     /// any booked cache-bust penalty (a cost TokenTrimmer DID cause).
@@ -7246,6 +7277,7 @@ fn request_log_for_l1_hit(
         flex_saved_usd: 0.0,
         doc_compaction_saved_usd: 0.0,
         summarizer_tax_usd: 0.0,
+        request_delta_evidence_state: entry.request_delta_evidence_state,
         cached: true,
         cache_layer: Some("l1".into()),
         route_id: route.route_id,
@@ -7321,6 +7353,7 @@ fn request_log_for_l2_hit(
     route_version_id: Option<i64>,
     route_paused: bool,
     baseline_cost_usd: f64,
+    request_delta_evidence_state: RequestDeltaEvidenceState,
     retrieval_tokens_saved: i64,
     similarity: f32,
     verdict: L2VerifyDecision,
@@ -7345,6 +7378,7 @@ fn request_log_for_l2_hit(
         flex_saved_usd: 0.0,
         doc_compaction_saved_usd: 0.0,
         summarizer_tax_usd: 0.0,
+        request_delta_evidence_state,
         cached: true,
         cache_layer: Some("l2".into()),
         route_id,
@@ -7944,6 +7978,11 @@ mod cache_header_tests {
             baseline_cost_usd,
             cost_usd: 0.003,
             provider_id: "openai".into(),
+            request_delta_evidence_state: if version >= 2 {
+                RequestDeltaEvidenceState::Measured
+            } else {
+                RequestDeltaEvidenceState::MissingEvidence
+            },
             version,
         }
     }
@@ -8573,6 +8612,11 @@ mod l2_baseline_tests {
             input_tokens: 1_000_000,
             output_tokens: 500_000,
             baseline_cost_usd,
+            request_delta_evidence_state: if baseline_cost_usd.is_some() {
+                RequestDeltaEvidenceState::Measured
+            } else {
+                RequestDeltaEvidenceState::MissingEvidence
+            },
             hit_count: 0,
             quality_score: None,
             judge_verdict: None,
@@ -8624,6 +8668,7 @@ mod l2_baseline_tests {
             Some(9_876_543_210),
             false,
             0.0123,
+            RequestDeltaEvidenceState::Measured,
             0,
             0.97,
             L2VerifyDecision::Confident,
@@ -11091,6 +11136,7 @@ mod telemetry_drain_tests {
             flex_saved_usd: 0.0,
             doc_compaction_saved_usd: 0.0,
             summarizer_tax_usd: 0.0,
+            request_delta_evidence_state: RequestDeltaEvidenceState::Measured,
             cached: false,
             cache_layer: None,
             route_id: None,
@@ -11462,6 +11508,7 @@ mod l2_insert_embed_reuse_tests {
             "gpt-4o".to_string(),
             3600,
             Some(0.001),
+            RequestDeltaEvidenceState::Measured,
             Some(precomputed.clone()),
         )
         .await;
@@ -11503,6 +11550,7 @@ mod l2_insert_embed_reuse_tests {
             "gpt-4o".to_string(),
             3600,
             Some(0.001),
+            RequestDeltaEvidenceState::Measured,
             None,
         )
         .await;

@@ -412,6 +412,35 @@ fn migrator_includes_master_key_rotation_fence() {
     assert!(down.contains("DROP TABLE IF EXISTS public.master_key_rotation"));
 }
 
+#[test]
+fn migrator_includes_closed_request_delta_evidence_state() {
+    let migration = tt_core::db::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 47)
+        .expect("migration version 47 not found");
+    assert!(migration
+        .description
+        .contains("request delta evidence state"));
+
+    let up = include_str!("../migrations/0047_request_delta_evidence_state.up.sql");
+    let down = include_str!("../migrations/0047_request_delta_evidence_state.down.sql");
+    for state in ["measured", "unpriceable", "missing_evidence"] {
+        assert!(up.contains(state), "migration must admit {state}");
+    }
+    assert!(up.contains("ALTER TABLE public.request_logs"));
+    assert!(up.contains("request_logs_request_delta_evidence_state_check"));
+    assert!(up.contains("ALTER TABLE public.cache_entries"));
+    assert!(up.contains("cache_entries_request_delta_evidence_state_check"));
+    assert!(up.contains("DEFAULT 'missing_evidence'"));
+    assert!(!up.contains("DEFAULT 'measured'"));
+    assert_eq!(
+        down.matches("DROP COLUMN IF EXISTS request_delta_evidence_state")
+            .count(),
+        2,
+        "down migration must remove provenance from both ledgers"
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -554,6 +583,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         flex_saved_usd: 0.0,
         doc_compaction_saved_usd: 0.0,
         summarizer_tax_usd: 0.0,
+        request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::Measured,
         cached: false,
         cache_layer: None,
         route_id: None,
@@ -685,6 +715,7 @@ async fn request_log_insert_round_trips_batch_columns() {
         flex_saved_usd: 0.0,
         doc_compaction_saved_usd: 0.0,
         summarizer_tax_usd: 0.0,
+        request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::Measured,
         cached: false,
         cache_layer: None,
         route_id: None,
@@ -807,6 +838,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
         flex_saved_usd: 0.000611,
         doc_compaction_saved_usd: 0.000733,
         summarizer_tax_usd: 0.000199,
+        request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::Measured,
         cached: false,
         cache_layer: None,
         route_id: None,
@@ -874,6 +906,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
         doc_compaction_saved,
         summarizer_tax,
         route_version_id,
+        request_delta_evidence_state,
     ) = sqlx::query_as::<
         _,
         (
@@ -887,13 +920,15 @@ async fn request_logs_insert_round_trips_against_postgres() {
             f64,
             f64,
             Option<i64>,
+            String,
         ),
     >(
         "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8, \
              doc_vision_saved_est_usd::FLOAT8, \
              content_compress_saved_est_usd::FLOAT8, content_compress_kind, \
              flex_saved_usd::FLOAT8, doc_compaction_saved_usd::FLOAT8, \
-             summarizer_tax_usd::FLOAT8, route_version_id \
+             summarizer_tax_usd::FLOAT8, route_version_id, \
+             request_delta_evidence_state \
              FROM request_logs WHERE id = $1",
     )
     .bind(id)
@@ -936,8 +971,34 @@ async fn request_logs_insert_round_trips_against_postgres() {
         Some(9_876_543_210),
         "immutable route-version ID must round-trip as BIGINT"
     );
+    assert_eq!(request_delta_evidence_state, "measured");
 
-    sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
+    // Simulate a rolling-deploy/legacy writer that does not know migration
+    // 0047. Omitting the column must conservatively classify the row as missing
+    // evidence rather than measured.
+    let legacy_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO request_logs \
+         (id, org_id, api_key_id, ts, provider, model, input_tokens, \
+          output_tokens, cost_usd, baseline_cost_usd, cached, latency_ms, status) \
+         VALUES ($1, $2, $3, now(), 'legacy-writer', 'test-1', 1, 1, 0, 0, false, 1, 200)",
+    )
+    .bind(legacy_id)
+    .bind(Uuid::nil())
+    .bind(Uuid::nil())
+    .execute(&pool)
+    .await
+    .expect("legacy-shape insert must use the conservative default");
+    let legacy_state: String =
+        sqlx::query_scalar("SELECT request_delta_evidence_state FROM request_logs WHERE id = $1")
+            .bind(legacy_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch legacy evidence state");
+    assert_eq!(legacy_state, "missing_evidence");
+
+    sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain' OR id = $1")
+        .bind(legacy_id)
         .execute(&pool)
         .await
         .expect("cleanup");
@@ -981,6 +1042,7 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         flex_saved_usd: 0.0,
         doc_compaction_saved_usd: 0.0,
         summarizer_tax_usd: 0.0,
+        request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::Measured,
         cached: false,
         cache_layer: None,
         route_id: None,
