@@ -46,6 +46,7 @@ fn make_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         input_tokens: 10,
         output_tokens: 5,
         baseline_cost_usd: None,
+        request_delta_evidence_state: Default::default(),
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,
@@ -66,6 +67,7 @@ fn make_expired_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         input_tokens: 10,
         output_tokens: 5,
         baseline_cost_usd: None,
+        request_delta_evidence_state: Default::default(),
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,
@@ -411,6 +413,7 @@ async fn l2_different_embedding_model_is_not_returned() {
         input_tokens: 1,
         output_tokens: 1,
         baseline_cost_usd: None,
+        request_delta_evidence_state: Default::default(),
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,
@@ -540,6 +543,7 @@ async fn postgres_l2_round_trip() {
         input_tokens: 100,
         output_tokens: 50,
         baseline_cost_usd: Some(0.000456),
+        request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::Measured,
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,
@@ -572,6 +576,11 @@ async fn postgres_l2_round_trip() {
         Some(0.000456),
         "baseline_cost_usd must round-trip through Postgres"
     );
+    assert_eq!(
+        found.request_delta_evidence_state,
+        tt_shared::RequestDeltaEvidenceState::Measured,
+        "request-delta provenance must round-trip through Postgres"
+    );
 
     cache
         .bump_hit_count(entry_id)
@@ -593,6 +602,7 @@ async fn postgres_l2_round_trip() {
         input_tokens: 10,
         output_tokens: 5,
         baseline_cost_usd: None,
+        request_delta_evidence_state: Default::default(),
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,
@@ -619,6 +629,10 @@ async fn postgres_l2_round_trip() {
     assert_eq!(
         found_null.baseline_cost_usd, None,
         "NULL baseline_cost_usd must surface as None"
+    );
+    assert_eq!(
+        found_null.request_delta_evidence_state,
+        tt_shared::RequestDeltaEvidenceState::MissingEvidence
     );
 
     // Clean up the test rows.
@@ -673,6 +687,7 @@ async fn postgres_l2_org_isolation_org_b_miss() {
         input_tokens: 10,
         output_tokens: 5,
         baseline_cost_usd: None,
+        request_delta_evidence_state: Default::default(),
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,
@@ -784,6 +799,7 @@ async fn pg_lexical_sig_roundtrip_and_pre_0017_rows_read_none() {
         input_tokens: 10,
         output_tokens: 5,
         baseline_cost_usd: None,
+        request_delta_evidence_state: Default::default(),
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,
@@ -805,8 +821,8 @@ async fn pg_lexical_sig_roundtrip_and_pre_0017_rows_read_none() {
         "lexical_sig must round-trip through the BIGINT column"
     );
 
-    // Pre-0017 shape: a raw INSERT that names no lexical_sig column. The
-    // column default is NULL, and the decode path must surface None.
+    // Pre-0017/0047 shape: a raw INSERT that names neither lexical_sig nor the
+    // provenance column. Their conservative defaults must survive decoding.
     let org_legacy = Uuid::new_v4();
     let legacy_id = Uuid::new_v4();
     sqlx::query(
@@ -842,6 +858,11 @@ async fn pg_lexical_sig_roundtrip_and_pre_0017_rows_read_none() {
     assert_eq!(
         legacy.lexical_sig, None,
         "a pre-0017 row must read lexical_sig as None (verify gate fails open)"
+    );
+    assert_eq!(
+        legacy.request_delta_evidence_state,
+        tt_shared::RequestDeltaEvidenceState::MissingEvidence,
+        "an old-writer row must never be promoted to measured by inference"
     );
 
     sqlx::query("DELETE FROM cache_entries WHERE id = $1 OR id = $2")

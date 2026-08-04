@@ -4,8 +4,55 @@
 //! client, CLI, and any corpus mirror. It does not select a cohort or price,
 //! allocate judge/shadow tax, or reconcile a provider invoice.
 
+use serde::{Deserialize, Serialize};
+
 /// Stable identifier for the request-level formula and its public corpus.
 pub const REQUEST_DELTA_ESTIMATE_V1: &str = "tt.request-delta-estimate.v1";
+
+/// Closed provenance state for the persisted request-delta inputs.
+///
+/// A numeric zero is not evidence by itself: it can mean a genuinely free
+/// local model or a catalog miss that the runtime intentionally flattened to
+/// zero. Writers therefore persist the reason separately and reporting code
+/// groups by this field instead of reverse-engineering provenance from money.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestDeltaEvidenceState {
+    /// Every formula input is present and valid, with both served and baseline
+    /// pricing known when pricing was required.
+    Measured,
+    /// At least one required model price was unavailable. The row remains
+    /// billable telemetry, but its dollar delta must not enter measured sums.
+    Unpriceable,
+    /// Required non-pricing evidence was absent or invalid. This is also the
+    /// conservative default for rows written before the provenance field.
+    #[default]
+    MissingEvidence,
+}
+
+impl RequestDeltaEvidenceState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::Unpriceable => "unpriceable",
+            Self::MissingEvidence => "missing_evidence",
+        }
+    }
+
+    /// Parse the closed persisted/wire representation. Callers reading legacy
+    /// or corrupt storage should use `unwrap_or_default()` so unknown values
+    /// fail conservatively to `missing_evidence`.
+    #[must_use]
+    pub fn from_persisted(value: &str) -> Option<Self> {
+        match value {
+            "measured" => Some(Self::Measured),
+            "unpriceable" => Some(Self::Unpriceable),
+            "missing_evidence" => Some(Self::MissingEvidence),
+            _ => None,
+        }
+    }
+}
 
 /// Complete raw inputs for one gateway-recorded request delta.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -24,6 +71,28 @@ pub struct RequestDeltaEstimate {
     pub signed_request_delta_usd: f64,
     pub positive_request_delta_usd: f64,
     pub regression_request_delta_usd: f64,
+}
+
+/// Classify the evidence behind one request-delta row without inferring from
+/// its numeric values.
+///
+/// Missing pricing takes precedence because it is actionable catalog evidence.
+/// With complete pricing, malformed or absent formula inputs remain a distinct
+/// missing-evidence bucket. Only a formula-valid tuple is measured.
+#[must_use]
+pub fn classify_request_delta_evidence_v1(
+    served_pricing_known: bool,
+    baseline_pricing_known: bool,
+    input: RequestDeltaInput,
+) -> RequestDeltaEvidenceState {
+    if !served_pricing_known || !baseline_pricing_known {
+        return RequestDeltaEvidenceState::Unpriceable;
+    }
+    if estimate_request_delta_v1(input).is_some() {
+        RequestDeltaEvidenceState::Measured
+    } else {
+        RequestDeltaEvidenceState::MissingEvidence
+    }
 }
 
 /// Formula and coverage fields signed by WFR v3/v4 and ARR v2 receipts.
@@ -249,6 +318,46 @@ mod tests {
             regression.canonical_fragment().unwrap(),
             "200000|180000|0|-50000|tt.request-delta-estimate.v1|2|2"
         );
+    }
+
+    #[test]
+    fn evidence_state_preserves_zero_price_and_missing_price_distinction() {
+        let free_but_priced = RequestDeltaInput {
+            baseline_cost_usd: Some(0.0),
+            cost_usd: Some(0.0),
+            provider_cache_saved_usd: Some(0.0),
+            cache_bust_penalty_usd: Some(0.0),
+            summarizer_tax_usd: Some(0.0),
+        };
+        assert_eq!(
+            classify_request_delta_evidence_v1(true, true, free_but_priced),
+            RequestDeltaEvidenceState::Measured
+        );
+        assert_eq!(
+            classify_request_delta_evidence_v1(false, true, free_but_priced),
+            RequestDeltaEvidenceState::Unpriceable
+        );
+
+        let malformed = RequestDeltaInput {
+            cost_usd: Some(f64::NAN),
+            ..free_but_priced
+        };
+        assert_eq!(
+            classify_request_delta_evidence_v1(true, true, malformed),
+            RequestDeltaEvidenceState::MissingEvidence
+        );
+
+        for state in [
+            RequestDeltaEvidenceState::Measured,
+            RequestDeltaEvidenceState::Unpriceable,
+            RequestDeltaEvidenceState::MissingEvidence,
+        ] {
+            assert_eq!(
+                RequestDeltaEvidenceState::from_persisted(state.as_str()),
+                Some(state)
+            );
+        }
+        assert_eq!(RequestDeltaEvidenceState::from_persisted("future"), None);
     }
 
     #[test]

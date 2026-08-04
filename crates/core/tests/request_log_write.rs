@@ -19,7 +19,8 @@ use tt_shared::{
     messages::{Choice, Message, MessageContent},
     pricing::Capability,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
-    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
+    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+    RequestDeltaEvidenceState, Usage,
 };
 use tt_telemetry::request_logs::InMemoryRequestLogWriter;
 
@@ -105,6 +106,7 @@ impl Provider for TestProvider {
 /// can drive provider-cache telemetry through the dispatch path.
 struct UsageProvider {
     usage: Usage,
+    priced: bool,
 }
 
 #[async_trait]
@@ -122,7 +124,7 @@ impl Provider for UsageProvider {
         }]
     }
     fn pricing(&self, _: &str) -> Option<ModelPricing> {
-        Some(ModelPricing {
+        self.priced.then(|| ModelPricing {
             input_per_million: 3.0,
             output_per_million: 6.0,
             cached_input_per_million: Some(0.3),
@@ -177,7 +179,10 @@ impl Provider for UsageProvider {
 /// returning `usage`, and return the single request_logs row it wrote.
 async fn dispatch_with_usage(usage: Usage) -> tt_telemetry::request_logs::RequestLogRow {
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(UsageProvider { usage }));
+    registry.register(Arc::new(UsageProvider {
+        usage,
+        priced: true,
+    }));
     let writer = Arc::new(InMemoryRequestLogWriter::new());
     let state = AppState::new(registry).with_request_log_writer(writer.clone());
     let app = build_router(state);
@@ -267,6 +272,53 @@ async fn provider_reported_zero_logs_zero_not_null() {
 }
 
 #[tokio::test]
+async fn missing_catalog_price_is_unpriceable_not_measured_zero() {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(UsageProvider {
+        usage: Usage {
+            prompt_tokens: 120,
+            completion_tokens: 60,
+            total_tokens: 180,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        },
+        priced: false,
+    }));
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let state = AppState::new(registry).with_request_log_writer(writer.clone());
+    let app = build_router(state);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": "test-1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    for _ in 0..20 {
+        if !writer.rows().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let row = writer.rows().pop().expect("request log row");
+    assert_eq!(row.cost_usd, 0.0);
+    assert_eq!(row.baseline_cost_usd, 0.0);
+    assert_eq!(
+        row.request_delta_evidence_state,
+        RequestDeltaEvidenceState::Unpriceable,
+        "numeric zero must not conceal the absent catalog price"
+    );
+}
+
+#[tokio::test]
 async fn chat_miss_writes_request_log_row() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut registry = ProviderRegistry::new();
@@ -323,6 +375,10 @@ async fn chat_miss_writes_request_log_row() {
         r.cost_usd
     );
     assert!((r.baseline_cost_usd - 0.00072).abs() < 1e-9);
+    assert_eq!(
+        r.request_delta_evidence_state,
+        RequestDeltaEvidenceState::Measured
+    );
     assert!(r.trace_id.is_some());
     // Latency is whatever the test took; just sanity-bound it.
     assert!(r.latency_ms >= 0);
@@ -405,6 +461,11 @@ async fn l1_hit_writes_request_log_with_cache_layer_l1() {
     assert_eq!(hit.requested_model.as_deref(), Some("test-1"));
     assert_eq!(hit.model, "test-1");
     assert_eq!(hit.status, 200);
+    assert_eq!(
+        hit.request_delta_evidence_state,
+        RequestDeltaEvidenceState::Measured,
+        "version-2 L1 envelopes must preserve the miss row's evidence state"
+    );
     // TT cache hit = no provider call at serve time → provider-cache token
     // columns are NULL (the original miss row carries the telemetry).
     assert_eq!(hit.cache_read_input_tokens, None);

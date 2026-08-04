@@ -432,6 +432,10 @@ pub struct CacheEntry {
     /// path then re-prices the stored model/token counts against the current
     /// catalog (or reports 0 saved) rather than fabricating a number.
     pub baseline_cost_usd: Option<f64>,
+    /// Provenance for the request-delta baseline copied from the cache-miss
+    /// request. Historical entries default to `missing_evidence`; a numeric
+    /// baseline is never promoted to measured by inference.
+    pub request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState,
     /// How many times this entry has been served from cache.
     pub hit_count: u64,
     /// Latest judge quality score in `[0, 1]` for a response served from this
@@ -940,6 +944,7 @@ pub fn l2_tool_context_text(req: &ChatCompletionRequest) -> Option<String> {
 ///     input_tokens: 10,
 ///     output_tokens: 5,
 ///     baseline_cost_usd: Some(0.000045),
+///     request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::Measured,
 ///     hit_count: 0,
 ///     quality_score: None,
 ///     judge_verdict: None,
@@ -1376,8 +1381,8 @@ impl L2Cache for PostgresL2Cache {
                 (id, org_id, embedding, response, model, embedding_model,
                  input_tokens, output_tokens, baseline_cost_usd, hit_count,
                  quality_score, judge_verdict, created_at, expires_at,
-                 lexical_sig)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                 lexical_sig, request_delta_evidence_state)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT DO NOTHING
             "#,
         )
@@ -1396,6 +1401,7 @@ impl L2Cache for PostgresL2Cache {
         .bind(entry.created_at)
         .bind(entry.expires_at)
         .bind(entry.lexical_sig)
+        .bind(entry.request_delta_evidence_state.as_str())
         .execute(&self.pool)
         .await
         .map_err(CacheError::Sqlx)?;
@@ -1440,7 +1446,7 @@ impl L2Cache for PostgresL2Cache {
             SELECT id, org_id, embedding, response, model, embedding_model,
                    input_tokens, output_tokens, baseline_cost_usd, hit_count,
                    quality_score, judge_verdict, created_at, expires_at,
-                   lexical_sig,
+                   lexical_sig, request_delta_evidence_state,
                    CAST(1.0 - (embedding <=> $2) AS REAL) AS similarity
               FROM cache_entries
              WHERE org_id = $1
@@ -1484,6 +1490,9 @@ impl L2Cache for PostgresL2Cache {
         // path can apply its honest fallback instead of a fabricated rate.
         let baseline_cost_usd: Option<f64> =
             row.try_get("baseline_cost_usd").map_err(CacheError::Sqlx)?;
+        let request_delta_evidence_state: String = row
+            .try_get("request_delta_evidence_state")
+            .map_err(CacheError::Sqlx)?;
         let hit_count: i64 = row.try_get("hit_count").map_err(CacheError::Sqlx)?;
         // NULL for rows inserted before migration 0013 (judge join) or never
         // judged — surfaced as `None`.
@@ -1516,6 +1525,10 @@ impl L2Cache for PostgresL2Cache {
             input_tokens: input_tokens.max(0) as u64,
             output_tokens: output_tokens.max(0) as u64,
             baseline_cost_usd,
+            request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::from_persisted(
+                &request_delta_evidence_state,
+            )
+            .unwrap_or_default(),
             hit_count: hit_count as u64,
             quality_score,
             judge_verdict,
@@ -1659,6 +1672,7 @@ mod tests {
             input_tokens: 1,
             output_tokens: 1,
             baseline_cost_usd: None,
+            request_delta_evidence_state: Default::default(),
             hit_count: 0,
             quality_score: None,
             judge_verdict: None,

@@ -33,7 +33,8 @@ use uuid::Uuid;
 use futures::stream::BoxStream;
 use tt_shared::{
     messages::{ChatCompletionRequest, Message, MessageContent, PanelExtras},
-    ChatCompletionChunk, ChatCompletionResponse, ProviderError, RequestContext, Usage,
+    ChatCompletionChunk, ChatCompletionResponse, ProviderError, RequestContext,
+    RequestDeltaEvidenceState, Usage,
 };
 
 use crate::routes::chat::{
@@ -2340,6 +2341,15 @@ pub(crate) async fn complete_panel(
     // None-aware by `run_panel`). `None` (every leg unpriced) books $0 honestly.
     let total_cost_usd = result.total_cost_usd.unwrap_or(0.0);
     let cost_breakdown = aggregate_cost_breakdown(total_cost_usd);
+    let request_delta_evidence_state = if result
+        .legs
+        .iter()
+        .any(|leg| leg.status == LegStatus::Ok && leg.cost_usd.is_none())
+    {
+        RequestDeltaEvidenceState::Unpriceable
+    } else {
+        cost_breakdown.request_delta_evidence_state(true, true)
+    };
 
     // ── Record realized spend EXACTLY ONCE (mirrors complete_once's dispatched
     //    tail: `spend_sink().record(...)` then `settle(..., cached=false, ...)`).
@@ -2384,6 +2394,7 @@ pub(crate) async fn complete_panel(
             flex_saved_usd: 0.0,
             doc_compaction_saved_usd: 0.0,
             summarizer_tax_usd: 0.0,
+            request_delta_evidence_state,
             // INVARIANT §2.1.5: every panel row is `cached = false` so the cloud
             // overage meter + month accumulator both count it.
             cached: false,

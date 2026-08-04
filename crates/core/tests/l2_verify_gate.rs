@@ -235,6 +235,7 @@ fn primed_entry(lexical_sig: Option<i64>) -> CacheEntry {
         input_tokens: 100,
         output_tokens: 50,
         baseline_cost_usd: Some(0.0006),
+        request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::Measured,
         hit_count: 0,
         quality_score: None,
         judge_verdict: None,

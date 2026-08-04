@@ -18,7 +18,7 @@
 //! full at-rest contract.
 
 use serde::{Deserialize, Serialize};
-use tt_shared::ChatCompletionResponse;
+use tt_shared::{ChatCompletionResponse, RequestDeltaEvidenceState};
 
 /// The format the gateway writes into [`L1Cache`].
 ///
@@ -44,6 +44,12 @@ pub struct L1Entry {
     #[serde(default)]
     pub provider_id: String,
 
+    /// Write-time provenance for the cached baseline. Version-1 envelopes and
+    /// raw legacy responses deserialize to `missing_evidence`; version 2 carries
+    /// the miss row's explicit measured/unpriceable state into every hit row.
+    #[serde(default)]
+    pub request_delta_evidence_state: RequestDeltaEvidenceState,
+
     /// Schema version. Bump for breaking changes to the envelope shape.
     /// `0` is reserved as a sentinel for entries that pre-date the envelope
     /// format and were decoded via the [`L1Entry::from_bytes`] fallback path.
@@ -62,13 +68,15 @@ impl L1Entry {
         baseline_cost_usd: f64,
         cost_usd: f64,
         provider_id: impl Into<String>,
+        request_delta_evidence_state: RequestDeltaEvidenceState,
     ) -> Self {
         Self {
             response,
             baseline_cost_usd,
             cost_usd,
             provider_id: provider_id.into(),
-            version: 1,
+            request_delta_evidence_state,
+            version: 2,
         }
     }
 
@@ -94,6 +102,7 @@ impl L1Entry {
             baseline_cost_usd: 0.0,
             cost_usd: 0.0,
             provider_id: String::new(),
+            request_delta_evidence_state: RequestDeltaEvidenceState::MissingEvidence,
             version: 0,
         })
     }
@@ -141,7 +150,13 @@ mod tests {
 
     #[test]
     fn envelope_round_trips_through_bytes() {
-        let entry = L1Entry::new(sample_response(), 0.0045, 0.0030, "openai");
+        let entry = L1Entry::new(
+            sample_response(),
+            0.0045,
+            0.0030,
+            "openai",
+            RequestDeltaEvidenceState::Measured,
+        );
         let bytes = entry.to_bytes().unwrap();
         let parsed = L1Entry::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.response.id, "chatcmpl-test");
@@ -149,7 +164,11 @@ mod tests {
         assert!((parsed.baseline_cost_usd - 0.0045).abs() < 1e-9);
         assert!((parsed.cost_usd - 0.0030).abs() < 1e-9);
         assert_eq!(parsed.provider_id, "openai");
-        assert_eq!(parsed.version, 1);
+        assert_eq!(
+            parsed.request_delta_evidence_state,
+            RequestDeltaEvidenceState::Measured
+        );
+        assert_eq!(parsed.version, 2);
         assert!(!parsed.is_legacy_format());
     }
 
@@ -165,8 +184,29 @@ mod tests {
         assert_eq!(parsed.baseline_cost_usd, 0.0);
         assert_eq!(parsed.cost_usd, 0.0);
         assert_eq!(parsed.provider_id, "");
+        assert_eq!(
+            parsed.request_delta_evidence_state,
+            RequestDeltaEvidenceState::MissingEvidence
+        );
         assert_eq!(parsed.version, 0);
         assert!(parsed.is_legacy_format());
+    }
+
+    #[test]
+    fn version_one_envelope_defaults_to_missing_evidence() {
+        let legacy_v1 = serde_json::json!({
+            "response": sample_response(),
+            "baseline_cost_usd": 0.0045,
+            "cost_usd": 0.003,
+            "provider_id": "openai",
+            "version": 1
+        });
+        let parsed = L1Entry::from_bytes(&serde_json::to_vec(&legacy_v1).unwrap()).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(
+            parsed.request_delta_evidence_state,
+            RequestDeltaEvidenceState::MissingEvidence
+        );
     }
 
     #[test]
