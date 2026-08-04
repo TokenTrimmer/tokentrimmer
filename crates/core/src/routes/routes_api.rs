@@ -75,7 +75,7 @@ pub async fn list(
     Ok(Json(routes))
 }
 
-/// `POST /v1/routes` — canonical-validate + create.
+/// `POST /v1/routes` — canonical-validate + create a disabled draft.
 ///
 /// The body is received as raw JSON on purpose: a normal `Json<NewRoute>`
 /// extractor would deserialize before the handler could report unknown fields
@@ -83,11 +83,28 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,
-    Json(raw): Json<serde_json::Value>,
+    Json(mut raw): Json<serde_json::Value>,
 ) -> ApiResult<(axum::http::StatusCode, Json<RouteWriteResponse>)> {
     let org = require_org(ctx)?;
+    // Generic API-key writes carry no fresh human activation intent. Preserve
+    // the canonical route contract for trusted/control-plane writers while
+    // making this public creation boundary draft-only.
+    if let Some(route) = raw.as_object_mut() {
+        route
+            .entry("enabled".to_string())
+            .or_insert(serde_json::Value::Bool(false));
+    }
     let canonical =
         canonicalize_route_value(raw).map_err(|issues| ApiError::RouteValidation { issues })?;
+    if canonical.route.enabled {
+        return Err(ApiError::RouteValidation {
+            issues: vec![RouteValidationIssue {
+                field: "enabled".into(),
+                code: "activation_confirmation_required".into(),
+                message: "generic route creation accepts disabled drafts only; review and activate this route through Dashboard → Routes".into(),
+            }],
+        });
+    }
     let spec = canonical.route;
     reject_reserved_catalog_name(&spec.name)?;
     let registry = state.registry.clone();

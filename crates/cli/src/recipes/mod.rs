@@ -5,7 +5,7 @@
 //! failover, long-context downshift). The route bodies are the SAME shape the
 //! gateway's `POST /v1/routes` accepts (see `tt_routing::NewRoute`), so applying
 //! a recipe is just creating its routes over the user-facing routes API — the
-//! exact path `tt route add` uses.
+//! exact draft-only path `tt route add` uses.
 //!
 //! The recipe JSON assets live in `crates/cli/recipes/*.json` and are embedded
 //! at build time, so the curated set ships with the binary (no runtime fetch).
@@ -34,8 +34,8 @@ pub struct Recipe {
     pub savings_lane: String,
     /// Longer prose description, printed by `show`.
     pub description: String,
-    /// The route-set. Each entry is a `tt_routing::NewRoute` body — the exact
-    /// JSON the gateway's `POST /v1/routes` accepts.
+    /// The route-set. Each entry becomes a disabled `tt_routing::NewRoute`
+    /// draft when it is sent to the gateway's `POST /v1/routes` endpoint.
     pub routes: Vec<Value>,
 }
 
@@ -199,8 +199,8 @@ pub fn show_text(recipe: &Recipe) -> String {
 // --- apply (network) --------------------------------------------------------
 
 /// Apply a recipe by creating each of its routes over the gateway's
-/// `POST /v1/routes` — the same endpoint `tt route add` uses. Returns the number
-/// of routes created. Pure w.r.t. the recipe; the caller supplies the HTTP
+/// `POST /v1/routes` — the same draft-only endpoint `tt route add` uses. Returns
+/// the number of routes created. Pure w.r.t. the recipe; the caller supplies the HTTP
 /// client + resolved base/key so this is mockable in tests.
 pub async fn apply_recipe(
     http: &reqwest::Client,
@@ -210,7 +210,12 @@ pub async fn apply_recipe(
 ) -> anyhow::Result<usize> {
     let base = base.trim_end_matches('/');
     for route in &recipe.routes {
-        let _: Value = post_route(http, base, key, route).await?;
+        let mut draft = route.clone();
+        draft
+            .as_object_mut()
+            .context("recipe route must be a JSON object")?
+            .insert("enabled".into(), Value::Bool(false));
+        let _: Value = post_route(http, base, key, &draft).await?;
     }
     Ok(recipe.routes.len())
 }
@@ -446,14 +451,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_recipe_sends_the_real_route_body() {
-        // The POSTed body must be the recipe's NewRoute, unmodified — proves we
-        // apply the curated route-set, not a placeholder.
+        // Apply the curated route-set as disabled drafts, not placeholders or
+        // immediately active traffic transformations.
         let server = MockServer::start_async().await;
         let m = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/routes")
                 .json_body_includes(
-                    r#"{ "name": "recipe:vision-gate", "when": { "has_images": true }, "then": { "target_model": "gpt-4o" } }"#,
+                    r#"{ "name": "recipe:vision-gate", "enabled": false, "when": { "has_images": true }, "then": { "target_model": "gpt-4o" } }"#,
                 );
             then.status(201).body("{}");
         });

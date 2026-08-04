@@ -1022,11 +1022,11 @@ GET /v1/admin/invoices
 
 ### 10.7 Self-hosted gateway routes API
 
-The open-source gateway binary serves a routes API at `/v1/routes` (note: **no `/admin/` prefix**). It supports list, create, get, delete, pause/resume, and a per-route savings report — there is **no PATCH/update** handler; to change a route, delete and re-create it.
+The open-source gateway binary serves a routes API at `/v1/routes` (note: **no `/admin/` prefix**). It supports list, draft creation, get, delete, pause/resume, and a per-route savings report — there is **no PATCH/update** handler; to change a route, delete and re-create it. Generic API-key creation is draft-only: an omitted `enabled` becomes `false`, while explicit `enabled: true` receives a field-addressed `422 activation_confirmation_required`. Review and activate drafts through Dashboard → Routes.
 
 ```
 GET    /v1/routes              → list all routes
-POST   /v1/routes              → create a route (body identical to §10.2)
+POST   /v1/routes              → create a disabled route draft (body otherwise identical to §10.2)
 GET    /v1/routes/:id          → fetch one route
 DELETE /v1/routes/:id?expected_revision=N
                                → delete only the management-read revision N

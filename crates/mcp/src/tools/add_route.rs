@@ -46,7 +46,7 @@ use crate::error::McpError;
 use crate::protocol::ToolDef;
 use crate::tools::Tool;
 
-/// `add_route` — create a routing rule for the authenticated org.
+/// `add_route` — create a disabled routing-rule draft for the authenticated org.
 pub struct AddRouteTool {
     /// Gateway base URL (e.g. `https://api.tokentrimmer.com`). The tool POSTs to
     /// `{gateway_base}/v1/routes`.
@@ -88,6 +88,18 @@ impl AddRouteTool {
             }
         }
 
+        match obj.get("enabled") {
+            Some(Value::Bool(true)) => {
+                return Err(McpError::InvalidParams(
+                    "generic add_route creates disabled drafts only; activate through Dashboard → Routes after review".into(),
+                ));
+            }
+            None => {
+                obj.insert("enabled".into(), Value::Bool(false));
+            }
+            _ => {}
+        }
+
         serde_json::from_value::<NewRoute>(Value::Object(obj))
             .map_err(|e| McpError::InvalidParams(format!("invalid route spec: {e}")))
     }
@@ -98,7 +110,8 @@ impl Tool for AddRouteTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "add_route",
-            description: "Create a routing rule for YOUR authenticated organization \
+            description:
+                "Create a disabled routing-rule draft for YOUR authenticated organization \
                 (write tool; available only when the server is booted with write \
                 access). The route is always applied to your own org; an `org_id` \
                 argument, if supplied, must match your authenticated org or the \
@@ -106,7 +119,8 @@ impl Tool for AddRouteTool {
                 route is structurally validated locally (vision-capability of the \
                 target, resolvability of any `shadow_model`) before it is sent; \
                 the gateway re-validates against its live provider registry and \
-                is the final authority. Re-creating an existing route id \
+                is the final authority. Activation requires a separate review \
+                in Dashboard → Routes. Re-creating an existing route id \
                 idempotently succeeds.",
             input_schema: json!({
                 "type": "object",
@@ -122,8 +136,9 @@ impl Tool for AddRouteTool {
                     },
                     "enabled": {
                         "type": "boolean",
-                        "default": true,
-                        "description": "Disabled routes never match."
+                        "const": false,
+                        "default": false,
+                        "description": "Must be false; add_route creates disabled drafts only."
                     },
                     "when": {
                         "type": "object",
@@ -272,6 +287,7 @@ mod tests {
             .unwrap();
         assert!(req.iter().any(|v| v.as_str() == Some("then")));
         assert!(req.iter().any(|v| v.as_str() == Some("name")));
+        assert_eq!(d.input_schema["properties"]["enabled"]["const"], false);
     }
 
     // ── happy path: posts the right NewRoute body ────────────────────────────
@@ -286,14 +302,14 @@ mod tests {
                     .path("/v1/routes")
                     .header("authorization", "Bearer tt_live_operator")
                     .json_body_includes(
-                        r#"{ "name": "all->cheap", "then": { "target_model": "gpt-4o-mini" } }"#
+                        r#"{ "name": "all->cheap", "enabled": false, "then": { "target_model": "gpt-4o-mini" } }"#
                             .to_string(),
                     );
                 then.status(201).json_body(json!({
                     "id": route_id.to_string(),
                     "name": "all->cheap",
                     "priority": 100,
-                    "enabled": true,
+                    "enabled": false,
                     "when": {},
                     "then": { "target_model": "gpt-4o-mini" }
                 }));
@@ -311,6 +327,29 @@ mod tests {
     }
 
     // ── validate-before-network: bad params never hit the gateway ────────────
+
+    #[tokio::test]
+    async fn explicit_activation_is_rejected_before_network() {
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/routes");
+                then.status(201).body("{}");
+            })
+            .await;
+
+        let err = tool(server.base_url(), Uuid::now_v7())
+            .call(json!({
+                "name": "active",
+                "enabled": true,
+                "then": { "target_model": "gpt-4o-mini" }
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        assert!(err.to_string().contains("disabled drafts only"));
+        assert_eq!(m.calls_async().await, 0);
+    }
 
     #[tokio::test]
     async fn unresolvable_shadow_model_rejected_before_network() {
@@ -539,7 +578,7 @@ mod tests {
                     "id": Uuid::now_v7().to_string(),
                     "name": "x",
                     "priority": 100,
-                    "enabled": true,
+                    "enabled": false,
                     "when": {},
                     "then": { "target_model": "gpt-4o-mini" }
                 }));

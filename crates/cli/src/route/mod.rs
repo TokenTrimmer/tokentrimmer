@@ -52,7 +52,7 @@ pub struct AddArgs {
     pub disabled: bool,
 }
 
-/// Pure: map `add` flags to the `NewRoute` JSON body the API expects.
+/// Pure: map `add` flags to the disabled `NewRoute` draft the API expects.
 pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     // `None` = a MODIFIER-ONLY route: no rewrite target, the matched request
     // keeps the model the caller picked and only the then-effects (currently
@@ -155,7 +155,7 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     Ok(json!({
         "name": name,
         "priority": args.priority,
-        "enabled": !args.disabled,
+        "enabled": false,
         "when": Value::Object(when),
         "then": Value::Object(then),
     }))
@@ -268,7 +268,7 @@ pub async fn run(
             .await?;
             drop(sp);
             ui::success(&format!(
-                "Created route {} ({}).",
+                "Created disabled route draft {} ({}); activate it in Dashboard → Routes.",
                 route["id"].as_str().unwrap_or("?"),
                 route["name"].as_str().unwrap_or("?")
             ));
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(body["then"]["target_model"], "gpt-4o-mini");
         assert_eq!(body["when"], json!({}));
         assert_eq!(body["priority"], 100);
-        assert_eq!(body["enabled"], true);
+        assert_eq!(body["enabled"], false);
     }
 
     #[test]

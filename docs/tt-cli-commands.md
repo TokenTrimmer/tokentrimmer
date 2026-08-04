@@ -351,7 +351,7 @@ and a gateway with a routing store configured.
 tt route list                    # table of your routes (NAME, ROUTE, PRIO, STATUS)
 tt route show <id>               # full JSON for one route
 tt route rm <id>                 # delete one route
-tt route add ...                 # create a route
+tt route add ...                 # create a disabled route draft
 tt route catalog enable          # install the curated down-route catalog
 tt route catalog disable         # remove all catalog routes (user routes untouched)
 tt route catalog status          # show active/paused state of each catalog route
@@ -360,7 +360,9 @@ tt route catalog status          # show active/paused state of each catalog rout
 `tt route add` needs a target — `--always <model>` (match all) or
 `--from <m> --to <m>` — plus optional `--when-*` conditions and `--max-cost` /
 `--disable-cache` / `--batch` / `--fallback` / `--priority` / `--name` /
-`--disabled` modifiers. `--batch` sets the *advisory* batch-eligibility marker
+modifiers. Route creation is always disabled; `--disabled` remains as a
+compatibility no-op. Review and activate the draft in Dashboard → Routes.
+`--batch` sets the *advisory* batch-eligibility marker
 (`then.batch`): matched traffic is still served and billed normally today, but
 the forgone Batch-API discount is attributed for the future async Batch Lane —
 never applied to streaming or interactive requests. There is no in-place
@@ -420,7 +422,7 @@ and `show` work fully offline; only `apply` talks to the gateway.
 ```bash
 tt recipes list            # table: RECIPE, OPTIMIZES, LANE
 tt recipes show <recipe>   # humanized route-set + savings lane + description
-tt recipes apply <recipe>  # create the recipe's routes on the gateway
+tt recipes apply <recipe>  # create disabled route drafts on the gateway
 ```
 
 The five curated recipes:
@@ -433,12 +435,12 @@ The five curated recipes:
 | `outage-fallback` | Provider outages fail over to a backup chain. |
 | `long-context-downshift` | Huge-context prompts → a cheaper long-context model. |
 
-`apply` creates each route via the same `POST /v1/routes` endpoint `tt route add`
+`apply` creates each route as a disabled draft via the same `POST /v1/routes` endpoint `tt route add`
 uses, so it requires a key (`tt login --token <KEY>` or `TT_API_KEY`) and a
 gateway with a routing store configured. Without a key it fails with an
 actionable message and a non-zero exit — it never silently "applies" nothing.
-After applying, inspect or remove the created routes with `tt route list` /
-`tt route rm <id>`.
+After applying, inspect the drafts with `tt route list`, activate reviewed
+routes in Dashboard → Routes, or remove them with `tt route rm <id>`.
 
 ### Example
 

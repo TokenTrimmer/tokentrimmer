@@ -700,7 +700,7 @@ enum RouteAction {
         /// Action to perform: enable, disable, or status.
         action: CatalogAction,
     },
-    /// Add a route. Use --always <model>, or --from <m> --to <m>, or
+    /// Add a disabled route draft. Use --always <model>, or --from <m> --to <m>, or
     /// --agentic-budget alone for a modifier-only route (keeps the caller's model).
     Add {
         #[arg(long)]
@@ -770,7 +770,7 @@ enum RouteAction {
         name: Option<String>,
         #[arg(long)]
         fallback: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "Compatibility no-op; route creation is always disabled")]
         disabled: bool,
     },
 }
