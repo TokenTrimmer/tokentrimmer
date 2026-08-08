@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod models;
 pub mod panel;
 pub mod preview;
+pub(crate) mod preview_action;
 pub mod ready;
 pub mod request_preflight;
 pub mod responses;
