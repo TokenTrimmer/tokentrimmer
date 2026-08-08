@@ -107,6 +107,9 @@ pub struct WorkflowNodeRunView {
     pub attempt: i32,
     pub status: String,
     pub output: Option<serde_json::Value>,
+    /// Bounded, value-free capture of the node's consumed template references
+    /// (secrets redacted); `None` when the node records no input.
+    pub input: Option<serde_json::Value>,
     pub cost_usd: f64,
     pub model_used: Option<String>,
     pub error: Option<String>,
@@ -301,6 +304,7 @@ fn node_run_view(
         attempt: record.attempt,
         status: record.status,
         output: record.output,
+        input: record.input,
         cost_usd: record.cost_usd,
         model_used: record.model_used,
         error: record.error,
@@ -382,6 +386,7 @@ mod tests {
             attempt: 1,
             status: "completed".into(),
             output: Some(serde_json::json!({"text": "ok"})),
+            input: Some(serde_json::json!({"template": "{{input}}", "refs": {"input": "hi"}})),
             cost_usd: 0.01,
             model_used: Some("gpt-4o-mini".into()),
             error: None,

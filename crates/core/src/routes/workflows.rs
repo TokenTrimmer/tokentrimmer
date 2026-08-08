@@ -759,6 +759,7 @@ async fn persist_run_results(
             run_id,
             &entry.node_id,
             &entry.status,
+            entry.input,
             entry.output,
             entry.cost_usd,
             entry.model_used.as_deref(),

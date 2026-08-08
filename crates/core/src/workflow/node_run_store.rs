@@ -18,6 +18,9 @@ pub(crate) struct WorkflowNodeRunRecord {
     pub attempt: i32,
     pub status: String,
     pub output: Option<serde_json::Value>,
+    /// Bounded, value-free capture of the node's consumed template references
+    /// (secrets redacted to `"***"`); `None` when the node records no input.
+    pub input: Option<serde_json::Value>,
     pub cost_usd: f64,
     pub model_used: Option<String>,
     pub error: Option<String>,
@@ -30,8 +33,8 @@ pub(crate) struct WorkflowNodeRunRecord {
 /// completed node execution.
 pub(crate) const INSERT_NODE_RUN_SQL: &str = "\
 INSERT INTO workflow_node_runs \
-  (id, run_id, node_id, attempt, status, output, cost_usd, model_used, error, started_at, finished_at) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+  (id, run_id, node_id, attempt, status, input, output, cost_usd, model_used, error, started_at, finished_at) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
 ON CONFLICT (id) DO NOTHING";
 
 /// List a bounded journal for one run.
@@ -41,7 +44,7 @@ ON CONFLICT (id) DO NOTHING";
 /// while `started_at` preserves engine start order for new rows and post-run
 /// persistence order for legacy rows.
 pub(crate) const LIST_NODE_RUNS_FOR_RUN_SQL: &str = "\
-SELECT nr.id, nr.node_id, nr.attempt, nr.status, nr.output, \
+SELECT nr.id, nr.node_id, nr.attempt, nr.status, nr.output, nr.input, \
        nr.cost_usd::float8 AS cost_usd, nr.model_used, nr.error, \
        nr.started_at, nr.finished_at \
 FROM workflow_node_runs AS nr \
@@ -57,6 +60,7 @@ fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowNodeRunRecord,
         attempt: row.try_get("attempt")?,
         status: row.try_get("status")?,
         output: row.try_get("output")?,
+        input: row.try_get("input")?,
         cost_usd: row.try_get("cost_usd")?,
         model_used: row.try_get("model_used")?,
         error: row.try_get("error")?,
@@ -73,6 +77,7 @@ pub(crate) async fn insert_node_run(
     run_id: Uuid,
     node_id: &str,
     status: &str,
+    input: Option<serde_json::Value>,
     output: Option<serde_json::Value>,
     cost_usd: f64,
     model_used: Option<&str>,
@@ -87,6 +92,7 @@ pub(crate) async fn insert_node_run(
         .bind(node_id)
         .bind(1_i32)
         .bind(status)
+        .bind(input)
         .bind(output)
         .bind(cost_usd)
         .bind(model_used)
@@ -132,6 +138,8 @@ mod tests {
         assert!(INSERT_NODE_RUN_SQL.contains("INSERT INTO workflow_node_runs"));
         assert!(INSERT_NODE_RUN_SQL.contains("started_at, finished_at"));
         assert!(INSERT_NODE_RUN_SQL.contains("ON CONFLICT (id) DO NOTHING"));
+        assert!(INSERT_NODE_RUN_SQL.contains("input"));
+        assert!(INSERT_NODE_RUN_SQL.contains("output"));
     }
 
     #[test]
@@ -143,5 +151,6 @@ mod tests {
         assert!(LIST_NODE_RUNS_FOR_RUN_SQL.contains("LIMIT $3"));
         assert!(LIST_NODE_RUNS_FOR_RUN_SQL.contains("nr.cost_usd::float8"));
         assert!(LIST_NODE_RUNS_FOR_RUN_SQL.contains("nr.started_at, nr.finished_at"));
+        assert!(LIST_NODE_RUNS_FOR_RUN_SQL.contains("nr.input"));
     }
 }

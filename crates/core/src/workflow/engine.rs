@@ -78,6 +78,7 @@ use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{reservation_cost_usd, IntelligenceSpec, NodeExecutor};
 use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
 use crate::workflow::preflight::{prepare_workflow_tree, PreparedWorkflowTree};
+use crate::workflow::replay::capture_node_input;
 use crate::workflow::schedule;
 use crate::workflow::secrets::required_secret_names;
 use crate::workflow::types::{ModelSelection, Node, NodeKind, NodeOutput, WorkflowDefinition};
@@ -118,6 +119,12 @@ pub(crate) struct NodeJournalEntry {
     /// `"completed"` or `"failed"`.
     pub status: String,
     pub output: Option<serde_json::Value>,
+    /// Bounded, value-free capture of what this node consumed: the template it
+    /// evaluated and the resolved reference bindings (secrets already `"***"`).
+    /// `None` when the node has no template input worth replaying (Trigger,
+    /// Output, Http — which is secret-substituted and must never be captured),
+    /// or when capture was not taken (SubWorkflow, Document, recursive folds).
+    pub input: Option<serde_json::Value>,
     pub cost_usd: f64,
     pub model_used: Option<String>,
     pub error: Option<String>,
@@ -542,6 +549,8 @@ fn run_workflow_boxed<'a>(
                 // Build IntelligenceSpecs sequentially — reads `outputs` and
                 // `trigger_id` which are not touched by the concurrent futures.
                 let mut specs: Vec<(String, IntelligenceSpec)> = Vec::new();
+                let mut captured_inputs: HashMap<String, Option<serde_json::Value>> =
+                    HashMap::new();
                 for node_id in &model_agent_wave {
                     let node = match node_map.get(node_id.as_str()) {
                         Some(n) => n,
@@ -589,6 +598,10 @@ fn run_workflow_boxed<'a>(
                                     max_cost_usd: *node_cap,
                                 },
                             ));
+                            captured_inputs.insert(
+                                node_id.clone(),
+                                capture_input(prompt, &trigger_id, &outputs, variables),
+                            );
                         }
                         NodeKind::Agent {
                             selection,
@@ -630,6 +643,10 @@ fn run_workflow_boxed<'a>(
                                     max_cost_usd: *node_cap,
                                 },
                             ));
+                            captured_inputs.insert(
+                                node_id.clone(),
+                                capture_input(prompt, &trigger_id, &outputs, variables),
+                            );
                         }
                         _ => unreachable!("partitioned into model_agent_wave above"),
                     }
@@ -717,6 +734,7 @@ fn run_workflow_boxed<'a>(
                                 node_id: node_id.clone(),
                                 status: "failed".into(),
                                 output: None,
+                                input: captured_inputs.get(&node_id).cloned().flatten(),
                                 cost_usd: 0.0,
                                 model_used: None,
                                 error: Some(message.clone()),
@@ -735,6 +753,7 @@ fn run_workflow_boxed<'a>(
                                 node_id: node_id.clone(),
                                 status: "completed".into(),
                                 output: Some(out.content.clone()),
+                                input: captured_inputs.get(&node_id).cloned().flatten(),
                                 cost_usd: out.cost_usd,
                                 model_used: out.model_used.clone(),
                                 error: None,
@@ -876,6 +895,7 @@ fn run_workflow_boxed<'a>(
                             node_id: node_id.clone(),
                             status: "completed".into(),
                             output: Some(serde_json::Value::String(value)),
+                            input: capture_input(expr, &trigger_id, &outputs, variables),
                             cost_usd: 0.0,
                             model_used: None,
                             error: None,
@@ -909,6 +929,7 @@ fn run_workflow_boxed<'a>(
                             node_id: node_id.clone(),
                             status: "completed".into(),
                             output: Some(serde_json::Value::String(taken.clone())),
+                            input: capture_input(cond, &trigger_id, &outputs, variables),
                             cost_usd: 0.0,
                             model_used: None,
                             error: None,
@@ -1013,7 +1034,10 @@ fn run_workflow_boxed<'a>(
                                 // SECURITY CHOKEPOINT: journal + output = RESPONSE ONLY.
                                 // NEVER include the substituted url/headers/body (they may
                                 // contain secrets). Http is zero-cost (no model call).
-                                // Include status so downstream nodes can branch on it.
+                                // Include status so downstream nodes can branch on it. For the
+                                // same reason no `input` capture is recorded here — the wire
+                                // spec is built with substitute_with_secrets and must never be
+                                // persisted, value-free or not.
                                 let resp_content = serde_json::json!({
                                     "status": resp.status,
                                     "body": resp.body,
@@ -1029,6 +1053,7 @@ fn run_workflow_boxed<'a>(
                                     node_id: node_id.clone(),
                                     status: "completed".into(),
                                     output: Some(resp_content),
+                                    input: None,
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: None,
@@ -1054,6 +1079,7 @@ fn run_workflow_boxed<'a>(
                                     node_id: node_id.clone(),
                                     status: "failed".into(),
                                     output: None,
+                                    input: None,
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: Some(message.clone()),
@@ -1252,6 +1278,10 @@ fn run_workflow_boxed<'a>(
                             node_id: node_id.clone(),
                             status: "completed".into(),
                             output: Some(last_content),
+                            // Loop `cond` is re-evaluated each iteration against
+                            // evolving outputs; the capture reflects the final
+                            // iteration's evaluation context.
+                            input: capture_input(cond, &trigger_id, &outputs, variables),
                             cost_usd: loop_cost,
                             model_used: None,
                             error: None,
@@ -1423,6 +1453,10 @@ fn run_workflow_boxed<'a>(
                             node_id: node_id.clone(),
                             status: "completed".into(),
                             output: Some(out.content.clone()),
+                            // Child inputs equal the parent run's inputs (MVP);
+                            // capturing a full copy is redundant + unbounded, and
+                            // the run record already scopes them.
+                            input: None,
                             cost_usd: out.cost_usd,
                             model_used: None,
                             error: None,
@@ -1467,6 +1501,7 @@ fn run_workflow_boxed<'a>(
                                     node_id: node_id.clone(),
                                     status: "failed".into(),
                                     output: None,
+                                    input: None,
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: Some(err.to_string()),
@@ -1516,6 +1551,7 @@ fn run_workflow_boxed<'a>(
                                 node_id: node_id.clone(),
                                 status: "completed".into(),
                                 output: Some(content.clone()),
+                                input: None,
                                 cost_usd: 0.0,
                                 model_used: None,
                                 error: None,
@@ -1579,6 +1615,7 @@ fn run_workflow_boxed<'a>(
                                     node_id: node_id.clone(),
                                     status: "completed".into(),
                                     output: Some(content.clone()),
+                                    input: None,
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: None,
@@ -1600,6 +1637,7 @@ fn run_workflow_boxed<'a>(
                                     node_id: node_id.clone(),
                                     status: "failed".into(),
                                     output: None,
+                                    input: None,
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: Some(err.to_string()),
@@ -1845,6 +1883,24 @@ fn resolve_ref(
     }
 }
 
+/// Build a bounded, value-free input capture for one template evaluation.
+///
+/// Resolves every `{{ref}}` in `template` through the same secret-free resolver
+/// the engine's substitution uses, so captured values exactly match what live
+/// evaluation produced and secret refs arrive as `"***"` — never a real value.
+/// Returns `None` when the template references nothing (nothing to replay), and
+/// the JSON form is truncated by the replay module's hard bounds.
+fn capture_input(
+    template: &str,
+    trigger_id: &str,
+    outputs: &HashMap<String, NodeOutput>,
+    variables: &BTreeMap<String, String>,
+) -> Option<serde_json::Value> {
+    let captured =
+        capture_node_input(template, |ref_str| resolve_ref(ref_str, trigger_id, outputs, variables))?;
+    serde_json::to_value(captured).ok()
+}
+
 /// Coerce a JSON value to a plain string for template output.
 /// String values are unwrapped; other values are compactly serialized.
 fn json_to_string(v: &serde_json::Value) -> String {
@@ -1921,6 +1977,7 @@ mod tests {
     use super::*;
     use crate::{
         error::ApiError,
+        workflow::replay::{replay_transform, CapturedNodeInput},
         workflow::types::{BudgetPolicy, Edge, ModelSelection, Node, NodeKind, WorkflowDefinition},
     };
 
@@ -2486,6 +2543,139 @@ mod tests {
         assert_eq!(
             calls[0].1, "hello processed",
             "transform output must propagate into the model prompt"
+        );
+    }
+
+    /// The engine records the Transform node's consumed references (per-node
+    /// input), and the offline replay of that capture reproduces the journaled
+    /// output exactly — no provider, no re-run.
+    #[tokio::test]
+    async fn test_transform_captures_input_and_replays_offline() {
+        let def = make_transform_def();
+        let stub = StubExecutor::new(vec![(
+            "m1",
+            NodeOutput {
+                content: json!("model_out"),
+                cost_usd: 0.10,
+                baseline_cost_usd: 0.0,
+                model_used: None,
+                doc_vision_saved_est_usd: 0.0,
+            },
+        )]);
+
+        let mut journal_entries: Vec<NodeJournalEntry> = Vec::new();
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hello"),
+            None,
+            |e| journal_entries.push(e),
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        let transform_entry = journal_entries
+            .iter()
+            .find(|e| e.node_id == "tr")
+            .expect("transform node must be journaled");
+
+        // Per-node input capture: the `{{input}}` ref resolved to the trigger
+        // value; Template is the expr itself.
+        let captured: CapturedNodeInput =
+            serde_json::from_value(transform_entry.input.as_ref().expect("transform input captured").clone())
+                .expect("captured input is a valid CapturedNodeInput");
+        assert_eq!(captured.template, "{{input}} processed");
+        assert_eq!(
+            captured.refs.get("input").map(String::as_str),
+            Some("hello"),
+            "captured input binding must match what substitution resolved"
+        );
+
+        // Offline replay reproduces the journaled output byte-for-byte.
+        let replay_value = replay_transform(&captured).unwrap_or_else(|e| panic!("replay: {e:?}"));
+        let journal_output = transform_entry
+            .output
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .expect("transform output is a string");
+        assert_eq!(
+            replay_value, journal_output,
+            "offline replay must reproduce the live transform output exactly"
+        );
+        assert_eq!(replay_value, "hello processed");
+    }
+
+    /// Model/Agent journal entries also record the prompt references they
+    /// consumed; the capture is bounded to the node's own template refs.
+    #[tokio::test]
+    async fn test_model_journal_captures_prompt_inputs() {
+        let def = make_sequential_def();
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("response_1"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("response_2"),
+                    cost_usd: 0.15,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+        ]);
+
+        let mut journal_entries: Vec<NodeJournalEntry> = Vec::new();
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hello"),
+            None,
+            |e| journal_entries.push(e),
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        let m1 = journal_entries
+            .iter()
+            .find(|e| e.node_id == "m1")
+            .expect("m1 journaled");
+        let m2 = journal_entries
+            .iter()
+            .find(|e| e.node_id == "m2")
+            .expect("m2 journaled");
+
+        let m1_input: CapturedNodeInput =
+            serde_json::from_value(m1.input.as_ref().expect("m1 input captured").clone()).unwrap();
+        let m2_input: CapturedNodeInput =
+            serde_json::from_value(m2.input.as_ref().expect("m2 input captured").clone()).unwrap();
+
+        assert_eq!(
+            m1_input.refs.get("input").map(String::as_str),
+            Some("hello")
+        );
+        assert_eq!(
+            m2_input.refs.get("m1").map(String::as_str),
+            Some("response_1"),
+            "m2 consumed m1's output as recorded input"
         );
     }
 
