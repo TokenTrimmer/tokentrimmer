@@ -18,6 +18,7 @@ pub mod l2_receipt;
 pub mod panel_legs;
 pub mod propagation;
 pub mod request_logs;
+pub mod trace_link;
 pub mod tracing;
 pub mod vcr;
 pub mod wfr_receipt;

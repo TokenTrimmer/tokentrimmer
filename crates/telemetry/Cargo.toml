@@ -24,6 +24,7 @@ schemars = { workspace = true, optional = true }
 chrono.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+url.workspace = true
 async-trait.workspace = true
 hex.workspace = true
 rand_core.workspace = true
