@@ -11,8 +11,18 @@ use tt_shared::messages::{Message, MessageContent, ToolCall};
 pub enum StopReason {
     /// The loop hit `max_turns`.
     MaxTurns,
-    /// The run's accumulated served cost reached `max_cost_usd`.
+    /// The run's accumulated served cost reached `max_cost_usd` and the loop
+    /// stopped BEFORE dispatching a turn that (per the accrued + directional
+    /// estimate check) would take it past the cap. No new provider work was
+    /// started after the cap was met.
     BudgetExhausted,
+    /// A STARTED provider call settled its served cost ABOVE the run's
+    /// `max_cost_usd` cap: the directional pre-dispatch estimate admitted a
+    /// turn whose actual cost came in over the cap. Recorded as a breach the
+    /// moment it settles (never silently clamped to the cap, never reported as
+    /// a clean `Completed`); the loop terminates immediately after the
+    /// offending turn.
+    BudgetBreach,
     /// The loop made no progress — `RUNAWAY_REPEAT_THRESHOLD` consecutive
     /// byte-identical (tool-call + tool-result) steps. The model saw the same
     /// result and re-issued the same call with no new information; left alone it

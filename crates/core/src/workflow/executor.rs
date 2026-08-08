@@ -204,38 +204,19 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
 
         match outcome {
             LoopOutcome::Terminal(run) => {
-                if let Some(message) =
-                    workflow_budget_dispatch_failure(run.status, run.note.as_deref())
-                {
-                    return Err(ApiError::InvalidRequest(message));
+                let capped = spec.max_cost_usd.is_some();
+                match terminal_run_to_node_outcome(run, capped) {
+                    NodeRunOutcome::Output(out) => Ok(out),
+                    NodeRunOutcome::BudgetDispatchRejected(message) => {
+                        Err(ApiError::InvalidRequest(message))
+                    }
+                    NodeRunOutcome::ProviderCallFailed {
+                        accrued_cost_usd,
+                        reason,
+                    } => Err(ApiError::Internal(format!(
+                        "node \"{node_id}\" provider call failed after accruing ${accrued_cost_usd:.4}: {reason}"
+                    ))),
                 }
-                // Extract the last assistant text from the transcript.
-                let last_text = run
-                    .messages
-                    .iter()
-                    .rev()
-                    .find_map(|m| {
-                        if let Message::Assistant {
-                            content: Some(MessageContent::Text(t)),
-                            ..
-                        } = m
-                        {
-                            Some(t.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-
-                // `model_used`: not tracked on `Run` in W1a (the request_logs row
-                // carries the per-turn model; surfacing it here is deferred to W2).
-                Ok(NodeOutput {
-                    content: json!(last_text),
-                    cost_usd: run.usage.cost_usd,
-                    baseline_cost_usd: run.usage.baseline_cost_usd,
-                    model_used: None,
-                    doc_vision_saved_est_usd: 0.0,
-                })
             }
             // Workflows don't use client (non-gateway) tools in W1a — the agent
             // loop is expected to terminate.  Treat an unexpected pause as an
@@ -247,6 +228,81 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
     }
 }
 
+/// Result of mapping a terminal agent-loop run onto the workflow node outcome
+/// the engine sees. Pure + unit-testable — tests construct a [`agent_run::Run`]
+/// directly (no provider, no DB).
+#[derive(Debug)]
+enum NodeRunOutcome {
+    /// The node produced an output from its (partial) transcript.
+    Output(NodeOutput),
+    /// The per-node budget dispatch rejected the final routed request before
+    /// provider work; the engine must propagate the rejection and stop the
+    /// workflow (surfaced as `InvalidRequest`, unchanged semantics).
+    BudgetDispatchRejected(String),
+    /// On a CAPPED node, a started provider call failed. Surfaced so the
+    /// engine's node journal records the failed call and the run's real accrued
+    /// spend as evidence — instead of silently reporting a "completed" node
+    /// with empty content and forgetting the failed call.
+    ProviderCallFailed {
+        accrued_cost_usd: f64,
+        reason: String,
+    },
+}
+
+/// Map a terminal agent-loop run to the node outcome for the engine.
+///
+/// - A budget-dispatch rejection (note carries the `"workflow budget dispatch"`
+///   token) is surfaced as a stop-the-workflow rejection on every path.
+/// - On a **capped** node, a `Failed` run — a started provider call that
+///   errored — is surfaced as a recorded failure carrying the run's actual
+///   accrued spend. Fail-closed + evidence: the workflow node fails instead of
+///   silently completing with an empty answer, and the spend accrued before the
+///   failure is preserved in the returned message.
+/// - Every other terminal run (Completed, or a budget-control Incomplete stop —
+///   `BudgetExhausted` / `BudgetBreach` / `MaxTurns` / runaway) yields the node
+///   output from the partial transcript, exactly as before.
+/// - **Uncapped nodes keep legacy behavior byte-for-byte**: a failed call still
+///   produces a (partial/empty) node output rather than failing the workflow,
+///   so ordinary uncapped workflow runs are unchanged.
+fn terminal_run_to_node_outcome(run: agent_run::Run, capped: bool) -> NodeRunOutcome {
+    if let Some(message) = workflow_budget_dispatch_failure(run.status, run.note.as_deref()) {
+        return NodeRunOutcome::BudgetDispatchRejected(message);
+    }
+    if capped && run.status == RunStatus::Failed {
+        return NodeRunOutcome::ProviderCallFailed {
+            accrued_cost_usd: run.usage.cost_usd,
+            reason: run.note.unwrap_or_else(|| "provider call failed".to_string()),
+        };
+    }
+    // Extract the last assistant text from the transcript.
+    let last_text = run
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| {
+            if let Message::Assistant {
+                content: Some(MessageContent::Text(t)),
+                ..
+            } = m
+            {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    // `model_used`: not tracked on `Run` in W1a (the request_logs row carries
+    // the per-turn model; surfacing it here is deferred to W2).
+    NodeRunOutcome::Output(NodeOutput {
+        content: json!(last_text),
+        cost_usd: run.usage.cost_usd,
+        baseline_cost_usd: run.usage.baseline_cost_usd,
+        model_used: None,
+        doc_vision_saved_est_usd: 0.0,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -254,7 +310,121 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::types::ModelSelection;
+    use crate::{
+        routes::agent_run::{Run, RunUsage},
+        workflow::types::ModelSelection,
+    };
+
+    // ---- Make workflow spend truly bounded: failed-call recording ---------
+
+    /// A terminal loop run produced by a fake agent-loop outcome. `messages`
+    /// carries the partial transcript; `usage` the accrued cost so far.
+    fn run_with(status: RunStatus, cost_usd: f64, note: Option<&str>) -> Run {
+        Run {
+            id: uuid::Uuid::nil(),
+            status,
+            messages: vec![Message::Assistant {
+                content: Some(MessageContent::Text("partial answer".into())),
+                tool_calls: vec![],
+                name: None,
+            }],
+            turns: 1,
+            usage: RunUsage {
+                cost_usd,
+                ..Default::default()
+            },
+            note: note.map(str::to_string),
+            summarizer_tax_usd: None,
+            stop_reason: None,
+        }
+    }
+
+    /// A STARTED provider call that fails on a CAPPED node must be surfaced as
+    /// a recorded failure carrying the run's real accrued spend — the workflow
+    /// node journal then records the failed call (evidence) instead of silently
+    /// reporting a "completed" node with empty content.
+    #[test]
+    fn capped_failed_run_surfaces_provider_call_with_accrued_spend() {
+        let outcome = terminal_run_to_node_outcome(
+            run_with(
+                RunStatus::Failed,
+                0.12,
+                Some("turn 0 failed: upstream 500: login_expired"),
+            ),
+            /* capped */ true,
+        );
+        match outcome {
+            NodeRunOutcome::ProviderCallFailed {
+                accrued_cost_usd,
+                reason,
+            } => {
+                assert!(
+                    (accrued_cost_usd - 0.12).abs() < 1e-9,
+                    "accrued spend before the failed call is preserved"
+                );
+                assert!(reason.contains("turn 0 failed"));
+            }
+            other => panic!("expected ProviderCallFailed, got {other:?}"),
+        }
+    }
+
+    /// Uncapped nodes keep legacy behavior byte-for-byte: a failed provider
+    /// call still yields a node output from the partial transcript (never a
+    /// workflow failure) — ordinary uncapped workflow runs are unchanged.
+    #[test]
+    fn uncapped_failed_run_keeps_legacy_node_output_behavior() {
+        let outcome = terminal_run_to_node_outcome(
+            run_with(RunStatus::Failed, 0.12, Some("turn 0 failed: upstream 500")),
+            /* capped */ false,
+        );
+        match outcome {
+            NodeRunOutcome::Output(node_output) => {
+                assert_eq!(node_output.content, serde_json::json!("partial answer"));
+                assert!((node_output.cost_usd - 0.12).abs() < 1e-9);
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    /// A budget-dispatch rejection (the run note carries the
+    /// `"workflow budget dispatch"` token) must stop the workflow on capped AND
+    /// uncapped nodes alike — unchanged propagation semantics.
+    #[test]
+    fn budget_dispatch_rejection_propagates_on_every_node() {
+        for capped in [true, false] {
+            let outcome = terminal_run_to_node_outcome(
+                run_with(
+                    RunStatus::Failed,
+                    0.0,
+                    Some("turn 0 failed: invalid request: workflow budget dispatch rejected the final routed request before provider work"),
+                ),
+                capped,
+            );
+            match outcome {
+                NodeRunOutcome::BudgetDispatchRejected(message) => {
+                    assert!(message.contains("workflow budget dispatch"));
+                }
+                other => panic!("expected BudgetDispatchRejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// A capped node that stops on a budget-control signal (BudgetExhausted /
+    /// BudgetBreach / MaxTurns) still yields its partial output — the breach is
+    /// recorded on the run's stop_reason/note, and the engine's own run-level
+    /// cap stops later nodes. Failing the whole workflow for a control stop
+    /// would be over-aggressive.
+    #[test]
+    fn capped_budget_control_stop_still_produces_node_output() {
+        let outcome = terminal_run_to_node_outcome(
+            run_with(RunStatus::Incomplete, 0.50, Some("run cost cap $0.40 breached")),
+            /* capped */ true,
+        );
+        assert!(
+            matches!(outcome, NodeRunOutcome::Output(_)),
+            "budget-control Incomplete runs map to Output, not a workflow failure"
+        );
+    }
 
     // ---- Task 3: NodeOutput.baseline_cost_usd is threaded from RunUsage -----
 

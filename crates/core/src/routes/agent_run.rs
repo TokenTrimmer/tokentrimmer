@@ -488,6 +488,34 @@ async fn run_loop_core_with_output_cap(
             message: assistant.clone(),
         });
 
+        // A started turn has now settled its actual served cost. The directional
+        // pre-dispatch estimate only admitted the turn on the way in
+        // (`accrued + est <= cap`); reality can settle above that. Once the
+        // accumulated cost crosses the cap, terminate as a RECORDED breach at
+        // the moment of settlement (fail closed) — never continue into another
+        // turn and never return `Completed` on a breaching final turn — and
+        // never silently clamp `usage.cost_usd` to the cap. The run carries
+        // `StopReason::BudgetBreach` + the real settled cost so the breach is
+        // persisted (`budget_breach`) and reconcileable. Settling exactly AT
+        // the cap is not a breach (matches `would_exceed`'s equal-is-admissible
+        // boundary).
+        if max_cost_usd.is_some_and(|cap| usage.cost_usd > cap) {
+            let cap = max_cost_usd.unwrap_or_default();
+            let settled_cost_usd = usage.cost_usd;
+            return LoopOutcome::Terminal(Run {
+                id,
+                status: RunStatus::Incomplete,
+                messages,
+                turns: turn + 1,
+                usage,
+                note: Some(format!(
+                    "run cost cap ${cap:.4} breached: a started provider call settled ${settled_cost_usd:.4}, above the directional estimate"
+                )),
+                summarizer_tax_usd: summarizer_tax,
+                stop_reason: Some(StopReason::BudgetBreach),
+            });
+        }
+
         let tool_calls = match &assistant {
             Message::Assistant { tool_calls, .. } => tool_calls.clone(),
             _ => Vec::new(),
@@ -819,6 +847,7 @@ fn durable_record_to_run(rec: &crate::routes::agent_run_store::AgentRunRecord) -
     let stop_reason = rec.stop_reason.as_deref().and_then(|s| match s {
         "max_turns" => Some(crate::routes::agent_run_budget::StopReason::MaxTurns),
         "budget_exhausted" => Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted),
+        "budget_breach" => Some(crate::routes::agent_run_budget::StopReason::BudgetBreach),
         "runaway" => Some(crate::routes::agent_run_budget::StopReason::Runaway),
         _ => None,
     });
@@ -2511,6 +2540,15 @@ mod tests {
             Some(crate::routes::agent_run_budget::StopReason::MaxTurns)
         );
 
+        // budget_breach stop reason round-trips (a started call settled above
+        // the cap is persisted as "budget_breach" and read back identically)
+        rec.stop_reason = Some("budget_breach".into());
+        let run = durable_record_to_run(&rec);
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::BudgetBreach)
+        );
+
         // orphaned "running" row → Incomplete fallback
         rec.status = "running".into();
         rec.stop_reason = None;
@@ -3525,8 +3563,11 @@ mod tests {
 
     #[tokio::test]
     async fn loop_stops_when_accrued_cost_reaches_cap() {
-        // Each turn costs 0.25; cap is 0.40. After turn 1 (0.25) the loop runs
-        // turn 2 (0.50 >= 0.40), then refuses turn 3 -> Incomplete/BudgetExhausted.
+        // Each turn costs 0.25; cap is 0.40. Turn 1 (0.25) is admitted; turn 2
+        // is admitted too (accrued 0.25 < cap, no estimate for the unpriced
+        // model), and its STARTED call settles 0.50 — over the cap. The breach
+        // is recorded at settlement as a BudgetBreach (turns=2, usage 0.50),
+        // rather than deferring to a pre-turn check on a 3rd turn.
         let stub = CostStub {
             script: std::sync::Mutex::new(vec![
                 assistant_toolcall("find_route_for"),
@@ -3550,10 +3591,112 @@ mod tests {
         assert_eq!(run.status, RunStatus::Incomplete);
         assert_eq!(
             run.stop_reason,
-            Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted)
+            Some(crate::routes::agent_run_budget::StopReason::BudgetBreach)
         );
+        assert!(run.note.as_deref().is_some_and(|n| n.contains("breached")));
         assert_eq!(run.turns, 2);
         assert_eq!(run.usage.cost_usd, 0.50);
+    }
+
+    /// A STARTED provider call that settles above the cap on an otherwise-final
+    /// turn must be recorded as a BudgetBreach, NOT silently returned as a
+    /// clean `Completed` run (the pre-dispatch check only runs at the top of
+    /// the loop, so without the settle-time breach check this would slip
+    /// through as Completed with `stop_reason: None`).
+    #[tokio::test]
+    async fn started_call_settling_above_cap_is_recorded_breach_not_completed() {
+        // One turn, no tool calls (a final answer), settling 1.20 under a 1.00
+        // cap — the first turn is admitted (`0 + est` path is skipped for
+        // unpriced "m") and its actual settle breaches the cap.
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![assistant_final()]),
+            cost_per_turn: 1.20,
+            baseline_per_turn: 0.0,
+        };
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            Some(1.00),
+        )
+        .await;
+        assert_eq!(
+            run.status,
+            RunStatus::Incomplete,
+            "a settle-above-cap run must not report Completed"
+        );
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::BudgetBreach)
+        );
+        assert_eq!(run.turns, 1);
+        assert_eq!(run.usage.cost_usd, 1.20, "real settle is preserved, never clamped");
+        assert!(run
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("settled $1.2000")));
+    }
+
+    /// The settle-time breach check stops the loop immediately after the
+    /// breaching turn — it must NOT let a later turn dispatch even if that turn
+    /// would individually fit the remaining (negative) budget.
+    #[tokio::test]
+    async fn started_call_settling_above_cap_stops_before_further_turns() {
+        // Turn 1 settles 0.60 (over a 0.50 cap); the scripted final answer on
+        // turn 2 must never be dispatched.
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.60,
+            baseline_per_turn: 0.0,
+        };
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            Some(0.50),
+        )
+        .await;
+        assert_eq!(run.status, RunStatus::Incomplete);
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::BudgetBreach)
+        );
+        assert_eq!(run.turns, 1, "only the breaching turn ran");
+        assert_eq!(run.usage.cost_usd, 0.60);
+    }
+
+    /// Settling EXACTLY at the cap is admissible (matches `would_exceed`'s
+    /// equal-is-not-exceeded boundary): the run completes cleanly, no breach.
+    #[tokio::test]
+    async fn started_call_settling_at_cap_is_not_a_breach() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![assistant_final()]),
+            cost_per_turn: 1.00,
+            baseline_per_turn: 0.0,
+        };
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            Some(1.00),
+        )
+        .await;
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.stop_reason, None);
+        assert_eq!(run.turns, 1);
+        assert_eq!(run.usage.cost_usd, 1.00);
     }
 
     #[tokio::test]

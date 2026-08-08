@@ -37,6 +37,7 @@ pub(crate) fn stop_reason_str(r: StopReason) -> &'static str {
     match r {
         StopReason::MaxTurns => "max_turns",
         StopReason::BudgetExhausted => "budget_exhausted",
+        StopReason::BudgetBreach => "budget_breach",
         StopReason::Runaway => "runaway",
     }
 }
@@ -425,6 +426,7 @@ mod tests {
         let cases = [
             (StopReason::MaxTurns, "max_turns"),
             (StopReason::BudgetExhausted, "budget_exhausted"),
+            (StopReason::BudgetBreach, "budget_breach"),
             (StopReason::Runaway, "runaway"),
         ];
         for (reason, expected) in cases {
