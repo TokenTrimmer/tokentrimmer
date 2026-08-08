@@ -1,0 +1,748 @@
+{
+  "corpus": {
+    "id": "tokentrimmer.route-condition-parity-corpus",
+    "version": 1
+  },
+  "route_contract": {
+    "id": "tokentrimmer.route.v1",
+    "version": 1
+  },
+  "condition_fields": [
+    {
+      "field": "model_in",
+      "matcher": "exact_set",
+      "dashboard": "set",
+      "parity": "Exact decoded-string equality on both sides. Neither the canonical matcher nor the dashboard safe fragment trims or case-folds model names; whitespace padding is compared verbatim."
+    },
+    {
+      "field": "input_tokens_lt",
+      "matcher": "strict_upper_bound_u32",
+      "dashboard": "strict_upper_bound_u32",
+      "parity": "Strict u32 upper bound. A threshold of 0 is wire-valid but unsatisfiable (no u32 is < 0), so the dashboard safe fragment fails closed on it; the matcher evaluates it as an always-not-matched active condition."
+    },
+    {
+      "field": "input_tokens_gt",
+      "matcher": "strict_lower_bound_u32",
+      "dashboard": "strict_lower_bound_u32",
+      "parity": "Strict u32 lower bound. A threshold of U32_MAX is unsatisfiable, so the dashboard safe fragment fails closed on it."
+    },
+    {
+      "field": "tag_equals",
+      "matcher": "exact",
+      "dashboard": "exact",
+      "parity": "Exact decoded-string equality against the request tag; no trimming or case-folding on either side."
+    },
+    {
+      "field": "has_images",
+      "matcher": "optional_bool",
+      "dashboard": "exact_bool",
+      "parity": "Option<bool> equality: Some(false) is an active requirement of no-image, distinct from the field being absent. The dashboard safe fragment keeps the explicit bool verbatim."
+    },
+    {
+      "field": "has_audio",
+      "matcher": "optional_bool",
+      "dashboard": "exact_bool",
+      "parity": "Option<bool> equality, same semantics as has_images."
+    },
+    {
+      "field": "has_documents",
+      "matcher": "optional_bool",
+      "dashboard": "exact_bool",
+      "parity": "Option<bool> equality, same semantics as has_images."
+    },
+    {
+      "field": "content_type",
+      "matcher": "exact",
+      "dashboard": "exact",
+      "parity": "Exact decoded-string equality against the dominant content kind. An observed-but-unclassifiable request (None) never equals a wanted kind and is not treated as unavailable."
+    },
+    {
+      "field": "prompt_contains_any_of",
+      "matcher": "or_of_substrings_unicode_lowercase",
+      "dashboard": "or_of_substrings_ascii_only",
+      "parity": "Both sides lower-case the decoded keyword and the request text and use substring containment (OR across keywords) WITHOUT trimming. The dashboard's safe fragment only reasons about fully-ASCII keywords: a non-ASCII keyword makes the region fail closed (\"not proven\"), while the canonical matcher lower-cases with full Unicode. This is the pinned non-ASCII prompt parity contract: runtime executes, advisory fails closed."
+    },
+    {
+      "field": "estimated_cost_gt",
+      "matcher": "strict_lower_bound_f64_nonnegative",
+      "dashboard": "strict_lower_bound_nonnegative",
+      "parity": "Strict nonnegative dollar lower bound. A negative threshold is runtime-comparable but outside the dashboard safe fragment (fails closed)."
+    },
+    {
+      "field": "estimated_cost_lt",
+      "matcher": "strict_upper_bound_f64_nonnegative",
+      "dashboard": "strict_upper_bound_nonnegative",
+      "parity": "Strict nonnegative dollar upper bound. An empty gt>=lt interval is unsatisfiable, so the dashboard safe fragment fails closed on it."
+    },
+    {
+      "field": "upstream_latency_ms_p95_gt",
+      "matcher": "strict_lower_bound_u32",
+      "dashboard": "strict_lower_bound_u32",
+      "parity": "Strict u32 lower bound; U32_MAX is unsatisfiable and fails closed."
+    },
+    {
+      "field": "not_reasoning_class",
+      "matcher": "active_bool",
+      "dashboard": "active_bool",
+      "parity": "true is an active non-reasoning requirement; false is inactive on both sides."
+    }
+  ],
+  "prompt_cases": [
+    {
+      "id": "unicode_lowercase_cafe_upper_keyword",
+      "keywords": ["CAFÉ"],
+      "prompt": "Please review the Café invoice",
+      "expected_match": true,
+      "dashboard_region": null,
+      "note": "Full Unicode lowercase maps both CAFÉ and Café to café; the runtime matcher matches. The keyword is non-ASCII, so the dashboard safe fragment fails closed."
+    },
+    {
+      "id": "unicode_lowercase_cafe_upper_prompt",
+      "keywords": ["café"],
+      "prompt": "Serve more CAFÉ please",
+      "expected_match": true,
+      "dashboard_region": null
+    },
+    {
+      "id": "german_sharp_s_is_not_expanded",
+      "keywords": ["STRASSE"],
+      "prompt": "fahren auf der straße",
+      "expected_match": false,
+      "dashboard_region": { "prompt_keywords": ["strasse"], "not_reasoning_class": false },
+      "note": "Full Unicode lowercase does NOT expand ß to ss: strasse is not a substring of straße. The ASCII-only keyword IS admitted by the dashboard fragment; the runtime lower-cases it identically (STRASSE -> strasse). The dashboard can reason about this keyword and, like the matcher, cannot prove a match against a prompt containing ß."
+    },
+    {
+      "id": "greek_uppercase_lowercases_fully",
+      "keywords": ["ΑΘΉΝΑ"],
+      "prompt": "Είμαι στην αθήνα σήμερα",
+      "expected_match": true,
+      "dashboard_region": null
+    },
+    {
+      "id": "cyrillic_uppercase_lowercases_fully",
+      "keywords": ["МОСКВА"],
+      "prompt": "привет москва сегодня",
+      "expected_match": true,
+      "dashboard_region": null
+    },
+    {
+      "id": "turkish_dotted_i_keeps_combining_dot",
+      "keywords": ["İSTANBUL"],
+      "prompt": "istanbul ist überall",
+      "expected_match": false,
+      "dashboard_region": null,
+      "note": "Full Unicode lowercase maps dotted İ to i + U+0307 combining dot; it never ASCII-folds to a bare i, so istanbul with a plain i is not a substring. Pins the matcher's exact Unicode behavior."
+    },
+    {
+      "id": "ascii_keyword_matches_inside_non_ascii_prompt",
+      "keywords": ["refactor"],
+      "prompt": "refactor ✓ café, merci",
+      "expected_match": true,
+      "dashboard_region": { "prompt_keywords": ["refactor"], "not_reasoning_class": false },
+      "note": "An ASCII keyword is admitted by the dashboard safe fragment even when the rest of the prompt text is non-ASCII."
+    },
+    {
+      "id": "json_escape_replace_before_case_analysis",
+      "keywords": ["\u00e9tude"],
+      "prompt": "Complete the ÉTUDE now",
+      "expected_match": true,
+      "dashboard_region": null,
+      "note": "The corpus JSON escape \\u00e9 is replaced once during decoding (the shared decode/replace semantic). Both sides then analyze the decoded keyword étude: the matcher lower-cases it Unicode-wise and matches ÉTUDE, while the dashboard's ASCII gate now sees non-ASCII and fails closed. Decode happens before either side's case analysis."
+    },
+    {
+      "id": "no_trim_space_padded_keyword_does_not_match_bare_word",
+      "keywords": ["\u0020refactor\u0020"],
+      "prompt": "refactor this now",
+      "expected_match": false,
+      "dashboard_region": { "prompt_keywords": [" refactor "], "not_reasoning_class": false },
+      "note": "Neither side trims: the padded keyword refactor (decoded from \\u0020) only matches text that literally contains the surrounding spaces. A bare leading word is not matched, and the dashboard keeps the padded keyword verbatim (lower-cased only)."
+    },
+    {
+      "id": "space_padded_keyword_matches_padded_prompt",
+      "keywords": ["\u0020refactor\u0020"],
+      "prompt": "please refactor this block",
+      "expected_match": true,
+      "dashboard_region": { "prompt_keywords": [" refactor "], "not_reasoning_class": false },
+      "note": "The padded keyword IS a substring of text that includes surrounding spaces. Padding is meaningful in both directions and is preserved identically on both sides."
+    }
+  ],
+  "field_cases": [
+    {
+      "id": "model_in_exact_match",
+      "field": "model_in",
+      "conditions": { "model_in": ["gpt-4o", "claude-sonnet-4-6"] },
+      "features": { "model": "gpt-4o", "input_tokens": 100 },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "model_in": ["gpt-4o", "claude-sonnet-4-6"], "not_reasoning_class": false }
+    },
+    {
+      "id": "model_in_exact_no_trim",
+      "field": "model_in",
+      "conditions": { "model_in": [" gpt-4o "] },
+      "features": { "model": "gpt-4o", "input_tokens": 100 },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": { "model_in": [" gpt-4o "], "not_reasoning_class": false },
+      "note": "Neither side trims: a padded model string never equals the unpadded requested model, yet remains an admitted (verbatim) dashboard set member."
+    },
+    {
+      "id": "input_tokens_lt_match",
+      "field": "input_tokens_lt",
+      "conditions": { "input_tokens_lt": 500 },
+      "features": { "model": "gpt-4o", "input_tokens": 300, "tag": "prod" },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "input_tokens_lt": 500, "not_reasoning_class": false }
+    },
+    {
+      "id": "input_tokens_lt_zero_is_unsatisfiable",
+      "field": "input_tokens_lt",
+      "conditions": { "input_tokens_lt": 0 },
+      "features": { "model": "gpt-4o", "input_tokens": 0 },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": null,
+      "note": "The matcher keeps it as an always-not-matched active bound; the dashboard refuses to treat it as a provable region (unreachable strict bound)."
+    },
+    {
+      "id": "input_tokens_gt_match",
+      "field": "input_tokens_gt",
+      "conditions": { "input_tokens_gt": 1000 },
+      "features": { "model": "gpt-4o", "input_tokens": 1500 },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "input_tokens_gt": 1000, "not_reasoning_class": false }
+    },
+    {
+      "id": "input_tokens_gt_u32_max_is_unsatisfiable",
+      "field": "input_tokens_gt",
+      "conditions": { "input_tokens_gt": 4294967295 },
+      "features": { "model": "gpt-4o", "input_tokens": 4294967295 },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": null
+    },
+    {
+      "id": "input_tokens_adjacent_band_is_empty",
+      "field": "input_tokens_gt",
+      "conditions": { "input_tokens_gt": 400, "input_tokens_lt": 401 },
+      "features": { "model": "gpt-4o", "input_tokens": 400 },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": null,
+      "note": "Strict bounds >400 and <401 share no integer; the dashboard fails closed on the empty band."
+    },
+    {
+      "id": "tag_equals_match",
+      "field": "tag_equals",
+      "conditions": { "tag_equals": "prod" },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "tag": "prod" },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "tag_equals": "prod", "not_reasoning_class": false }
+    },
+    {
+      "id": "tag_equals_mismatch_no_trim",
+      "field": "tag_equals",
+      "conditions": { "tag_equals": "prod" },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "tag": " prod " },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": { "tag_equals": "prod", "not_reasoning_class": false },
+      "note": "Exact tag equality: the observed padded tag never equals prod; the dashboard keeps wanted tags verbatim."
+    },
+    {
+      "id": "has_images_true_match",
+      "field": "has_images",
+      "conditions": { "has_images": true },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "has_images": true },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "has_images": true, "not_reasoning_class": false }
+    },
+    {
+      "id": "has_images_false_requires_no_image",
+      "field": "has_images",
+      "conditions": { "has_images": false },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "has_images": true },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": { "has_images": false, "not_reasoning_class": false },
+      "note": "Some(false) is an active no-image requirement, kept verbatim by the dashboard."
+    },
+    {
+      "id": "has_audio_false_match",
+      "field": "has_audio",
+      "conditions": { "has_audio": false },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "has_audio": false },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "has_audio": false, "not_reasoning_class": false }
+    },
+    {
+      "id": "has_documents_true_match",
+      "field": "has_documents",
+      "conditions": { "has_documents": true },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "has_documents": true },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "has_documents": true, "not_reasoning_class": false }
+    },
+    {
+      "id": "content_type_exact_match",
+      "field": "content_type",
+      "conditions": { "content_type": "code" },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "content_type": "code" },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "content_type": "code", "not_reasoning_class": false }
+    },
+    {
+      "id": "content_type_unclassifiable_is_not_match",
+      "field": "content_type",
+      "conditions": { "content_type": "code" },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "content_type": null },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": { "content_type": "code", "not_reasoning_class": false },
+      "note": "An observed but unclassifiable request (null kind) never equals a wanted kind; this is NotMatched, not Unavailable."
+    },
+    {
+      "id": "prompt_or_of_substrings_lowercase",
+      "field": "prompt_contains_any_of",
+      "conditions": { "prompt_contains_any_of": ["refactor", "TEST"] },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "prompt": "Let's TEST the refactor" },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "prompt_keywords": ["refactor", "test"], "not_reasoning_class": false },
+      "note": "OR-of-substrings after case-folding; the dashboard lowers ASCII keywords identically."
+    },
+    {
+      "id": "estimated_cost_gt_match",
+      "field": "estimated_cost_gt",
+      "conditions": { "estimated_cost_gt": 0.01 },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "estimated_cost_usd": 0.02 },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "estimated_cost_gt": 0.01, "not_reasoning_class": false }
+    },
+    {
+      "id": "estimated_cost_lt_unknown_cost_fails_closed",
+      "field": "estimated_cost_lt",
+      "conditions": { "estimated_cost_lt": 1.0 },
+      "features": { "model": "gpt-4o", "input_tokens": 100 },
+      "expected_outcome": "unavailable",
+      "expected_match": false,
+      "dashboard_region": { "estimated_cost_lt": 1.0, "not_reasoning_class": false },
+      "note": "Unknown cost never matches a cost condition (Unavailable, fail-closed), while the dashboard can still reason about the interval's reachability."
+    },
+    {
+      "id": "estimated_cost_empty_band_is_unsatisfiable",
+      "field": "estimated_cost_gt",
+      "conditions": { "estimated_cost_gt": 2.0, "estimated_cost_lt": 1.0 },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "estimated_cost_usd": 0.5 },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": null,
+      "note": "gt >= lt makes the interval empty; the dashboard fails closed."
+    },
+    {
+      "id": "estimated_cost_gt_negative_threshold_runs_but_fails_closed",
+      "field": "estimated_cost_gt",
+      "conditions": { "estimated_cost_gt": -0.5 },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "estimated_cost_usd": 0.1 },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": null,
+      "note": "The matcher compares a negative threshold with strict inequality; the dashboard's nonnegative guard refuses it as an unprovable shape."
+    },
+    {
+      "id": "upstream_latency_p95_gt_match",
+      "field": "upstream_latency_ms_p95_gt",
+      "conditions": { "upstream_latency_ms_p95_gt": 250 },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "upstream_p95_ms": 300 },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "upstream_latency_ms_p95_gt": 250, "not_reasoning_class": false }
+    },
+    {
+      "id": "upstream_latency_p95_gt_unobserved_fails_closed",
+      "field": "upstream_latency_ms_p95_gt",
+      "conditions": { "upstream_latency_ms_p95_gt": 250 },
+      "features": { "model": "gpt-4o", "input_tokens": 100 },
+      "expected_outcome": "unavailable",
+      "expected_match": false,
+      "dashboard_region": { "upstream_latency_ms_p95_gt": 250, "not_reasoning_class": false }
+    },
+    {
+      "id": "upstream_latency_p95_gt_u32_max_unsatisfiable",
+      "field": "upstream_latency_ms_p95_gt",
+      "conditions": { "upstream_latency_ms_p95_gt": 4294967295 },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "upstream_p95_ms": 4294967295 },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": null
+    },
+    {
+      "id": "not_reasoning_class_true_match",
+      "field": "not_reasoning_class",
+      "conditions": { "not_reasoning_class": true },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "is_reasoning_class": false },
+      "expected_outcome": "matched",
+      "expected_match": true,
+      "dashboard_region": { "not_reasoning_class": true }
+    },
+    {
+      "id": "not_reasoning_class_true_mismatch",
+      "field": "not_reasoning_class",
+      "conditions": { "not_reasoning_class": true },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "is_reasoning_class": true },
+      "expected_outcome": "not_matched",
+      "expected_match": false,
+      "dashboard_region": { "not_reasoning_class": true }
+    },
+    {
+      "id": "not_reasoning_class_false_is_inactive",
+      "field": "not_reasoning_class",
+      "conditions": { "not_reasoning_class": false },
+      "features": { "model": "gpt-4o", "input_tokens": 100, "is_reasoning_class": true },
+      "expected_outcome": "inactive",
+      "expected_match": true,
+      "dashboard_region": { "not_reasoning_class": false },
+      "note": "not_reasoning_class: false is inactive on both sides: it never constrains and never requires the captured feature."
+    }
+  ],
+  "fail_closed_cases": [
+    {
+      "id": "unknown_condition_key",
+      "conditions": { "bogus_condition": 1 },
+      "expected": "region_null",
+      "note": "An unknown key is outside the closed condition-field set; the dashboard safe fragment fails closed."
+    },
+    {
+      "id": "model_in_not_array",
+      "conditions": { "model_in": "gpt-4o" },
+      "expected": "region_null"
+    },
+    {
+      "id": "model_in_non_string_member",
+      "conditions": { "model_in": [42] },
+      "expected": "region_null"
+    },
+    {
+      "id": "model_in_empty_string_member",
+      "conditions": { "model_in": [""] },
+      "expected": "region_null"
+    },
+    {
+      "id": "prompt_non_ascii_keyword",
+      "conditions": { "prompt_contains_any_of": ["café"] },
+      "expected": "region_null",
+      "note": "Non-ASCII keywords fail closed for ASCII-only safe-fragment reasoning even though the runtime matcher lower-cases them Unicode-wise."
+    },
+    {
+      "id": "prompt_non_string_member",
+      "conditions": { "prompt_contains_any_of": [5] },
+      "expected": "region_null"
+    },
+    {
+      "id": "input_tokens_lt_non_integer",
+      "conditions": { "input_tokens_lt": 1.5 },
+      "expected": "region_null"
+    },
+    {
+      "id": "input_tokens_gt_exceeds_u32",
+      "conditions": { "input_tokens_gt": 4294967296 },
+      "expected": "region_null"
+    },
+    {
+      "id": "has_images_non_bool",
+      "conditions": { "has_images": "false" },
+      "expected": "region_null"
+    },
+    {
+      "id": "tag_equals_non_string",
+      "conditions": { "tag_equals": 42 },
+      "expected": "region_null"
+    },
+    {
+      "id": "not_reasoning_class_non_bool",
+      "conditions": { "not_reasoning_class": 1 },
+      "expected": "region_null"
+    },
+    {
+      "id": "estimated_cost_gt_negative",
+      "conditions": { "estimated_cost_gt": -0.5 },
+      "expected": "region_null"
+    }
+  ],
+  "overlap_cases": [
+    {
+      "id": "equal_priority_may_overlap_created_at_order",
+      "routes": [
+        {
+          "name": "A",
+          "id": "10000000-0000-0000-0000-000000000002",
+          "priority": 100,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"] }
+        },
+        {
+          "name": "B",
+          "id": "10000000-0000-0000-0000-000000000001",
+          "priority": 100,
+          "created_at": "2026-02-01T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"], "tag_equals": "prod" }
+        }
+      ],
+      "requests": [
+        {
+          "id": "r1",
+          "features": { "model": "gpt-4o", "input_tokens": 100, "tag": "prod" },
+          "expected_winner": "A",
+          "note": "Both match a gpt-4o/prod request; A is created earlier and wins under created_at ASC even though B has the lower UUID."
+        }
+      ],
+      "pairs": [
+        { "candidate": "A", "subject": "B", "relation": "equal", "expected": "may_overlap" },
+        { "candidate": "B", "subject": "A", "relation": "equal", "expected": "may_overlap" }
+      ]
+    },
+    {
+      "id": "equal_priority_duplicate_id_asc_tiebreak",
+      "routes": [
+        {
+          "name": "A",
+          "id": "10000000-0000-0000-0000-000000000002",
+          "priority": 100,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"], "tag_equals": "prod" }
+        },
+        {
+          "name": "B",
+          "id": "10000000-0000-0000-0000-000000000001",
+          "priority": 100,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"], "tag_equals": "prod" }
+        }
+      ],
+      "requests": [
+        {
+          "id": "r1",
+          "features": { "model": "gpt-4o", "input_tokens": 100, "tag": "prod" },
+          "expected_winner": "B",
+          "note": "Byte-identical condition objects at the same priority; B (lower UUID) is the persisted earlier-order winner under the id ASC tie-break. The dashboard's exact-duplicate path flags this as identical_conditions_equal_priority_earlier_order (this corpus pins the shared may_overlap/order semantics, not the dashboard's duplicate finding text)."
+        }
+      ],
+      "pairs": [
+        { "candidate": "A", "subject": "B", "relation": "equal", "expected": "may_overlap" },
+        { "candidate": "B", "subject": "A", "relation": "equal", "expected": "may_overlap" }
+      ]
+    },
+    {
+      "id": "equal_priority_disjoint_has_images",
+      "routes": [
+        {
+          "name": "A",
+          "id": "10000000-0000-0000-0000-000000000001",
+          "priority": 100,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": { "has_images": true }
+        },
+        {
+          "name": "B",
+          "id": "10000000-0000-0000-0000-000000000002",
+          "priority": 100,
+          "created_at": "2026-01-02T00:00:00Z",
+          "conditions": { "has_images": false }
+        }
+      ],
+      "requests": [
+        { "id": "r_image", "features": { "model": "gpt-4o", "input_tokens": 10, "has_images": true }, "expected_winner": "A" },
+        { "id": "r_text", "features": { "model": "gpt-4o", "input_tokens": 10, "has_images": false }, "expected_winner": "B" }
+      ],
+      "pairs": [
+        { "candidate": "A", "subject": "B", "relation": "equal", "expected": "disjoint" },
+        { "candidate": "B", "subject": "A", "relation": "equal", "expected": "disjoint" }
+      ],
+      "note": "Exact boolean inequality is one case the dashboard CAN prove disjoint; no request can match both, so ordering never arbitrates."
+    },
+    {
+      "id": "higher_priority_may_overlap_not_subsume",
+      "routes": [
+        {
+          "name": "A",
+          "id": "10000000-0000-0000-0000-000000000001",
+          "priority": 300,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"], "tag_equals": "prod" }
+        },
+        {
+          "name": "B",
+          "id": "10000000-0000-0000-0000-000000000002",
+          "priority": 100,
+          "created_at": "2026-01-02T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"] }
+        }
+      ],
+      "requests": [
+        {
+          "id": "r1",
+          "features": { "model": "gpt-4o", "input_tokens": 10, "tag": "prod" },
+          "expected_winner": "A",
+          "note": "A is strictly higher priority and both match; A wins. A does not subsume B (A adds a tag constraint), so the dashboard emits higher_priority_conditions_may_overlap."
+        }
+      ],
+      "pairs": [
+        { "candidate": "A", "subject": "B", "relation": "higher", "expected": "may_overlap" }
+      ]
+    },
+    {
+      "id": "higher_priority_subsumes",
+      "routes": [
+        {
+          "name": "A",
+          "id": "10000000-0000-0000-0000-000000000001",
+          "priority": 300,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"] }
+        },
+        {
+          "name": "B",
+          "id": "10000000-0000-0000-0000-000000000002",
+          "priority": 100,
+          "created_at": "2026-01-02T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"], "tag_equals": "prod" }
+        }
+      ],
+      "requests": [
+        {
+          "id": "r1",
+          "features": { "model": "gpt-4o", "input_tokens": 10, "tag": "prod" },
+          "expected_winner": "A",
+          "note": "A's broader conditions subsume B; the dashboard emits higher_priority_conditions_subsume and the engine always picks A when B could run."
+        }
+      ],
+      "pairs": [
+        { "candidate": "A", "subject": "B", "relation": "higher", "expected": "subsumes" }
+      ]
+    },
+    {
+      "id": "non_ascii_prompt_unresolved_fails_closed",
+      "routes": [
+        {
+          "name": "A",
+          "id": "10000000-0000-0000-0000-000000000001",
+          "priority": 100,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"], "prompt_contains_any_of": ["café"] }
+        },
+        {
+          "name": "B",
+          "id": "10000000-0000-0000-0000-000000000002",
+          "priority": 100,
+          "created_at": "2026-02-01T00:00:00Z",
+          "conditions": { "model_in": ["gpt-4o"] }
+        }
+      ],
+      "requests": [
+        {
+          "id": "r1",
+          "features": { "model": "gpt-4o", "input_tokens": 10, "prompt": "bonjour café" },
+          "expected_winner": "A",
+          "note": "The runtime matcher lower-cases café Unicode-wise and matches; with equal store-order precedence A wins. The dashboard cannot reason about A's non-ASCII keyword, so it produces NO overlap claim either way: not proven, not disjoint."
+        }
+      ],
+      "pairs": [
+        { "candidate": "A", "subject": "B", "relation": "equal", "expected": "unresolved" },
+        { "candidate": "B", "subject": "A", "relation": "equal", "expected": "unresolved" }
+      ]
+    },
+    {
+      "id": "higher_priority_empty_conditions_catch_all",
+      "routes": [
+        {
+          "name": "A",
+          "id": "10000000-0000-0000-0000-000000000001",
+          "priority": 300,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": {}
+        },
+        {
+          "name": "B",
+          "id": "10000000-0000-0000-0000-000000000002",
+          "priority": 100,
+          "created_at": "2026-01-02T00:00:00Z",
+          "conditions": { "model_in": ["gpt-5"] }
+        }
+      ],
+      "requests": [
+        {
+          "id": "r1",
+          "features": { "model": "gpt-5", "input_tokens": 10 },
+          "expected_winner": "A",
+          "note": "An exactly-empty condition object is the universal set on both sides: A subsumes B and wins every request under priority DESC."
+        }
+      ],
+      "pairs": [
+        { "candidate": "A", "subject": "B", "relation": "higher", "expected": "subsumes" }
+      ]
+    },
+    {
+      "id": "strict_bound_may_overlap_and_adjacent_disjoint",
+      "routes": [
+        {
+          "name": "A",
+          "id": "10000000-0000-0000-0000-000000000001",
+          "priority": 50,
+          "created_at": "2026-01-01T00:00:00Z",
+          "conditions": { "input_tokens_gt": 400, "input_tokens_lt": 405 }
+        },
+        {
+          "name": "B",
+          "id": "10000000-0000-0000-0000-000000000002",
+          "priority": 50,
+          "created_at": "2026-01-02T00:00:00Z",
+          "conditions": { "input_tokens_gt": 402, "input_tokens_lt": 410 }
+        },
+        {
+          "name": "C",
+          "id": "10000000-0000-0000-0000-000000000003",
+          "priority": 50,
+          "created_at": "2026-01-03T00:00:00Z",
+          "conditions": { "input_tokens_gt": 401, "input_tokens_lt": 403 }
+        }
+      ],
+      "requests": [
+        {
+          "id": "r_overlap",
+          "features": { "model": "gpt-4o", "input_tokens": 403 },
+          "expected_winner": "A",
+          "note": "A [401..404] and B [403..409] overlap on 403; A is created earlier and wins the tie."
+        },
+        {
+          "id": "r_in_a_and_c",
+          "features": { "model": "gpt-4o", "input_tokens": 402 },
+          "expected_winner": "A",
+          "note": "Token 402 is inside both A [401..404] and C [402..402], and outside B. A is created earliest, so it wins under created_at ASC."
+        },
+        {
+          "id": "r_only_b",
+          "features": { "model": "gpt-4o", "input_tokens": 405 },
+          "expected_winner": "B",
+          "note": "Token 405 is inside B [403..409] only (outside A [401..404] and C [402..402]); B wins without an order tie."
+        }
+      ],
+      "pairs": [
+        { "candidate": "A", "subject": "B", "relation": "equal", "expected": "may_overlap" },
+        { "candidate": "B", "subject": "A", "relation": "equal", "expected": "may_overlap" },
+        { "candidate": "C", "subject": "A", "relation": "equal", "expected": "may_overlap" },
+        { "candidate": "A", "subject": "C", "relation": "equal", "expected": "may_overlap" },
+        { "candidate": "C", "subject": "B", "relation": "equal", "expected": "disjoint" },
+        { "candidate": "B", "subject": "C", "relation": "equal", "expected": "disjoint" }
+      ],
+      "note": "C's band [402..402] (401 < t < 403) is adjacent-but-disjoint from B's [403..409] (402 < t < 410): strictU32IntervalsOverlap returns false, so the dashboard proves those two equal-priority routes disjoint (no request can match both). C DOES overlap A [401..404], which the pair table records as may_overlap. The duplicate-created route r_in_a_and_c (token 402) matches A and C; A is created earlier, so with store-order precedence A wins."
+    }
+  ]
+}
