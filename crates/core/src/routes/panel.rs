@@ -1341,10 +1341,11 @@ pub struct PanelAdmissionEstimate {
 /// Obtain one with [`admit_panel_request`] and pass it to [`run_panel`]. Its
 /// fields are private deliberately: a direct Rust caller cannot construct a
 /// proof and skip the same fail-closed budget estimate used by the HTTP route.
-/// `run_panel` revalidates the proof against the current request and config
-/// immediately before fan-out, so a proof cannot be reused to bypass a later
-/// request/config change. This remains admission only, not a reservation or a
-/// runtime spending ceiling.
+/// `run_panel` revalidates the proof against the current request, config, AND
+/// registry catalog immediately before fan-out — re-running the capability /
+/// catalog-presence check plus the budget gate — so a proof cannot be reused
+/// to bypass a later request, config, or runtime-catalog change. This remains
+/// admission only, not a reservation or a runtime spending ceiling.
 #[must_use = "pass the admission proof to run_panel before dispatching a panel"]
 pub struct PanelAdmission {
     /// Header-style request budget, retained so revalidation preserves header
@@ -1603,6 +1604,79 @@ fn panel_admission_estimate(
     }
 }
 
+/// Revalidate that every panel leg that will dispatch is present in the
+/// CURRENT runtime catalog with the capabilities this request requires.
+///
+/// This is deliberately a catalog/capability check, not a cost check, and it
+/// runs before [`panel_budget_gate`] so an unknown or incapable leg surfaces
+/// as a precise admission error instead of being folded into a misleading
+/// `cost_limit_exceeded`. Every member leg dispatches the caller's unmodified
+/// request (model swapped), so each member must exist in the current catalog
+/// AND satisfy the request's required capabilities (`vision`, `tools`,
+/// `json_mode`). Synthesize/BestOfN then dispatch a text-only arbiter request,
+/// so the LLM arbiter needs catalog presence but not the caller's modality
+/// capabilities; Majority has no LLM arbiter call, so it makes no arbiter
+/// catalog claim.
+///
+/// Unknown leg models fail closed with [`ApiError::ModelNotFound`]; a cataloged
+/// leg that cannot meet the request's required capabilities fails with
+/// [`ApiError::PanelModelCapabilityUnavailable`]. Because this runs inside both
+/// admission and [`PanelAdmission::revalidate`], it is re-checked against the
+/// registry current at dispatch — a proof minted under one catalog cannot fan
+/// out after that catalog loses a member or its capabilities.
+///
+/// Only the capability LIST is certified here (not the local-tokenizer
+/// input-window comparison): the local input-token estimate can differ from
+/// provider tokenization, matching the request-preflight model-support
+/// evidence, so context-window enforcement remains a dispatch-time provider
+/// concern.
+fn validate_panel_catalog_admission(
+    state: &AppState,
+    cfg: &PanelConfig,
+    req: &ChatCompletionRequest,
+) -> Result<(), ApiError> {
+    let required = tt_shared::RequiredCapabilities::from_request(req);
+
+    for member in &cfg.members {
+        let info = state
+            .registry
+            .model_info(&member.model)
+            .ok_or_else(|| ApiError::ModelNotFound {
+                model: member.model.clone(),
+            })?;
+        // estimated_tokens = 0 skips the local-tokenizer window check; we only
+        // fail on capabilities we positively know are missing from the catalog
+        // row (see doc comment above).
+        let missing = required.skip_reasons(info, 0);
+        if !missing.is_empty() {
+            return Err(ApiError::PanelModelCapabilityUnavailable {
+                role: "member",
+                model: member.model.clone(),
+                reasons: missing,
+            });
+        }
+    }
+
+    match cfg.strategy {
+        ArbiterStrategyKind::Synthesize | ArbiterStrategyKind::BestOfN => {
+            // The arbiter receives only the built text-only judge/synthesis
+            // request, so it must exist in the current catalog but does not
+            // need the caller's modality capabilities.
+            state
+                .registry
+                .model_info(&cfg.arbiter_model.model)
+                .ok_or_else(|| ApiError::ModelNotFound {
+                    model: cfg.arbiter_model.model.clone(),
+                })?;
+        }
+        // Majority's configured arbiter is not an LLM judge/map prerequisite;
+        // it makes no catalog claim here.
+        ArbiterStrategyKind::Majority => {}
+    }
+
+    Ok(())
+}
+
 fn validate_panel_admission(
     state: &AppState,
     cfg: &PanelConfig,
@@ -1611,6 +1685,7 @@ fn validate_panel_admission(
     request_budget: Option<f64>,
 ) -> Result<(), ApiError> {
     cfg.validate_for_dispatch()?;
+    validate_panel_catalog_admission(state, cfg, req)?;
     panel_budget_gate(
         state,
         cfg,
@@ -1856,7 +1931,8 @@ async fn run_panel_legs_and_quorum(
 /// meet quorum and that an LLM arbiter has an explicit mapped credential.
 /// Additional members whose provider id is absent are then recorded as
 /// [`LegStatus::SkippedNoCred`] and do not count toward quorum. `admission`
-/// must come from [`admit_panel_request`]; it is revalidated before any member
+/// must come from [`admit_panel_request`]; it is revalidated — catalog
+/// presence + required capabilities, then the budget gate — before any member
 /// leg can be dispatched.
 pub async fn run_panel(
     state: &crate::AppState,
@@ -3654,6 +3730,355 @@ mod tests {
         assert_eq!(
             reason.encode_utf16().count(),
             MAX_PANEL_ARBITER_REASON_UTF16_UNITS
+        );
+    }
+
+    use tt_shared::pricing::Capability;
+    use tt_shared::{ModelInfo, ModelPricing};
+
+    // -----------------------------------------------------------------------
+    // fail-closed runtime-catalog admission (coherent executable panel
+    // admission): every member/arbiter is re-validated against the CURRENT
+    // catalog at dispatch, with explicit required-capabilities checking.
+    // -----------------------------------------------------------------------
+
+    /// A minimal registry-backed provider for the catalog-admission tests:
+    /// models and prices are caller-supplied so a test can build a CURRENT
+    /// catalog where a member is absent, lacks a required capability, or is
+    /// fully capable. It never dispatches — every fail-closed assertion stops
+    /// before any fan-out — so the chat methods return an explicit
+    /// Unsupported error if ever reached.
+    struct CatalogMockProvider {
+        id: &'static str,
+        models: Vec<ModelInfo>,
+        prices: HashMap<String, ModelPricing>,
+    }
+
+    #[async_trait]
+    impl tt_shared::Provider for CatalogMockProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            self.models.clone()
+        }
+        fn pricing(&self, model: &str) -> Option<ModelPricing> {
+            self.prices.get(model).cloned()
+        }
+        async fn chat_completion(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            Err(ProviderError::Unsupported(
+                "catalog-admission mock never dispatches".to_string(),
+            ))
+        }
+        async fn chat_completion_stream(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
+            Err(ProviderError::Unsupported(
+                "catalog-admission mock never dispatches".to_string(),
+            ))
+        }
+    }
+
+    fn catalog_member(model: &str, capabilities: Vec<Capability>) -> ModelInfo {
+        ModelInfo {
+            id: model.to_string(),
+            provider: "catalog-mock".to_string(),
+            capabilities,
+            max_input_tokens: 128_000,
+            max_output_tokens: 16_384,
+        }
+    }
+
+    fn catalog_pricing() -> ModelPricing {
+        ModelPricing {
+            input_per_million: 4.0,
+            output_per_million: 12.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    /// Build an `AppState` whose CURRENT runtime catalog contains exactly
+    /// `models`, plus a text-capable `caller-model` so the admission ingress
+    /// (which resolves the caller's request model first) succeeds and the
+    /// member/arbiter catalog checks below are what actually decide admission.
+    /// Each catalog row is priced so the budget gate can also run.
+    fn catalog_state(models: Vec<ModelInfo>) -> AppState {
+        let mut models = models;
+        models.push(catalog_member("caller-model", vec![Capability::Text]));
+        let prices = models
+            .iter()
+            .map(|m| (m.id.clone(), catalog_pricing()))
+            .collect::<HashMap<_, _>>();
+        let mut registry = crate::registry::ProviderRegistry::new();
+        registry.register(std::sync::Arc::new(CatalogMockProvider {
+            id: "catalog-mock",
+            models,
+            prices,
+        }));
+        AppState::new(registry)
+    }
+
+    /// A panel request that REQUIRES `Capability::Tools` on every member leg
+    /// (each member dispatch forks the caller's request with the tools intact).
+    fn catalog_tools_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "caller-model".to_string(),
+            messages: vec![Message::User {
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: vec![tt_shared::messages::Tool {
+                r#type: "function".to_string(),
+                function: tt_shared::messages::ToolFunction {
+                    name: "f".to_string(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }],
+            max_tokens: Some(64),
+            ..Default::default()
+        }
+    }
+
+    fn catalog_tools_cfg() -> PanelConfig {
+        PanelConfig {
+            strategy: ArbiterStrategyKind::Synthesize,
+            members: vec![ModelRef {
+                model: "member-capable".to_string(),
+                provider: None,
+            }],
+            arbiter_model: ModelRef {
+                model: "arbiter-capable".to_string(),
+                provider: None,
+            },
+            quorum: Some(1),
+            max_cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn admission_rejects_member_absent_from_runtime_catalog() {
+        // Member "member-capable" has no row in this catalog — the coherent
+        // admission rejects it as absent, not as over-budget.
+        let state = catalog_state(vec![catalog_member(
+            "arbiter-capable",
+            vec![Capability::Text],
+        )]);
+        let cfg = catalog_tools_cfg();
+        let req = catalog_tools_request();
+        let err = admit_panel_request(&state, &cfg, &req, Some(999.0))
+            .err()
+            .expect("member absent from the runtime catalog must fail closed");
+        assert!(
+            matches!(&err, ApiError::ModelNotFound { model } if model == "member-capable"),
+            "expected ModelNotFound for the absent member, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_member_missing_required_capability() {
+        // Member is cataloged but lacks the request's required Tools capability.
+        let state = catalog_state(vec![
+            catalog_member("member-nocap", vec![Capability::Text]),
+            catalog_member("arbiter-capable", vec![Capability::Text]),
+        ]);
+        let mut cfg = catalog_tools_cfg();
+        cfg.members = vec![ModelRef {
+            model: "member-nocap".to_string(),
+            provider: None,
+        }];
+        let req = catalog_tools_request();
+        let err = admit_panel_request(&state, &cfg, &req, Some(999.0))
+            .err()
+            .expect("a member that cannot satisfy the required tools capability must fail closed");
+        assert!(
+            matches!(
+                &err,
+                ApiError::PanelModelCapabilityUnavailable {
+                    role: "member",
+                    model,
+                    reasons
+                } if model == "member-nocap" && reasons.contains(&"tools_not_supported")
+            ),
+            "expected member capability error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_llm_arbiter_absent_from_runtime_catalog() {
+        // Members are capable; the Synthesize arbiter has no catalog row.
+        let state = catalog_state(vec![catalog_member(
+            "member-capable",
+            vec![Capability::Text, Capability::Tools],
+        )]);
+        let cfg = catalog_tools_cfg(); // arbiter: "arbiter-capable" (absent)
+        let req = catalog_tools_request();
+        let err = admit_panel_request(&state, &cfg, &req, Some(999.0))
+            .err()
+            .expect("the Synthesize arbiter must exist in the current catalog");
+        assert!(
+            matches!(&err, ApiError::ModelNotFound { model } if model == "arbiter-capable"),
+            "expected ModelNotFound for the absent arbiter, got {err:?}"
+        );
+    }
+
+    /// The proof is minted against a capable catalog, then dispatch runs
+    /// against a DIFFERENT current catalog where the member lost its Tools
+    /// capability — or vanished entirely. Revalidation must stop before any
+    /// fan-out: this is the admission-revalidation contract.
+    #[tokio::test]
+    async fn admission_revalidation_fails_closed_against_current_catalog() {
+        let mint_state = catalog_state(vec![
+            catalog_member(
+                "member-capable",
+                vec![Capability::Text, Capability::Tools],
+            ),
+            catalog_member("arbiter-capable", vec![Capability::Text]),
+        ]);
+        let cfg = catalog_tools_cfg();
+        let req = catalog_tools_request();
+        let admission = admit_panel_request(&mint_state, &cfg, &req, Some(999.0))
+            .expect("fully capable catalog should admit the tools panel");
+        let ctx = direct_engine_admission_context();
+        let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+
+        // Current catalog cataloged the member WITHOUT Tools between ingress
+        // and dispatch (a capability downgrade).
+        let downgraded_state = catalog_state(vec![
+            catalog_member("member-capable", vec![Capability::Text]),
+            catalog_member("arbiter-capable", vec![Capability::Text]),
+        ]);
+        let error = run_panel(
+            &downgraded_state,
+            &ctx,
+            &req,
+            &creds,
+            &cfg,
+            &admission,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("revalidation must stop before fan-out when the current catalog loses a capability");
+        assert!(
+            matches!(
+                &error,
+                ApiError::PanelModelCapabilityUnavailable {
+                    role: "member",
+                    model,
+                    reasons
+                } if model == "member-capable" && reasons.contains(&"tools_not_supported")
+            ),
+            "expected member capability revalidation error, got {error:?}"
+        );
+
+        // Current catalog no longer knows the member at all.
+        let absent_state = catalog_state(vec![catalog_member(
+            "arbiter-capable",
+            vec![Capability::Text],
+        )]);
+        let error = run_panel(
+            &absent_state,
+            &ctx,
+            &req,
+            &creds,
+            &cfg,
+            &admission,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("revalidation must stop before fan-out when the current catalog drops a member");
+        assert!(
+            matches!(&error, ApiError::ModelNotFound { model } if model == "member-capable"),
+            "expected ModelNotFound revalidation error, got {error:?}"
+        );
+    }
+
+    /// Positive control: with a fully capable current catalog the catalog
+    /// revalidation PASSES and the next gate (credential preflight, no creds
+    /// mapped) is what stops the panel — proving the capability gate does not
+    /// false-fail a legitimate tools panel.
+    #[tokio::test]
+    async fn admission_revalidation_with_capable_catalog_reaches_credential_fence() {
+        let state = catalog_state(vec![
+            catalog_member(
+                "member-capable",
+                vec![Capability::Text, Capability::Tools],
+            ),
+            catalog_member("arbiter-capable", vec![Capability::Text]),
+        ]);
+        let cfg = catalog_tools_cfg();
+        let req = catalog_tools_request();
+        let admission = admit_panel_request(&state, &cfg, &req, Some(999.0))
+            .expect("capable tools panel should be admitted");
+        let ctx = direct_engine_admission_context();
+        let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+
+        let error = run_panel(
+            &state,
+            &ctx,
+            &req,
+            &creds,
+            &cfg,
+            &admission,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("capable catalog passes catalog revalidation; credential preflight rejects next");
+        assert!(
+            matches!(
+                &error,
+                ApiError::PanelCredentialPreflight {
+                    required: 1,
+                    credentialed: 0,
+                    missing_arbiter: true
+                }
+            ),
+            "expected credential-preflight error after capability revalidation passed, got {error:?}"
+        );
+    }
+
+    /// Majority never dispatches its configured arbiter as an LLM judge, so
+    /// the catalog check must NOT demand an arbiter catalog row. Admission
+    /// still fails closed — at the existing unpriceable-embedding budget gate
+    /// — rather than with ModelNotFound.
+    #[test]
+    fn admission_majority_makes_no_llm_arbiter_catalog_claim() {
+        let state = catalog_state(vec![catalog_member(
+            "member-capable",
+            vec![Capability::Text],
+        )]);
+        let mut cfg = catalog_tools_cfg();
+        cfg.strategy = ArbiterStrategyKind::Majority;
+        let req = ChatCompletionRequest {
+            model: "caller-model".to_string(),
+            messages: vec![Message::User {
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            max_tokens: Some(64),
+            ..Default::default()
+        };
+        let err = admit_panel_request(&state, &cfg, &req, Some(999.0))
+            .err()
+            .expect("Majority stays unpriceable by the budget gate");
+        assert!(
+            matches!(&err, ApiError::CostLimitExceeded { .. }),
+            "Majority's configured arbiter must not be a catalog prerequisite; expected the \
+             existing unpriceable cost error, got {err:?}"
         );
     }
 }

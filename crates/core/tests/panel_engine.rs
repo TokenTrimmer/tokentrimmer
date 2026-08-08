@@ -939,17 +939,17 @@ async fn multi_provider_panel_dispatches_both_and_bills_one_aggregate_row() {
 }
 
 // ============================================================================
-// INVARIANT 8 (unpriceable member — fail-closed): a panel whose member list
-// includes a model not in any registered provider ⇒ `estimate_panel_cost`
-// returns `None` ⇒ `panel_budget_gate` returns `CostLimitExceeded` ⇒ 402
-// BEFORE any dispatch — even with a generous cost ceiling.
+// INVARIANT 8 (member absent from the current runtime catalog — fail-closed):
+// a panel whose member list includes a model with no catalog row ⇒ coherent
+// panel admission rejects it with `model_not_found` (404) BEFORE any dispatch
+// — even with a generous cost ceiling. This is the precise admission error for
+// an unknown member: the budget gate's `cost_limit_exceeded` is reserved for
+// work that IS cataloged but cannot be priced within budget.
 //
-// This is a DISTINCT fail-closed path from the over-budget case (Invariant 3):
-// the budget gate cannot produce an estimate at all, so it rejects regardless
-// of ceiling. The test uses `app_single_provider` (providers: "gpt-4o",
-// "gpt-4o-mini") and names a panel member "no-such-model-zzz" that is not
-// served by any registered mock — `estimate_panel_cost` sees `resolve` return
-// `None` on that model, short-circuits to `None`, and the gate fires.
+// The test uses `app_single_provider` (providers: "gpt-4o", "gpt-4o-mini") and
+// names a panel member "no-such-model-zzz" that has no row in the registry
+// catalog — `validate_panel_catalog_admission` resolves the member's
+// `ModelInfo` to `None` and fails closed before any pricing or fan-out.
 // ============================================================================
 
 #[tokio::test]
@@ -962,7 +962,8 @@ async fn unpriceable_member_fails_closed_with_zero_dispatches() {
         .header("content-type", "application/json")
         .header("authorization", "Bearer test")
         .header("x-tokentrimmer-panel", "synthesize")
-        // Generous ceiling — the reject must be for unpriceable, not over-budget.
+        // Generous ceiling — the reject must be for an unknown catalog member,
+        // not over-budget.
         .header("x-tokentrimmer-cost-limit-usd", "999.0")
         .body(Body::from(
             json!({
@@ -972,7 +973,7 @@ async fn unpriceable_member_fails_closed_with_zero_dispatches() {
                 "stream": false,
                 "tt_extras": {
                     "panel": {
-                        // "no-such-model-zzz" is not served by any registered mock.
+                        // "no-such-model-zzz" has no row in any registered catalog.
                         "members": ["gpt-4o", "no-such-model-zzz"],
                         "arbiter_model": "gpt-4o"
                     }
@@ -984,25 +985,26 @@ async fn unpriceable_member_fails_closed_with_zero_dispatches() {
 
     let resp = app.oneshot(req).await.unwrap();
 
-    // estimate_panel_cost returns None → panel_budget_gate raises CostLimitExceeded → 402.
+    // Catalog-admission revalidation rejects the unknown member as 404
+    // model_not_found (not a cost error).
     assert_eq!(
         resp.status(),
-        StatusCode::PAYMENT_REQUIRED,
-        "unpriceable panel member must return 402 PAYMENT_REQUIRED (fail-closed), \
-         even with a generous ceiling"
+        StatusCode::NOT_FOUND,
+        "a panel member absent from the current runtime catalog must return 404 \
+         model_not_found (fail-closed), even with a generous ceiling"
     );
 
     let body = body_json(resp).await;
     assert_eq!(
-        body["error"]["code"], "cost_limit_exceeded",
-        "error code must be cost_limit_exceeded (unpriceable → fail-closed), got {body}"
+        body["error"]["code"], "model_not_found",
+        "error code must be model_not_found for a member absent from the runtime catalog, got {body}"
     );
 
     // CRITICAL: zero upstream calls — the gate fires before any provider dispatch.
     assert_eq!(
         calls.load(Ordering::Relaxed),
         0,
-        "INVARIANT: unpriceable budget gate must fire BEFORE any provider dispatch (zero calls)"
+        "INVARIANT: catalog fail-closed gate must fire BEFORE any provider dispatch (zero calls)"
     );
 
     // Zero billing rows — no side effects on early reject.
@@ -1010,7 +1012,7 @@ async fn unpriceable_member_fails_closed_with_zero_dispatches() {
     assert_eq!(
         rows.len(),
         0,
-        "INVARIANT: unpriceable fail-closed reject must write ZERO request_logs rows"
+        "INVARIANT: catalog fail-closed reject must write ZERO request_logs rows"
     );
 }
 

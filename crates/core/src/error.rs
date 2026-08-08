@@ -97,6 +97,22 @@ pub enum ApiError {
     /// A panel strategy requested but not implemented in this build.
     #[error("panel strategy not supported: {strategy}")]
     PanelStrategyUnsupported { strategy: String },
+
+    /// A Fusion panel leg model is present in the runtime catalog but cannot
+    /// satisfy the request's required capabilities before any fan-out. This
+    /// is distinct from [`ApiError::ModelNotFound`]: the model IS cataloged,
+    /// it just cannot serve the requested modality (vision/tools/json-mode).
+    #[error(
+        "panel {role} model {model} cannot satisfy required capabilities: {reasons:?}"
+    )]
+    PanelModelCapabilityUnavailable {
+        /// `"member"` or `"arbiter"`.
+        role: &'static str,
+        /// The model id that cannot satisfy the request's required capabilities.
+        model: String,
+        /// Human-readable missing-capability reasons (e.g. `tools_not_supported`).
+        reasons: Vec<&'static str>,
+    },
 }
 
 #[derive(Serialize)]
@@ -282,6 +298,21 @@ impl IntoResponse for ApiError {
                 "invalid_request_error",
                 "panel_strategy_unsupported",
                 format!("Fusion panel strategy '{strategy}' is not supported yet."),
+                None,
+                None,
+            ),
+            ApiError::PanelModelCapabilityUnavailable {
+                role,
+                model,
+                reasons,
+            } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "panel_model_capability_unavailable",
+                format!(
+                    "Fusion panel {role} model '{model}' cannot satisfy the required capabilities: {}.",
+                    reasons.join(", ")
+                ),
                 None,
                 None,
             ),

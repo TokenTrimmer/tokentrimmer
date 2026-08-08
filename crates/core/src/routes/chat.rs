@@ -317,6 +317,7 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         // runtime-dependent. Never negative-cache any of them.
         | ApiError::PanelDisabled
         | ApiError::PanelQuorumUnmet { .. }
+        | ApiError::PanelModelCapabilityUnavailable { .. }
         | ApiError::PanelStrategyUnsupported { .. } => false,
     }
 }
@@ -350,6 +351,7 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::Conflict(_) => StatusCode::CONFLICT,
         ApiError::PanelDisabled => StatusCode::FORBIDDEN,
         ApiError::PanelQuorumUnmet { .. } => StatusCode::BAD_GATEWAY,
+        ApiError::PanelModelCapabilityUnavailable { .. } => StatusCode::BAD_REQUEST,
         ApiError::PanelStrategyUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
     };
     status.as_u16()
