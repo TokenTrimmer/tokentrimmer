@@ -18,6 +18,7 @@ pub mod pricing;
 pub mod provider;
 pub mod providers;
 pub mod request_delta;
+pub mod request_delta_backfill;
 pub mod request_preflight;
 pub mod url_guard;
 pub mod usage;
@@ -54,6 +55,10 @@ pub use request_delta::{
     classify_request_delta_evidence_v1, estimate_request_delta_v1, RequestDeltaEstimate,
     RequestDeltaEvidenceState, RequestDeltaInput, RequestDeltaReceiptError,
     RequestDeltaReceiptFields, REQUEST_DELTA_ESTIMATE_V1,
+};
+pub use request_delta_backfill::{
+    backfill_request_delta_evidence_v1, row_evidence_v1, BackfillCoverage, BackfillRun,
+    BackfilledRow, PricingProvenance, RetainedRequestRow, REQUEST_DELTA_BACKFILL_V1,
 };
 pub use request_preflight::{
     PreflightAction, PreflightCostEvidence, PreflightCredentialEvidence, PreflightLimitEvidence,

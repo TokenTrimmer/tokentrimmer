@@ -1093,6 +1093,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sdk_surface_reproduces_the_public_corpus_formula_exactly() {
+        // Cross-surface identity: the SDK/CLI surface (the same
+        // `RequestDeltaEstimate::from_components` every CLI command and SDK
+        // caller funnels the gateway's five raw components through) must
+        // reproduce the exact public corpus-pinned formula — the identical
+        // signed/positive/regression USD as `tt_shared::estimate_request_delta_v1`.
+        #[derive(serde::Deserialize)]
+        struct Corpus {
+            formula_version: String,
+            vectors: Vec<Vector>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Vector {
+            id: String,
+            input: CorpusInput,
+            expected: Expected,
+        }
+        #[derive(serde::Deserialize)]
+        struct CorpusInput {
+            baseline_cost_usd: Option<f64>,
+            cost_usd: Option<f64>,
+            provider_cache_saved_usd: Option<f64>,
+            cache_bust_penalty_usd: Option<f64>,
+            summarizer_tax_usd: Option<f64>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Expected {
+            state: String,
+            signed_request_delta_usd: Option<f64>,
+            positive_request_delta_usd: Option<f64>,
+            regression_request_delta_usd: Option<f64>,
+        }
+
+        let corpus: Corpus = serde_json::from_str(include_str!(
+            "../../../docs/savings-estimate-contract/tokentrimmer.request-delta-estimate.v1.corpus.json"
+        ))
+        .expect("request-delta corpus must parse");
+        assert_eq!(
+            corpus.formula_version,
+            tt_shared::REQUEST_DELTA_ESTIMATE_V1,
+            "the SDK surface must pin the same formula identity as the corpus"
+        );
+
+        for vector in corpus.vectors {
+            let estimate = RequestDeltaEstimate::from_components(
+                vector.input.baseline_cost_usd,
+                vector.input.cost_usd,
+                vector.input.provider_cache_saved_usd,
+                vector.input.cache_bust_penalty_usd,
+                vector.input.summarizer_tax_usd,
+            );
+            match vector.expected.state.as_str() {
+                "measured" => {
+                    let RequestDeltaEstimate::Measured {
+                        baseline_cost_usd,
+                        cost_usd,
+                        provider_cache_saved_usd,
+                        cache_bust_usd,
+                        summarizer_tax_usd,
+                        signed_usd,
+                        positive_usd,
+                        regression_usd,
+                    } = estimate
+                    else {
+                        panic!("{} must be measured on the SDK surface", vector.id)
+                    };
+                    assert_eq!(
+                        tt_shared::estimate_request_delta_v1(tt_shared::RequestDeltaInput {
+                            baseline_cost_usd: Some(baseline_cost_usd),
+                            cost_usd: Some(cost_usd),
+                            provider_cache_saved_usd: Some(provider_cache_saved_usd),
+                            cache_bust_penalty_usd: Some(cache_bust_usd),
+                            summarizer_tax_usd: Some(summarizer_tax_usd),
+                        }),
+                        Some(tt_shared::RequestDeltaEstimate {
+                            signed_request_delta_usd: signed_usd,
+                            positive_request_delta_usd: positive_usd,
+                            regression_request_delta_usd: regression_usd,
+                        }),
+                        "{} SDK dollars must equal the shared formula dollars",
+                        vector.id
+                    );
+                    assert_close(
+                        signed_usd,
+                        vector.expected.signed_request_delta_usd.unwrap(),
+                        &vector.id,
+                    );
+                    assert_close(
+                        positive_usd,
+                        vector.expected.positive_request_delta_usd.unwrap(),
+                        &vector.id,
+                    );
+                    assert_close(
+                        regression_usd,
+                        vector.expected.regression_request_delta_usd.unwrap(),
+                        &vector.id,
+                    );
+                }
+                "unmeasured" => {
+                    assert_eq!(
+                        estimate,
+                        RequestDeltaEstimate::Unmeasured,
+                        "{} must stay unmeasured on the SDK surface",
+                        vector.id
+                    );
+                }
+                state => panic!("unknown corpus state {state}"),
+            }
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64, id: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{id}: SDK {actual} != corpus {expected}"
+        );
+    }
+
     use httpmock::prelude::*;
 
     fn sample_response() -> serde_json::Value {
