@@ -345,6 +345,7 @@ mod tests {
       conditions  JSONB NOT NULL,
       target      JSONB NOT NULL,
       enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+      revision    BIGINT NOT NULL DEFAULT 0,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )";
 
