@@ -37,6 +37,17 @@ pub(crate) enum AuditAction {
         /// whole file.
         #[arg(long)]
         expected_tip: Option<String>,
+        /// After chain verification, compute the Merkle root over the entry
+        /// hashes and print a machine-readable inclusion proof as JSON.
+        /// LOCAL-ONLY: this is membership inside the verified export's own
+        /// root — NOT a transparency-log publication and NOT external
+        /// timestamping.
+        #[arg(long)]
+        merkle: bool,
+        /// 0-based index of the entry to prove inclusion for (default: the
+        /// tip / last entry). Implies `--merkle`.
+        #[arg(long)]
+        merkle_index: Option<u64>,
     },
 }
 
@@ -56,6 +67,8 @@ pub(crate) fn run_audit_verify(
     key_path: Option<&str>,
     key_hex_inline: Option<&str>,
     expected_tip: Option<&str>,
+    merkle: bool,
+    merkle_index: Option<u64>,
 ) -> anyhow::Result<()> {
     let chain_path_str = path.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
     let chain_path = Path::new(chain_path_str);
@@ -136,12 +149,94 @@ pub(crate) fn run_audit_verify(
                 "chain OK — all {} entries verified{tip_note}",
                 parsed.entries.len()
             ));
+            if merkle || merkle_index.is_some() {
+                print_merkle_proof(&parsed.entries, org, merkle_index)?;
+            }
         }
         Err(e) => {
             anyhow::bail!("chain verification FAILED: {e}");
         }
     }
 
+    Ok(())
+}
+
+/// Build the machine-readable Merkle proof JSON for one entry, after chain
+/// verification. Pure and side-effect free so tests can assert on it directly.
+fn build_merkle_proof_json(
+    entries: &[tt_telemetry::audit::AuditEntry],
+    org: Option<&str>,
+    merkle_index: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
+    if entries.is_empty() {
+        anyhow::bail!(
+            "--merkle requires at least one verified entry; the chain file has none"
+        );
+    }
+    let chain_id = match org {
+        Some(o) => o.to_string(),
+        None => entries[0].org_id.to_string(),
+    };
+    let index = merkle_index.unwrap_or((entries.len() - 1) as u64);
+    if index >= entries.len() as u64 {
+        anyhow::bail!(
+            "--merkle-index {index} is out of range: chain has {} entries (valid 0..={})",
+            entries.len(),
+            entries.len() - 1
+        );
+    }
+
+    let mut tree =
+        tt_telemetry::audit::merkle::IncrementalMerkleTree::with_chain_id(chain_id.clone());
+    for entry in entries {
+        let leaf = tt_telemetry::audit::merkle::leaf_from_hex(&entry.hash).map_err(|e| {
+            anyhow::anyhow!("entry seq {} has an invalid hash field: {e}", entry.seq)
+        })?;
+        tree.push(leaf);
+    }
+
+    let proof = tree
+        .prove_inclusion(index)
+        .expect("index bounds-checked against entries above");
+    let selected = &entries[index as usize];
+    let selected_seq = selected.seq;
+
+    // Guards against any inconsistency in the builder itself before we print.
+    let selected_leaf =
+        tt_telemetry::audit::merkle::leaf_from_hex(&selected.hash)
+            .expect("hash decoded above");
+    tt_telemetry::audit::merkle::verify_inclusion(&proof, &selected_leaf, &proof.root)
+        .map_err(|e| anyhow::anyhow!("internal merkle self-check failed: {e}"))?;
+
+    Ok(serde_json::json!({
+        "proof_version": proof.version,
+        "chain_id": proof.chain_id,
+        "leaf_index": proof.leaf_index,
+        "chain_seq": selected_seq,
+        "leaf_count": proof.leaf_count,
+        "root": proof.root_hex(),
+        "sibling_path": proof.sibling_path.iter().map(|s| serde_json::json!({
+            "hash": s.hex(),
+            "left": s.left,
+        })).collect::<Vec<_>>(),
+        "local_only": true,
+        "note": "local-only inclusion proof over the verified export root; NOT a transparency-log publication",
+    }))
+}
+
+/// Print a machine-readable Merkle inclusion proof for one entry.
+///
+/// All data is derived from the already-verified export — no network, no
+/// external timestamping, no transparency receipt. The proof asserts membership
+/// of one entry hash inside the chain root computed from this file, and is
+/// explicitly labeled **local-only**.
+fn print_merkle_proof(
+    entries: &[tt_telemetry::audit::AuditEntry],
+    org: Option<&str>,
+    merkle_index: Option<u64>,
+) -> anyhow::Result<()> {
+    let json = build_merkle_proof_json(entries, org, merkle_index)?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
     Ok(())
 }
 
@@ -333,6 +428,8 @@ mod expected_tip_tests {
             None,
             None,
             Some("5:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            false,
+            None,
         );
         assert!(res.is_err(), "missing file + expected_tip must error");
     }
@@ -346,10 +443,201 @@ mod expected_tip_tests {
             None,
             None,
             None,
+            false,
+            None,
         );
         assert!(
             res.is_ok(),
             "missing file without expected_tip must stay Ok"
         );
+    }
+}
+
+#[cfg(test)]
+mod merkle_proof_tests {
+    use super::*;
+    use tt_telemetry::audit::{build_entry, generate_signing_key, Actor, AuditEntry};
+
+    /// Build a real signed chain of `n` entries for `org`.
+    fn build_chain(n: u64, org: uuid::Uuid) -> (ed25519_dalek::SigningKey, Vec<AuditEntry>) {
+        let key = generate_signing_key();
+        let mut entries: Vec<AuditEntry> = Vec::new();
+        for i in 0..n {
+            let entry = build_entry(
+                &key,
+                entries.last(),
+                org,
+                Actor::System,
+                format!("event.{i}"),
+                serde_json::json!({"n": i}),
+            )
+            .expect("entry builds");
+            entries.push(entry);
+        }
+        (key, entries)
+    }
+
+    fn expect_error<R>(res: anyhow::Result<R>, needle: &str) {
+        match res {
+            Ok(_) => panic!("expected error containing {needle:?}"),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains(needle),
+                    "expected error containing {needle:?}, got {msg:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merkle_proof_json_matches_tree_and_verifies() {
+        let org = uuid::Uuid::new_v4();
+        let (_key, entries) = build_chain(9, org);
+
+        let mut tree =
+            tt_telemetry::audit::merkle::IncrementalMerkleTree::with_chain_id(org.to_string());
+        for e in &entries {
+            tree.push(tt_telemetry::audit::merkle::leaf_from_hex(&e.hash).unwrap());
+        }
+
+        let json = build_merkle_proof_json(&entries, None, None).expect("tip proof");
+        assert_eq!(json["proof_version"], 1);
+        assert_eq!(json["chain_id"], org.to_string());
+        assert_eq!(json["leaf_index"], 8);
+        assert_eq!(json["chain_seq"], entries[8].seq);
+        assert_eq!(json["leaf_count"], 9);
+        assert_eq!(json["root"], tree.root_hex().unwrap());
+        assert_eq!(json["local_only"], true);
+        let note = json["note"].as_str().unwrap();
+        assert!(note.contains("NOT a transparency-log publication"));
+        let path = json["sibling_path"].as_array().unwrap();
+        assert!(!path.is_empty());
+
+        // Reconstruct the proof from the JSON and verify it end to end.
+        let proof = proof_from_json(&json);
+        let selected_leaf = tt_telemetry::audit::merkle::leaf_from_hex(&entries[8].hash).unwrap();
+        let root_bytes = hex::decode(json["root"].as_str().unwrap()).unwrap();
+        let root: [u8; 32] = root_bytes.try_into().unwrap();
+        assert!(
+            tt_telemetry::audit::merkle::verify_inclusion(&proof, &selected_leaf, &root).is_ok()
+        );
+    }
+
+    #[test]
+    fn merkle_proof_selected_index_and_org_override() {
+        let org = uuid::Uuid::new_v4();
+        let (_key, entries) = build_chain(6, org);
+
+        // --merkle-index picks a non-tip leaf; --org overrides chain_id.
+        let json =
+            build_merkle_proof_json(&entries, Some("org-override"), Some(2)).expect("selected");
+        assert_eq!(json["leaf_index"], 2);
+        assert_eq!(json["chain_seq"], entries[2].seq);
+        assert_eq!(json["chain_id"], "org-override");
+        assert_eq!(json["leaf_count"], 6);
+
+        let proof = proof_from_json(&json);
+        let leaf = tt_telemetry::audit::merkle::leaf_from_hex(&entries[2].hash).unwrap();
+        let root: [u8; 32] =
+            hex::decode(json["root"].as_str().unwrap()).unwrap().try_into().unwrap();
+        assert!(tt_telemetry::audit::merkle::verify_inclusion(&proof, &leaf, &root).is_ok());
+
+        // A different leaf must NOT verify against this proof.
+        let other = tt_telemetry::audit::merkle::leaf_from_hex(&entries[3].hash).unwrap();
+        assert!(tt_telemetry::audit::merkle::verify_inclusion(&proof, &other, &root).is_err());
+    }
+
+    #[test]
+    fn merkle_proof_out_of_range_is_error() {
+        let org = uuid::Uuid::new_v4();
+        let (_key, entries) = build_chain(3, org);
+        expect_error(
+            build_merkle_proof_json(&entries, None, Some(99)),
+            "out of range",
+        );
+    }
+
+    #[test]
+    fn merkle_proof_empty_chain_is_error() {
+        expect_error(build_merkle_proof_json(&[], None, None), "at least one verified entry");
+    }
+
+    #[test]
+    fn run_audit_verify_accepts_merkle_flag() {
+        let org = uuid::Uuid::new_v4();
+        let (key, entries) = build_chain(4, org);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_chain_file(dir.path(), &key, &entries);
+        let p = path.to_str().unwrap().to_string();
+
+        // --merkle (tip proof) and --merkle-index both succeed.
+        run_audit_verify(Some(&p), None, None, None, None, true, None)
+            .expect("--merkle verify ok");
+        run_audit_verify(Some(&p), None, None, None, None, false, Some(1))
+            .expect("--merkle-index implies merkle");
+    }
+
+    #[test]
+    fn run_audit_verify_rejects_out_of_range_merkle_index() {
+        let org = uuid::Uuid::new_v4();
+        let (key, entries) = build_chain(2, org);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_chain_file(dir.path(), &key, &entries);
+        let p = path.to_str().unwrap().to_string();
+        expect_error(
+            run_audit_verify(Some(&p), None, None, None, None, false, Some(5)),
+            "out of range",
+        );
+    }
+
+    /// Write a JSONL chain with a verifying-key preamble to `dir`; returns its
+    /// path.
+    fn write_chain_file(
+        dir: &std::path::Path,
+        key: &ed25519_dalek::SigningKey,
+        entries: &[AuditEntry],
+    ) -> std::path::PathBuf {
+        let verifying_hex = hex::encode(key.verifying_key().to_bytes());
+        let mut content = format!(r#"{{"meta":true,"verifying_key":"{verifying_hex}"}}"#);
+        for e in entries {
+            content.push('\n');
+            content.push_str(&serde_json::to_string(e).expect("serialize entry"));
+        }
+        let path = dir.join("AUDIT-CHAIN.jsonl");
+        std::fs::write(&path, content).expect("write chain file");
+        path
+    }
+
+    /// Reconstruct an `InclusionProof` from the CLI's machine-readable JSON.
+    fn proof_from_json(json: &serde_json::Value) -> tt_telemetry::audit::merkle::InclusionProof {
+        use tt_telemetry::audit::merkle::Sibling;
+        let root: [u8; 32] = hex::decode(json["root"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let path = json["sibling_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let hash: [u8; 32] = hex::decode(s["hash"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                Sibling {
+                    hash,
+                    left: s["left"].as_bool().unwrap(),
+                }
+            })
+            .collect();
+        tt_telemetry::audit::merkle::InclusionProof {
+            version: json["proof_version"].as_u64().unwrap(),
+            chain_id: json["chain_id"].as_str().unwrap().to_string(),
+            leaf_index: json["leaf_index"].as_u64().unwrap(),
+            leaf_count: json["leaf_count"].as_u64().unwrap(),
+            root,
+            sibling_path: path,
+        }
     }
 }

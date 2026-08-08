@@ -10,10 +10,12 @@
 //! - [`AuditWriter`] — async trait implemented by storage backends.
 //! - [`InMemoryAuditWriter`] — in-process writer for tests and CLI demos.
 //! - [`verify_chain`] — standalone verifier; used by `tt audit verify`.
+//! - [`merkle`] — local-only Merkle inclusion proofs over the chain.
 //! - [`AuditError`] / [`VerifyError`] — error enums.
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod merkle;
 pub mod writer;
 
 use chrono::{DateTime, Utc};

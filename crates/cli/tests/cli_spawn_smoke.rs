@@ -440,3 +440,68 @@ fn man_emits_a_page() {
         "`tt man` panicked"
     );
 }
+
+/// `tt audit verify --merkle` over a REAL signed chain: exits cleanly and
+/// prints a machine-readable local-only inclusion proof as JSON on stdout.
+#[test]
+fn audit_verify_merkle_prints_machine_readable_proof() {
+    // Mint a genuine signed chain under an isolated HOME.
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", home.path());
+    let key = tt_cli::local_audit::load_or_create_signing_key().expect("signing key");
+    let chain_path = work.path().join("AUDIT-CHAIN.jsonl");
+    for i in 0..5u8 {
+        tt_cli::local_audit::append_entry(
+            &chain_path,
+            &key,
+            uuid::Uuid::from_u128(0x1592),
+            format!("merkle.smoke.{i}").as_str(),
+            serde_json::json!({"i": i}),
+        )
+        .expect("append signed entry");
+    }
+
+    // Tip proof (default).
+    let tip = output_tt(home.path(), &["audit", "verify", "--merkle", chain_path.to_str().unwrap()]);
+    assert!(tip.status.success(), "--merkle exited non-zero: {tip:?}");
+    assert_no_panic(&["audit", "verify", "--merkle"], &String::from_utf8_lossy(&tip.stderr));
+    let tip_stdout = String::from_utf8_lossy(&tip.stdout);
+    let proof: serde_json::Value = serde_json::from_str(&tip_stdout)
+        .unwrap_or_else(|e| panic!("stdout must be the proof JSON, got: {tip_stdout:?} — {e}"));
+    assert_eq!(proof["local_only"], true);
+    assert_eq!(proof["leaf_index"], 4, "default proof is the tip");
+    assert_eq!(proof["leaf_count"], 5);
+    assert_eq!(proof["root"].as_str().unwrap().len(), 64);
+    assert!(!proof["sibling_path"].as_array().unwrap().is_empty());
+    assert!(
+        proof["note"].as_str().unwrap().contains("NOT a transparency-log publication"),
+        "proof must be explicitly labeled non-transparency: {proof}"
+    );
+
+    // Selected index.
+    let sel = output_tt(
+        home.path(),
+        &["audit", "verify", "--merkle-index", "2", chain_path.to_str().unwrap()],
+    );
+    assert!(sel.status.success(), "--merkle-index exited non-zero: {sel:?}");
+    let sel_proof: serde_json::Value =
+        serde_json::from_slice(&sel.stdout).expect("stdout must be the proof JSON");
+    assert_eq!(sel_proof["leaf_index"], 2);
+
+    // Out-of-range index fails fast (non-zero), never panics.
+    let bad = output_tt(
+        home.path(),
+        &["audit", "verify", "--merkle-index", "99", chain_path.to_str().unwrap()],
+    );
+    assert!(!bad.status.success(), "out-of-range --merkle-index must error");
+    assert_no_panic(
+        &["audit", "verify", "--merkle-index", "99"],
+        &String::from_utf8_lossy(&bad.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("out of range"),
+        "expected a range error, got: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}

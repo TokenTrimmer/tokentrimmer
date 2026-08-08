@@ -849,7 +849,8 @@ async fn main() -> anyhow::Result<()> {
     // silence the stdout log layer before init by forcing the env filter off —
     // unless the operator has set RUST_LOG, in which case we honor their choice.
     if (inspect_emits_machine_output_to_stdout(std::env::args())
-        || is_stdout_generator_subcommand(std::env::args()))
+        || is_stdout_generator_subcommand(std::env::args())
+        || audit_verify_emits_merkle_to_stdout(std::env::args()))
         && std::env::var_os("RUST_LOG").is_none()
     {
         // SAFETY: set before any threads are spawned that read RUST_LOG; tracing
@@ -948,6 +949,8 @@ async fn main() -> anyhow::Result<()> {
                     key,
                     key_hex,
                     expected_tip,
+                    merkle,
+                    merkle_index,
                 },
         } => {
             audit::run_audit_verify(
@@ -956,6 +959,8 @@ async fn main() -> anyhow::Result<()> {
                 key.as_deref(),
                 key_hex.as_deref(),
                 expected_tip.as_deref(),
+                merkle,
+                merkle_index,
             )?;
         }
         Command::Export {
@@ -2776,6 +2781,24 @@ where
         .is_some_and(|sub| sub == "completions" || sub == "man")
 }
 
+/// Decide whether `tt audit verify --merkle[--index]` is the invocation: its
+/// entire stdout payload is the machine-readable proof JSON, so the startup
+/// tracing log line must be silenced exactly like the SARIF/man/completions
+/// cases (a prepended log JSON line would break `> proof.json` consumers).
+fn audit_verify_emits_merkle_to_stdout<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    let non_flag: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
+    let is_audit_verify = matches!(non_flag.as_slice(), [sub, verify, ..] if sub.as_str() == "audit" && verify.as_str() == "verify");
+    is_audit_verify
+        && args
+            .iter()
+            .any(|a| a == "--merkle" || a == "--merkle-index")
+}
+
 /// Resolve the `tt inspect` output format from an explicit `--format` value
 /// (when set) and otherwise from the `--output` path extension.
 ///
@@ -3536,8 +3559,8 @@ mod hosted_telemetry_wiring_tests {
 #[cfg(test)]
 mod inspect_format_tests {
     use super::{
-        inspect_emits_machine_output_to_stdout, inspect_output_format,
-        is_stdout_generator_subcommand, OutputFormat,
+        audit_verify_emits_merkle_to_stdout, inspect_emits_machine_output_to_stdout,
+        inspect_output_format, is_stdout_generator_subcommand, OutputFormat,
     };
 
     fn argv(s: &str) -> Vec<String> {
@@ -3634,5 +3657,26 @@ mod inspect_format_tests {
         assert!(!is_stdout_generator_subcommand(argv("inspect .")));
         assert!(!is_stdout_generator_subcommand(argv("chat")));
         assert!(!is_stdout_generator_subcommand(argv("")));
+    }
+
+    #[test]
+    fn detects_audit_verify_merkle_stdout() {
+        // `tt audit verify --merkle[...]` emits the proof JSON to stdout →
+        // silence the startup tracing log line so it can't prepend to it.
+        assert!(audit_verify_emits_merkle_to_stdout(argv(
+            "audit verify --merkle .claude/AUDIT-CHAIN.jsonl"
+        )));
+        assert!(audit_verify_emits_merkle_to_stdout(argv(
+            "audit verify --merkle-index 2 --key key.hex chain.jsonl"
+        )));
+        assert!(audit_verify_emits_merkle_to_stdout(argv(
+            "--no-color audit verify --merkle"
+        )));
+        // Plain verify (human output) and other commands don't.
+        assert!(!audit_verify_emits_merkle_to_stdout(argv(
+            "audit verify chain.jsonl --key k.hex"
+        )));
+        assert!(!audit_verify_emits_merkle_to_stdout(argv("audit verify")));
+        assert!(!audit_verify_emits_merkle_to_stdout(argv("inspect . --format json")));
     }
 }
