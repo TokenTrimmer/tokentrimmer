@@ -32,6 +32,22 @@ use crate::workflow::types::NodeOutput;
 /// Default response body byte cap: 1 MiB.
 pub(crate) const DEFAULT_MAX_RESPONSE_BYTES: usize = 1_048_576;
 
+/// Closed set of media types a URL document source may resolve to — the exact
+/// extension/media table the gateway's document tooling (`cli/src/docprep.rs`,
+/// `client/src/document.rs`, and the `document_lane` sidecar) dispatches on:
+/// PDF text-layer extraction plus image OCR. A fetched URL whose resolved
+/// media type is outside this set fails closed — the engine never hands an
+/// arbitrary remote payload to the distill seam or downstream nodes.
+pub(crate) const SUPPORTED_DOCUMENT_MEDIA: &[&str] = &[
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/tiff",
+];
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -97,6 +113,19 @@ pub(crate) enum HttpError {
     /// NOT included in this error message.
     #[error("url rejected by SSRF guard (blocked scheme or private/internal address)")]
     BlockedUrl,
+
+    /// A URL document source fetch returned a non-2xx status. The body is never
+    /// distilled from an error page — fail closed. Only the status code is
+    /// echoed (no URL).
+    #[error("document fetch returned HTTP status {0}")]
+    BadStatus(u16),
+
+    /// A URL document source resolved to a media type outside
+    /// [`SUPPORTED_DOCUMENT_MEDIA`] (or no resolvable type). The node fails
+    /// closed rather than handing an arbitrary remote payload to the distill
+    /// seam. Only the observed media type is echoed (no URL).
+    #[error("document media type not in supported set: {0}")]
+    UnsupportedMediaType(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +332,202 @@ pub(crate) async fn run_http(
     };
 
     Ok(HttpResp { status, body })
+}
+
+// ---------------------------------------------------------------------------
+// run_document_fetch
+// ---------------------------------------------------------------------------
+
+/// A URL document source successfully fetched through the guarded egress: its
+/// resolved media type (already vetted against [`SUPPORTED_DOCUMENT_MEDIA`])
+/// plus its fully-buffered bytes as standard base64 — ready to hand to the
+/// Document node's distill seam exactly like an inline base64 source.
+#[derive(Debug)]
+pub(crate) struct FetchedDocument {
+    pub media_type: String,
+    pub data_b64: String,
+}
+
+/// Execute a guarded fetch of a workflow URL document source.
+///
+/// This is the SAME guarded egress path the Http node's [`run_http`] uses —
+/// identical transport posture, reusing the shared guards — with two
+/// intentional differences:
+///
+/// * **No `allowed_hosts` allowlist.** A URL document source is admitted by
+///   its own closed contract (a static, credential-free HTTPS literal passing
+///   the shared SSRF guard at authoring), not by a per-workflow allowlist
+///   entry that the document-source surface has never had. The transport is
+///   still fully guarded (below), so removing the allowlist does not loosen
+///   the Http node's guarantees — it simply omits a document node never had.
+/// * **Media-set + status gates.** The fetched bytes are only ever passed to
+///   the distill seam when the status is 2xx and the resolved media type is a
+///   member of [`SUPPORTED_DOCUMENT_MEDIA`]. The base64 path trusts the
+///   author's `media_type`; a remote source is treated as untrusted input and
+///   fails closed instead.
+///
+/// # Security (mirrors `run_http` exactly)
+///
+/// 1. Rejects inline userinfo — the contract is credential-free.
+/// 2. Re-asserts [`tt_shared::validate_provider_url`] at run time (https-only,
+///    hostname denylist, private/loopback/link-local/metadata IP-literal block,
+///    best-effort DNS-resolved-IP block). Authoring-time validation is not
+///    sufficient against TOCTOU / DNS rebinding.
+/// 3. Fresh client per call with [`tt_shared::with_guarded_dns`]
+///    (DNS-rebind guard at connect time), `Policy::none()` (no redirects —
+///    a redirect to a private IP can never be followed), 30 s total + 5 s
+///    connect timeout, rustls, gzip.
+/// 4. Streams the body up to [`DEFAULT_MAX_RESPONSE_BYTES`] (1 MiB — the same
+///    shared byte cap the Http node uses); never trusts `Content-Length`.
+/// 5. All reqwest errors are mapped via `.without_url()` — the URL (and any
+///    credentials it never carries) is never echoed in an error string.
+pub(crate) async fn run_document_fetch(url: &str) -> Result<FetchedDocument, HttpError> {
+    // ---- 1. Userinfo rejection — the source is credential-free. -------------
+    let parsed = reqwest::Url::parse(url).map_err(|_| HttpError::InvalidUrl)?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HttpError::UrlContainsUserinfo);
+    }
+
+    // ---- 2. Run-time SSRF re-assertion (defense-in-depth). ------------------
+    // A definition could in principle reach this function bypassing authoring
+    // validation, and even a validated hostname can DNS-rebind between saves.
+    // Re-run the shared guard on the CONCRETE URL we are about to fetch.
+    tt_shared::validate_provider_url(url, false).map_err(|_| HttpError::BlockedUrl)?;
+
+    // ---- 3. Guarded client (identical to run_http). -------------------------
+    let client = tt_shared::with_guarded_dns(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .use_rustls_tls()
+            .gzip(true),
+    )
+    .build()
+    .map_err(|e| HttpError::Request(e.without_url().to_string()))?;
+
+    // ---- 4. GET — no headers, no body: the source URL carries nothing. ------
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| HttpError::Request(e.without_url().to_string()))?;
+    let status = response.status().as_u16();
+
+    // Content-Type with parameters stripped + lowercased, when present.
+    let content_type: Option<String> = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or(ct)
+                .trim()
+                .to_ascii_lowercase()
+        });
+
+    // ---- 5. Status derived BEFORE streaming (never distill an error page). --
+    if !(200..300).contains(&status) {
+        return Err(HttpError::BadStatus(status));
+    }
+
+    // ---- 6. Media-set gate (fail closed) before consuming the body. ---------
+    let observed = content_type.clone().unwrap_or_else(|| "<none>".to_string());
+    let media_type = resolve_document_media_type(&content_type, url).ok_or_else(|| {
+        HttpError::UnsupportedMediaType(observed.clone())
+    })?;
+
+    // ---- 7. Stream body up to the shared byte cap (never trust the header).--
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| HttpError::Request(e.without_url().to_string()))?;
+        if buf.len() + chunk.len() > DEFAULT_MAX_RESPONSE_BYTES {
+            buf.extend_from_slice(&chunk[..DEFAULT_MAX_RESPONSE_BYTES.saturating_sub(buf.len())]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    if truncated {
+        warn!(
+            cap_bytes = DEFAULT_MAX_RESPONSE_BYTES,
+            status, "run_document_fetch: response body exceeded byte cap"
+        );
+        return Err(HttpError::ResponseTooLarge(DEFAULT_MAX_RESPONSE_BYTES));
+    }
+
+    use base64::Engine as _;
+    Ok(FetchedDocument {
+        media_type,
+        data_b64: base64::engine::general_purpose::STANDARD.encode(&buf),
+    })
+}
+
+/// Resolve the media type of a fetched URL document source.
+///
+/// The response `Content-Type` (already parameter-stripped + lowercased) is
+/// authoritative when it is present and non-generic; a generic
+/// `application/octet-stream` / `binary/octet-stream` marker (or an absent
+/// header) falls back to the URL path extension — the same extension table
+/// the gateway's document tooling uses. Returning `None` means the fetched
+/// payload is not a supported document and the caller must fail closed.
+fn resolve_document_media_type(
+    content_type: &Option<String>,
+    url: &str,
+) -> Option<String> {
+    match content_type {
+        Some(base) if !is_generic_document_content_type(base) => canonical_document_media(base),
+        _ => media_type_from_url_extension(url),
+    }
+}
+
+/// `true` for the generic binary markers that carry no usable type information,
+/// forcing a fall back to the URL path extension.
+fn is_generic_document_content_type(base: &str) -> bool {
+    matches!(base, "" | "application/octet-stream" | "binary/octet-stream")
+}
+
+/// Normalize a Content-Type to a supported canonical member
+/// (`image/jpg` → `image/jpeg`, `image/x-png` → `image/png`, …), returning
+/// `Some` only when the result is a member of [`SUPPORTED_DOCUMENT_MEDIA`].
+fn canonical_document_media(base: &str) -> Option<String> {
+    let normalized = match base {
+        "image/jpg" => "image/jpeg",
+        "image/pjpeg" => "image/jpeg", // JPEG under an MS-isms alias
+        "image/x-png" => "image/png",
+        "image/tif" => "image/tiff",
+        other => other,
+    };
+    SUPPORTED_DOCUMENT_MEDIA
+        .contains(&normalized)
+        .then(|| normalized.to_string())
+}
+
+/// Infer a supported media type from the URL path extension (the canonical
+/// pdf/png/jpg/gif/webp/bmp/tiff table). Returns `None` for an extension-less
+/// or unrecognized path.
+fn media_type_from_url_extension(url: &str) -> Option<String> {
+    let path = reqwest::Url::parse(url).ok()?.path().to_string();
+    let ext = path.rsplit('.').next()?; // segment after the last dot, if any
+    if ext.contains('/') || ext.is_empty() {
+        return None; // no dot / no extension
+    }
+    let media = match ext.to_ascii_lowercase().as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tiff" | "tif" => "image/tiff",
+        _ => return None,
+    };
+    Some(media.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -651,5 +876,198 @@ mod tests {
                 "error must not expose URL path; got: {err_str}"
             );
         }
+    }
+    // -----------------------------------------------------------------------
+    // run_document_fetch: SSRF / scheme / userinfo rejection (all no-network —
+    // the guard fires before any connect), + pure media-resolution helpers.
+    // -----------------------------------------------------------------------
+
+    /// A URL document source embedding userinfo must fail closed: the source
+    /// is credential-free by contract.
+    #[tokio::test]
+    async fn run_document_fetch_rejects_userinfo() {
+        let err = run_document_fetch("https://allowed.example.com@evil.com/doc.pdf")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::UrlContainsUserinfo),
+            "expected UrlContainsUserinfo, got: {err}"
+        );
+    }
+
+    /// A private IP-literal URL document source must fail closed at the SSRF
+    /// guard — no network call ever fires.
+    #[tokio::test]
+    async fn run_document_fetch_rejects_loopback_ip() {
+        let err = run_document_fetch("https://127.0.0.1/doc.pdf")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::BlockedUrl),
+            "expected BlockedUrl for loopback, got: {err}"
+        );
+    }
+
+    /// Cloud-metadata IP-literal URL document source must fail closed.
+    #[tokio::test]
+    async fn run_document_fetch_rejects_metadata_ip() {
+        let err = run_document_fetch("https://169.254.169.254/latest/meta-data/")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::BlockedUrl),
+            "expected BlockedUrl for metadata IP, got: {err}"
+        );
+    }
+
+    /// A plain-HTTP URL document source must fail closed (https-only contract).
+    #[tokio::test]
+    async fn run_document_fetch_rejects_non_https() {
+        let err = run_document_fetch("http://example.com/doc.pdf")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::BlockedUrl),
+            "expected BlockedUrl for http, got: {err}"
+        );
+    }
+
+    /// An unparseable URL document source must fail closed.
+    #[tokio::test]
+    async fn run_document_fetch_rejects_invalid_url() {
+        let err = run_document_fetch("not a url").await.unwrap_err();
+        assert!(
+            matches!(err, HttpError::InvalidUrl),
+            "expected InvalidUrl, got: {err}"
+        );
+    }
+
+    // ---- canonical_document_media ------------------------------------------
+
+    #[test]
+    fn canonical_document_media_passes_supported_identically() {
+        assert_eq!(
+            canonical_document_media("application/pdf").as_deref(),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            canonical_document_media("image/png").as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            canonical_document_media("image/webp").as_deref(),
+            Some("image/webp")
+        );
+        assert_eq!(
+            canonical_document_media("image/bmp").as_deref(),
+            Some("image/bmp")
+        );
+    }
+
+    #[test]
+    fn canonical_document_media_normalizes_aliases() {
+        assert_eq!(
+            canonical_document_media("image/jpg").as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            canonical_document_media("image/pjpeg").as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            canonical_document_media("image/x-png").as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            canonical_document_media("image/tif").as_deref(),
+            Some("image/tiff")
+        );
+    }
+
+    #[test]
+    fn canonical_document_media_rejects_unknown() {
+        assert_eq!(canonical_document_media("text/html"), None);
+        assert_eq!(canonical_document_media("application/zip"), None);
+        assert_eq!(canonical_document_media(""), None);
+    }
+
+    // ---- media_type_from_url_extension -------------------------------------
+
+    #[test]
+    fn media_from_url_extension_known_extensions() {
+        assert_eq!(
+            media_type_from_url_extension("https://example.com/doc.pdf").as_deref(),
+            Some("application/pdf")
+        );
+        // Query string is not part of the path; extension matching is case-insensitive.
+        assert_eq!(
+            media_type_from_url_extension("https://example.com/a.PDF?x=1&y=2").as_deref(),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            media_type_from_url_extension("https://example.com/pic.JPG").as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            media_type_from_url_extension("https://example.com/anim.gif").as_deref(),
+            Some("image/gif")
+        );
+    }
+
+    #[test]
+    fn media_from_url_extension_unknown_or_missing() {
+        assert_eq!(media_type_from_url_extension("https://example.com/doc"), None);
+        assert_eq!(media_type_from_url_extension("https://example.com/doc.exe"), None);
+        assert_eq!(
+            media_type_from_url_extension("https://example.com/noext?fmt=pdf"),
+            None
+        );
+        assert_eq!(
+            media_type_from_url_extension("https://example.com/"),
+            None
+        );
+    }
+
+    // ---- resolve_document_media_type (Content-Type precedence) --------------
+
+    #[test]
+    fn resolve_media_prefers_non_generic_content_type() {
+        let ct = Some("application/pdf".to_string());
+        assert_eq!(
+            resolve_document_media_type(&ct, "https://example.com/x.bin").as_deref(),
+            Some("application/pdf")
+        );
+        // A non-generic unsupported Content-Type wins over the URL extension —
+        // never trust a .pdf path on a server that served HTML.
+        let ct = Some("text/html".to_string());
+        assert_eq!(
+            resolve_document_media_type(&ct, "https://example.com/x.pdf"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_media_falls_back_to_extension_on_generic_or_absent() {
+        let generic = Some("application/octet-stream".to_string());
+        assert_eq!(
+            resolve_document_media_type(&generic, "https://example.com/x.pdf").as_deref(),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            resolve_document_media_type(&None, "https://example.com/x.png").as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            resolve_document_media_type(&None, "https://example.com/x.doc"),
+            None
+        );
+    }
+
+    #[test]
+    fn generic_content_type_markers() {
+        assert!(is_generic_document_content_type(""));
+        assert!(is_generic_document_content_type("application/octet-stream"));
+        assert!(is_generic_document_content_type("binary/octet-stream"));
+        assert!(!is_generic_document_content_type("application/pdf"));
     }
 }

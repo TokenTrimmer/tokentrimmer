@@ -302,10 +302,12 @@ fn validate_with_schedule_floor(
     }
 
     // ------------------------------------------------------------------
-    // 6c. Document nodes: source must be base64 (v1 doesn't fetch URLs — same
-    // posture as the document_lane seam); the data + media_type must be
-    // non-empty; an optional cache_key, if set, must be non-empty. No SSRF
-    // surface (the node distills inline bytes; remote URLs are a future slice).
+    // 6c. Document nodes: the source must be a non-empty inline base64 payload
+    // (media_type + data) OR a static, credential-free HTTPS URL literal
+    // passing the shared SSRF guard (see the Url arm). An optional cache_key,
+    // if set, must be non-empty. No template tokens are allowed in a URL
+    // source — the fetch target must be a static literal so authoring-time
+    // validation is authoritative (no blind substitution-driven egress).
     // ------------------------------------------------------------------
     for node in &def.nodes {
         if let NodeKind::Document { source, cache_key } = &node.kind {
@@ -324,11 +326,59 @@ fn validate_with_schedule_floor(
                         ));
                     }
                 }
-                tt_shared::messages::DocumentSource::Url { .. } => {
-                    errors.push(format!(
-                        "node \"{}\": document source must be base64 (URLs are not fetched in v1)",
-                        node.id
-                    ));
+                tt_shared::messages::DocumentSource::Url { url } => {
+                    // URL document source (lossless adapters): admitted under a
+                    // CLOSED contract — a static, credential-free HTTPS literal
+                    // passing the gateway's shared SSRF guard. The fetched bytes
+                    // are then media-set-vetted + byte-capped at run time by the
+                    // guarded egress; nothing here opens a second egress path.
+                    let trimmed = url.trim();
+                    if trimmed.is_empty() {
+                        errors.push(format!(
+                            "node \"{}\": document source url must be non-empty",
+                            node.id
+                        ));
+                        continue;
+                    }
+                    // Static literal only: template substitution would let an
+                    // author pass a placeholder past this guard and inject the
+                    // substituted value as the egress target (a blind SSRF
+                    // channel). Reject any template token outright.
+                    if trimmed.contains("{{") {
+                        errors.push(format!(
+                            "node \"{}\": document source url must be a static literal \
+                             (no {{{{...}}}} templates); the fetch target cannot be templated",
+                            node.id
+                        ));
+                        continue;
+                    }
+                    let parsed = match reqwest::Url::parse(trimmed) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            errors.push(format!(
+                                "node \"{}\": document source url is not a valid URL",
+                                node.id
+                            ));
+                            continue;
+                        }
+                    };
+                    // Credential-free: userinfo (`user:pass@host`) is rejected —
+                    // a URL document source must never carry credentials.
+                    if !parsed.username().is_empty() || parsed.password().is_some() {
+                        errors.push(format!(
+                            "node \"{}\": document source url must not contain userinfo \
+                             ('@' in authority)",
+                            node.id
+                        ));
+                    }
+                    // https-only + hostname/IP denylist + best-effort resolved-IP
+                    // block — the exact shared guard the Http nodes run here.
+                    if let Err(e) = tt_shared::url_guard::validate_provider_url(trimmed, false) {
+                        errors.push(format!(
+                            "node \"{}\": document source url rejected: {}",
+                            node.id, e
+                        ));
+                    }
                 }
             }
             if let Some(key) = cache_key {
@@ -1720,18 +1770,56 @@ mod tests {
         );
     }
 
-    /// A Document node with a URL source must be rejected (v1 doesn't fetch).
+    /// A Document node with a credential-free HTTPS URL source must validate —
+    /// the URL source is admitted under the same closed contract the rest of
+    /// the document-source validation enforces (static literal, https-only,
+    /// no userinfo, shared SSRF guard).
     #[test]
-    fn document_node_rejects_url_source() {
-        let def = doc_def(tt_shared::messages::DocumentSource::Url {
-            url: "https://example.com/doc.pdf".into(),
-        });
-        let errs = validate(&def, &any_model).unwrap_err();
-        let combined = errs.join("\n");
-        assert!(
-            combined.contains("base64") && combined.contains("URL"),
-            "expected URL-source rejection; got: {combined}"
-        );
+    fn document_node_validates_https_url_source() {
+        for url in [
+            "https://example.com/doc.pdf",
+            "https://files.example.com/a/b/report.PDF?token=abc",
+            "https://example.com/image.png",
+        ] {
+            let def = doc_def(tt_shared::messages::DocumentSource::Url {
+                url: url.to_string(),
+            });
+            assert!(
+                validate(&def, &any_model).is_ok(),
+                "a credential-free HTTPS URL document source must validate; got errors for `{url}`"
+            );
+        }
+    }
+
+    /// URL sources that violate the closed admission contract must be rejected
+    /// at authoring: non-https scheme, embedded userinfo, private/loopback/
+    /// metadata IP, internal hostname, template tokens, or an unparseable URL.
+    #[test]
+    fn document_node_rejects_unsafe_url_sources() {
+        for url in [
+            "http://example.com/doc.pdf",                 // not https
+            "https://user:pass@example.com/doc.pdf",      // credentials in URL
+            "https://127.0.0.1/doc.pdf",                  // loopback
+            "https://10.0.0.5/doc.pdf",                   // private RFC1918
+            "https://192.168.1.1/doc.pdf",                // private RFC1918
+            "https://169.254.169.254/latest/meta-data/",  // cloud metadata
+            "https://localhost/doc.pdf",                  // localhost hostname
+            "https://metadata.google.internal/doc.pdf",   // internal hostname
+            "https://myhost.local/doc.pdf",               // mDNS `.local` hostname
+            "ftp://example.com/doc.pdf",                  // non-http scheme
+            "https://example.com/{{trigger.input_id}}.pdf", // templated target
+            "not a url",                                  // unparseable
+            "   ",                                        // blank
+        ] {
+            let def = doc_def(tt_shared::messages::DocumentSource::Url {
+                url: url.to_string(),
+            });
+            let errs = validate(&def, &any_model).unwrap_err();
+            assert!(
+                !errs.is_empty(),
+                "expected URL-source admission rejection for `{url}`"
+            );
+        }
     }
 
     /// A Document node with empty base64 data must be rejected.

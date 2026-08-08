@@ -1489,44 +1489,61 @@ fn run_workflow_boxed<'a>(
                     // booking it here would need that model, known only downstream).
                     NodeKind::Document { source, cache_key } => {
                         let _ = cache_key; // TODO D6 cache slice: compose into the cache key.
-                                           // v1 distills inline base64 bytes only (the seam's posture);
-                                           // a URL source is rejected at validation + never reaches here.
+                        // Resolve the document's bytes: an inline base64 source
+                        // passes through untouched; a URL source is fetched
+                        // through the gateway's guarded egress (the SAME
+                        // no-redirect/DNS-guard/https-only transport the Http
+                        // node uses, re-asserting the shared SSRF guard, the
+                        // closed media set, and the shared byte cap at run
+                        // time). Fail closed: any fetch error / unsupported
+                        // media / oversize body → a named-error failed
+                        // NodeOutput, never raw remote bytes downstream.
                         let (media_type, data_b64) = match source {
                             tt_shared::messages::DocumentSource::Base64 { media_type, data } => {
                                 (media_type.clone(), data.clone())
                             }
-                            tt_shared::messages::DocumentSource::Url { .. } => {
-                                let err = "document node source must be base64 (URLs are not fetched in v1)";
-                                journal(NodeJournalEntry {
-                                    node_id: node_id.clone(),
-                                    status: "failed".into(),
-                                    output: None,
-                                    input: None,
-                                    cost_usd: 0.0,
-                                    model_used: None,
-                                    error: Some(err.to_string()),
-                                    started_at: node_started_at,
-                                    finished_at: chrono::Utc::now(),
-                                });
-                                let out = NodeOutput {
-                                    content: serde_json::Value::Null,
-                                    cost_usd: 0.0,
-                                    baseline_cost_usd: 0.0,
-                                    model_used: None,
-                                    doc_vision_saved_est_usd: 0.0,
-                                };
-                                outputs.insert(node_id.clone(), out);
-                                propagate_edges(node_id, def, &mut reachable);
-                                emit(WfEvent::NodeDone {
-                                    node_id: node_id.clone(),
-                                    cost_usd: 0.0,
-                                    run_cost_usd: accrued,
-                                    baseline_cost_usd: accrued_baseline,
-                                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
-                                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
-                                });
-                                done.insert(node_id.clone());
-                                continue;
+                            tt_shared::messages::DocumentSource::Url { url } => {
+                                match wf_http::run_document_fetch(url).await {
+                                    Ok(doc) => (doc.media_type, doc.data_b64),
+                                    Err(e) => {
+                                        // SECURITY: HttpError strings are
+                                        // sanitized — the URL is never echoed.
+                                        let err =
+                                            format!("document node source fetch failed: {e}");
+                                        journal(NodeJournalEntry {
+                                            node_id: node_id.clone(),
+                                            status: "failed".into(),
+                                            output: None,
+                                            input: None,
+                                            cost_usd: 0.0,
+                                            model_used: None,
+                                            error: Some(err),
+                                            started_at: node_started_at,
+                                            finished_at: chrono::Utc::now(),
+                                        });
+                                        let out = NodeOutput {
+                                            content: serde_json::Value::Null,
+                                            cost_usd: 0.0,
+                                            baseline_cost_usd: 0.0,
+                                            model_used: None,
+                                            doc_vision_saved_est_usd: 0.0,
+                                        };
+                                        outputs.insert(node_id.clone(), out);
+                                        propagate_edges(node_id, def, &mut reachable);
+                                        emit(WfEvent::NodeDone {
+                                            node_id: node_id.clone(),
+                                            cost_usd: 0.0,
+                                            run_cost_usd: accrued,
+                                            baseline_cost_usd: accrued_baseline,
+                                            saved_usd_so_far: (accrued_baseline - accrued)
+                                                .max(0.0),
+                                            budget_remaining_usd: run_max_cost_usd
+                                                .map(|m| m - accrued),
+                                        });
+                                        done.insert(node_id.clone());
+                                        continue;
+                                    }
+                                }
                             }
                         };
                         // The cache key: blake3(content_bytes) + the optional
@@ -6275,6 +6292,127 @@ mod tests {
             out_node.content.is_null(),
             "no cache + no sidecar → the Document node's fail-loud null propagates to the Output; got: {:?}",
             out_node.content
+        );
+    }
+
+    /// Build a minimal Trigger → Document → Output flow whose Document node
+    /// sources the given URL.
+    fn doc_node_flow_url(url: &str) -> WorkflowDefinition {
+        WorkflowDefinition {
+            triggers: vec![],
+            id: Uuid::nil(),
+            version: 1,
+            name: "doc-url".to_string(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "d".into(),
+                    kind: NodeKind::Document {
+                        source: tt_shared::messages::DocumentSource::Url {
+                            url: url.to_string(),
+                        },
+                        cache_key: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "d".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "d".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: Vec::new(),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// A URL document source must EXECUTE through the guarded fetch — and when
+    /// the guarded egress rejects the target (here a loopback IP literal
+    /// blocked by the shared SSRF guard BEFORE any network call), the node
+    /// FAILS CLOSED with a named, sanitized error. This proves the engine wired
+    /// the URL-source arm to the guarded egress (the pre-slice behavior emitted
+    /// a static "must be base64" message and never touched the guard), and that
+    /// no third egress path was invented: the loopback URL is refused by the
+    /// same `validate_provider_url` guard the Http node uses.
+    #[tokio::test]
+    async fn document_url_source_runs_through_guarded_fetch_and_fails_closed() {
+        std::env::remove_var("TT_DOC_SIDECAR_URL");
+        let def = doc_node_flow_url("https://127.0.0.1/doc.pdf");
+        let mut journal_entries: Vec<NodeJournalEntry> = Vec::new();
+        let result = run_workflow(
+            &StubExecutor::new(vec![]),
+            &def,
+            &json!("go"),
+            None,
+            |e| journal_entries.push(e),
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+        // The run still succeeds (fail-loud per-node posture, mirroring the
+        // distill-failure path); the Output node carries the node's null output.
+        assert_eq!(result.status, WfStatus::Succeeded);
+        let out_node = result
+            .node_outputs
+            .iter()
+            .find(|(id, _)| id == "o")
+            .expect("output node present")
+            .1
+            .clone();
+        assert!(
+            out_node.content.is_null(),
+            "a guard-blocked URL source must fail closed (null output); got: {:?}",
+            out_node.content
+        );
+        // The Document node journaled a named error from the guarded egress —
+        // not the old static "must be base64" message.
+        let doc_entries: Vec<&NodeJournalEntry> = journal_entries
+            .iter()
+            .filter(|e| e.node_id == "d")
+            .collect();
+        assert_eq!(
+            doc_entries.len(),
+            1,
+            "exactly one journal entry for the document node"
+        );
+        let entry = doc_entries[0];
+        assert_eq!(entry.status, "failed");
+        let err = entry.error.as_deref().expect("a named error was journaled");
+        assert!(
+            err.contains("document node source fetch failed"),
+            "named fetch-failure error expected; got: {err}"
+        );
+        assert!(
+            err.to_ascii_lowercase().contains("blocked"),
+            "the error must identify the SSRF guard rejection; got: {err}"
+        );
+        assert!(
+            !err.contains("must be base64"),
+            "the URL arm must no longer emit the static base64-only message; got: {err}"
+        );
+        // The sanitization contract: the rejected URL string must never leak
+        // into the error (no host/path echo).
+        assert!(
+            !err.contains("127.0.0.1") && !err.contains("/doc.pdf"),
+            "the URL must not be echoed in the error; got: {err}"
         );
     }
 }
