@@ -49,6 +49,57 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         merkle_index: Option<u64>,
     },
+    /// Co-sign an out-of-band CUSTOMER checkpoint that binds the exact org,
+    /// TokenTrimmer audit verifying key, monotonic sequence, lowercase BLAKE3
+    /// tip hash, whole-second UTC time, and a SHA-256 identity of the customer
+    /// key. The customer signs with their OWN Ed25519 key; output is
+    /// create-only (never overwrites).
+    CreateCheckpoint {
+        /// Path to the JSONL chain to checkpoint. Defaults to
+        /// `.claude/AUDIT-CHAIN.jsonl`.
+        #[arg(long)]
+        chain: Option<String>,
+        /// Canonical organization UUID the chain must belong to (required).
+        #[arg(long)]
+        org: String,
+        /// Path to a file containing the hex-encoded TokenTrimmer Ed25519
+        /// verifying key. Overrides the preamble key.
+        #[arg(long)]
+        key: Option<String>,
+        /// Hex-encoded TokenTrimmer Ed25519 verifying key inline.
+        #[arg(long)]
+        key_hex: Option<String>,
+        /// Path to the customer's Ed25519 SIGNING seed (64 hex chars). Must be
+        /// mode 0600 on Unix.
+        #[arg(long)]
+        customer_key: String,
+        /// Output path (create-only). Defaults to
+        /// `customer-audit-checkpoint.v1.json`.
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Verify a customer co-signed checkpoint against a locally exported chain.
+    /// Requires the customer PUBLIC key out of band, then checks the customer
+    /// signature, the chain under the checkpointed TokenTrimmer key, the org of
+    /// every row, and the exact co-signed tip.
+    VerifyCheckpoint {
+        /// Path to the checkpoint artifact.
+        #[arg(long)]
+        checkpoint: String,
+        /// Path to the JSONL chain to verify under the checkpointed key.
+        #[arg(long)]
+        chain: Option<String>,
+        /// Path to a file containing the customer's hex-encoded Ed25519 public
+        /// key (64 hex chars).
+        #[arg(long)]
+        customer_key: Option<String>,
+        /// Customer's hex-encoded Ed25519 public key inline.
+        #[arg(long)]
+        customer_key_hex: Option<String>,
+        /// Optional org that must agree with every chain row (and the checkpoint).
+        #[arg(long)]
+        org: Option<String>,
+    },
 }
 
 /// Implement `tt audit verify`.
@@ -639,5 +690,364 @@ mod merkle_proof_tests {
             root,
             sibling_path: path,
         }
+    }
+}
+
+// ─── Customer co-signed audit checkpoint ───────────────────────────────────
+
+fn canonical_hex(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.len() != 64 || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("expected exactly 64 hex characters, got {trimmed:?}");
+    }
+    Ok(trimmed.to_lowercase())
+}
+
+fn load_customer_signing_key(path: &str) -> anyhow::Result<ed25519_dalek::SigningKey> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| anyhow::anyhow!("customer seed {path}: {e}"))?;
+        let mode = meta.permissions().mode();
+        if mode & 0o777 != 0o600 {
+            anyhow::bail!(
+                "customer seed {} must be mode 0600 (got {:03o}); refusing to use a group/other-readable seed",
+                path,
+                mode & 0o777
+            );
+        }
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read customer seed {path}: {e}"))?;
+    let hex = content.trim();
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("customer seed must be exactly 64 hex characters");
+    }
+    let bytes: [u8; 32] = hex::decode(hex)
+        .map_err(|e| anyhow::anyhow!("customer seed hex decode: {e}"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("customer seed must be exactly 32 bytes (64 hex chars)"))?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
+}
+
+fn write_create_only(path: &str, contents: &str) -> anyhow::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!("refusing to overwrite existing checkpoint {path} (create-only)")
+            } else {
+                anyhow::anyhow!("failed to create {path}: {e}")
+            }
+        })?;
+    use std::io::Write;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// Co-sign a customer audit checkpoint for one completed chain export.
+pub(crate) fn run_audit_create_checkpoint(
+    chain: Option<&str>,
+    org: &str,
+    key_path: Option<&str>,
+    key_hex_inline: Option<&str>,
+    customer_key: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let chain_path_str = chain.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
+    let chain_path = Path::new(chain_path_str);
+    if !chain_path.exists() {
+        anyhow::bail!("checkpoint FAILED: chain file {} does not exist", chain_path.display());
+    }
+    let content = std::fs::read_to_string(chain_path)
+        .map_err(|e| anyhow::anyhow!("failed to read reach chain {}: {e}", chain_path.display()))?;
+    let parsed = parse_chain_jsonl(&content)?;
+    if parsed.entries.is_empty() {
+        anyhow::bail!("checkpoint FAILED: chain {} has no entries to co-sign", chain_path.display());
+    }
+    let tip = parsed.entries.last().expect("non-empty");
+    let tip_hash = tip.hash.trim().to_lowercase();
+    if tip_hash.len() != 64 || !tip_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("checkpoint FAILED: chain tip hash is not canonical 64-hex BLAKE3");
+    }
+
+    let tt_key_hex = if let Some(hex) = key_hex_inline {
+        canonical_hex(hex)?
+    } else if let Some(path) = key_path {
+        canonical_hex(
+            &std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("failed to read key file {path}: {e}"))?,
+        )?
+    } else if let Some(preamble) = parsed.preamble_verifying_key.as_deref() {
+        canonical_hex(preamble)?
+    } else {
+        anyhow::bail!(
+            "checkpoint FAILED: no TokenTrimmer verifying key found — pass --key <path>, \
+             --key-hex <hex>, or use an export with a preamble line"
+        );
+    };
+
+    let customer = load_customer_signing_key(customer_key)?;
+    let identity = tt_telemetry::audit::checkpoint::customer_key_identity(&customer.verifying_key());
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let payload = tt_telemetry::audit::checkpoint::CheckpointPayload {
+        org: org.trim().to_lowercase(),
+        verifying_key_hex: tt_key_hex,
+        sequence: tip.seq,
+        tip_hash,
+        timestamp,
+        customer_key_identity: identity,
+    };
+    let artifact = tt_telemetry::audit::checkpoint::build_checkpoint(&payload, &customer)
+        .map_err(|e| anyhow::anyhow!("checkpoint creation failed: {e}"))?;
+
+    let output_path = output
+        .map(str::to_string)
+        .unwrap_or_else(|| "customer-audit-checkpoint.v1.json".to_string());
+    write_create_only(
+        &output_path,
+        &serde_json::to_string_pretty(&artifact)?,
+    )?;
+    tt_cli::ui::note(&format!(
+        "wrote customer checkpoint {} (org={}, seq={})",
+        output_path, payload.org, payload.sequence
+    ));
+    Ok(())
+}
+
+/// Verify a customer checkpoint against a locally exported chain.
+pub(crate) fn run_audit_verify_checkpoint(
+    checkpoint_path: &str,
+    chain: Option<&str>,
+    customer_key_path: Option<&str>,
+    customer_key_hex_inline: Option<&str>,
+    org: Option<&str>,
+) -> anyhow::Result<()> {
+    let checkpoint_value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(checkpoint_path)
+            .map_err(|e| anyhow::anyhow!("failed to read checkpoint {}: {e}", checkpoint_path))?,
+    )
+    .map_err(|e| anyhow::anyhow!("checkpoint {} is not valid JSON: {e}", checkpoint_path))?;
+
+    let customer_hex = if let Some(hex) = customer_key_hex_inline {
+        hex.trim().to_string()
+    } else if let Some(path) = customer_key_path {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read customer key {path}: {e}"))?
+            .trim()
+            .to_string()
+    } else {
+        anyhow::bail!(
+            "checkpoint verification requires the customer PUBLIC key out of band: \
+             pass --customer-key <path> or --customer-key-hex <hex>"
+        );
+    };
+    let key_bytes = hex::decode(canonical_hex(&customer_hex)?)
+        .map_err(|e| anyhow::anyhow!("customer key hex decode: {e}"))?;
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("customer public key must be exactly 32 bytes (64 hex chars)"))?;
+    let customer_public = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
+        .map_err(|e| anyhow::anyhow!("invalid customer Ed25519 public key: {e}"))?;
+
+    let bound = tt_telemetry::audit::checkpoint::verify_checkpoint(&checkpoint_value, &customer_public)
+        .map_err(|e| anyhow::anyhow!("checkpoint signature/identity verification FAILED: {e}"))?;
+    if let Some(want) = org {
+        if want.trim().to_lowercase() != bound.org {
+            anyhow::bail!("checkpoint FAILED: --org={want} disagrees with checkpointed org {}", bound.org);
+        }
+    }
+
+    let chain_path_str = chain.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
+    let chain_path = Path::new(chain_path_str);
+    if !chain_path.exists() {
+        anyhow::bail!(
+            "checkpoint FAILED: chain file {} does not exist (possible whole-chain deletion)",
+            chain_path.display()
+        );
+    }
+    let chain_content = std::fs::read_to_string(chain_path)
+        .map_err(|e| anyhow::anyhow!("failed to read chain {}: {e}", chain_path.display()))?;
+    let parsed = parse_chain_jsonl(&chain_content)?;
+    if parsed.entries.is_empty() {
+        anyhow::bail!("checkpoint FAILED: chain {} has no entries", chain_path.display());
+    }
+    // Every row must belong to the checkpointed org.
+    let org_checked: Vec<uuid::Uuid> = parsed
+        .entries
+        .iter()
+        .map(|entry| entry.org_id)
+        .collect();
+    if org_checked.iter().any(|row_org| row_org.to_string() != bound.org) {
+        anyhow::bail!(
+            "checkpoint FAILED: chain contains rows outside the checkpointed org {}",
+            bound.org
+        );
+    }
+    // The chain preamble key (when present) must agree with the checkpointed key.
+    if let Some(preamble) = parsed.preamble_verifying_key.as_deref() {
+        if canonical_hex(preamble)?.to_lowercase() != bound.verifying_key_hex {
+            anyhow::bail!("checkpoint FAILED: chain preamble key disagrees with the checkpointed key");
+        }
+    }
+    let tt_key_bytes = hex::decode(&bound.verifying_key_hex)
+        .map_err(|e| anyhow::anyhow!("checkpointed key hex decode: {e}"))?;
+    let tt_key_array: [u8; 32] = tt_key_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("checkpointed key must be 32 bytes"))?;
+    let tt_verifying = ed25519_dalek::VerifyingKey::from_bytes(&tt_key_array)
+        .map_err(|e| anyhow::anyhow!("invalid checkpointed TokenTrimmer key: {e}"))?;
+
+    let anchor = tt_telemetry::audit::TipAnchor {
+        seq: bound.sequence,
+        hash: bound.tip_hash.clone(),
+    };
+    tt_telemetry::audit::verify_chain_with_anchor(&parsed.entries, &tt_verifying, &anchor)
+        .map_err(|e| anyhow::anyhow!("chain under checkpointed key FAILED: {e}"))?;
+
+    tt_cli::ui::note(&format!(
+        "checkpoint verified: org={} seq={} tip={}" ,
+        bound.org, bound.sequence, &bound.tip_hash[..16]
+    ));
+    Ok(())
+}
+
+#[cfg(test)]
+mod checkpoint_cli_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn seed() -> (SigningKey, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Use `tt_cli::local_audit::append_entry` to build a REAL signed chain.
+        let chain = dir.path().join("chain.jsonl");
+        (SigningKey::from_bytes(&[3u8; 32]), chain, dir.into_path())
+    }
+
+    #[test]
+    fn create_then_verify_roundtrip() {
+        let (tt_seed, chain, dir) = seed();
+        let org = uuid::Uuid::new_v4();
+        let tt_key_hex = tt_cli::local_audit::append_entry(
+            &chain,
+            &tt_seed,
+            org,
+            "api_key.created",
+            serde_json::json!({}),
+        )
+        .expect("append first entry");
+
+        let customer = SigningKey::from_bytes(&[7u8; 32]);
+        let seed_path = dir.join("customer.seed");
+        std::fs::write(&seed_path, hex::encode(customer.to_bytes())).unwrap();
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let checkpoint = dir.join("cp.json");
+        run_audit_create_checkpoint(
+            Some(chain.to_str().unwrap()),
+            &org.to_string(),
+            None,
+            Some(&tt_key_hex),
+            seed_path.to_str().unwrap(),
+            Some(checkpoint.to_str().unwrap()),
+        )
+        .expect("create checkpoint");
+
+        // create-only: a second write into the same path refuses overwrite.
+        assert!(
+            run_audit_create_checkpoint(
+                Some(chain.to_str().unwrap()),
+                &org.to_string(),
+                None,
+                Some(&tt_key_hex),
+                seed_path.to_str().unwrap(),
+                Some(checkpoint.to_str().unwrap()),
+            )
+            .is_err(),
+            "checkpoint output must be create-only"
+        );
+
+        // Round-trip verify with the customer PUBLIC key + the same org.
+        let pub_hex = hex::encode(customer.verifying_key().to_bytes());
+        run_audit_verify_checkpoint(
+            checkpoint.to_str().unwrap(),
+            Some(chain.to_str().unwrap()),
+            None,
+            Some(&pub_hex),
+            Some(&org.to_string()),
+        )
+        .expect("verify roundtrip");
+
+        // Wrong customer public key must fail closed.
+        let wrong = hex::encode(SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
+        assert!(
+            run_audit_verify_checkpoint(
+                checkpoint.to_str().unwrap(),
+                Some(chain.to_str().unwrap()),
+                None,
+                Some(&wrong),
+                Some(&org.to_string()),
+            )
+            .is_err(),
+            "wrong customer key must fail"
+        );
+
+        // A different org must not agree with the co-signed org.
+        let other = uuid::Uuid::new_v4().to_string();
+        assert!(
+            run_audit_verify_checkpoint(
+                checkpoint.to_str().unwrap(),
+                Some(chain.to_str().unwrap()),
+                None,
+                Some(&pub_hex),
+                Some(&other),
+            )
+            .is_err(),
+            "disagreeing --org must fail"
+        );
+
+        // A missing chain is the whole-chain-deletion fail-closed case.
+        assert!(
+            run_audit_verify_checkpoint(
+                checkpoint.to_str().unwrap(),
+                Some(dir.join("missing.jsonl").to_str().unwrap()),
+                None,
+                Some(&pub_hex),
+                Some(&org.to_string()),
+            )
+            .is_err(),
+            "missing chain must fail closed"
+        );
+    }
+
+    #[test]
+    fn refuses_a_group_or_other_readable_customer_seed() {
+        let (tt_seed, chain, dir) = seed();
+        let org = uuid::Uuid::new_v4();
+        let tt_key_hex = tt_cli::local_audit::append_entry(
+            &chain,
+            &tt_seed,
+            org,
+            "api_key.created",
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        let seed_path = dir.join("loose.seed");
+        std::fs::write(&seed_path, hex::encode([7u8; 32])).unwrap();
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let result = run_audit_create_checkpoint(
+            Some(chain.to_str().unwrap()),
+            &org.to_string(),
+            None,
+            Some(&tt_key_hex),
+            seed_path.to_str().unwrap(),
+            Some(dir.join("cp.json").to_str().unwrap()),
+        );
+        assert!(result.is_err(), "mode-0644 customer seed must be refused on Unix");
     }
 }

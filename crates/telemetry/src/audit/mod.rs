@@ -16,6 +16,7 @@
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod merkle;
+pub mod checkpoint;
 pub mod writer;
 
 use chrono::{DateTime, Utc};

@@ -963,6 +963,42 @@ async fn main() -> anyhow::Result<()> {
                 merkle_index,
             )?;
         }
+        Command::Audit {
+            action: AuditAction::CreateCheckpoint {
+                chain,
+                org,
+                key,
+                key_hex,
+                customer_key,
+                output,
+            },
+        } => {
+            audit::run_audit_create_checkpoint(
+                chain.as_deref(),
+                &org,
+                key.as_deref(),
+                key_hex.as_deref(),
+                &customer_key,
+                output.as_deref(),
+            )?;
+        }
+        Command::Audit {
+            action: AuditAction::VerifyCheckpoint {
+                checkpoint,
+                chain,
+                customer_key,
+                customer_key_hex,
+                org,
+            },
+        } => {
+            audit::run_audit_verify_checkpoint(
+                &checkpoint,
+                chain.as_deref(),
+                customer_key.as_deref(),
+                customer_key_hex.as_deref(),
+                org.as_deref(),
+            )?;
+        }
         Command::Export {
             action: tt_cli::compress_corpus::ExportAction::CompressCorpus { input, output },
         } => {
