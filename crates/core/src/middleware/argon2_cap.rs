@@ -37,6 +37,9 @@ use governor::{
 };
 use tt_cache::{RateLimitDecision, RedisRateLimiter};
 
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const SHARED_BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A keyed GCRA limiter over client IPs, generic over the clock `C`. The no-op
 /// accounting middleware is pinned to the clock's instant type so a
 /// `FakeRelativeClock` (whose instant differs from the default quanta clock)
@@ -182,21 +185,23 @@ where
     /// the deterministic in-process GCRA limiter.
     pub async fn check(&self, ip: IpAddr) -> CapDecision {
         if let Some(shared) = self.shared.as_ref() {
-            return match shared
-                .check(
-                    "argon2-verify",
-                    &ip.to_string(),
-                    self.verify_per_min,
-                    Duration::from_secs(60),
-                )
-                .await
+            let ip = ip.to_string();
+            return match tokio::time::timeout(
+                SHARED_BACKEND_TIMEOUT,
+                shared.check("argon2-verify", &ip, self.verify_per_min, RATE_LIMIT_WINDOW),
+            )
+            .await
             {
-                Ok(RateLimitDecision::Allow) => CapDecision::Allow,
-                Ok(RateLimitDecision::Reject { retry_after_secs }) => {
+                Ok(Ok(RateLimitDecision::Allow)) => CapDecision::Allow,
+                Ok(Ok(RateLimitDecision::Reject { retry_after_secs })) => {
                     CapDecision::Reject { retry_after_secs }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     tracing::error!(%error, "shared argon2 verification limiter unavailable");
+                    CapDecision::Unavailable
+                }
+                Err(_) => {
+                    tracing::error!("shared argon2 verification limiter timed out");
                     CapDecision::Unavailable
                 }
             };
@@ -214,11 +219,9 @@ where
 
 /// Extract the client IP for keying. Behind Cloudflare + Fly the socket peer is
 /// the edge, so prefer `cf-connecting-ip`, then the first hop of
-/// `x-forwarded-for`, then a stable fallback. A spoofable header is acceptable
-/// here: this is abuse-control, not authn. An attacker rotating the header to
-/// dodge the per-IP cap still pays argon2 only on distinct cells, and every
-/// distinct spoofed IP is bounded independently; a header-less direct flood
-/// collapses onto the single fallback bucket and is bounded there.
+/// `x-forwarded-for`, then a stable fallback. Hosted origins reject direct
+/// traffic before this middleware, so only the configured edge path may supply
+/// these headers.
 #[must_use]
 pub fn client_ip(headers: &HeaderMap) -> IpAddr {
     if let Some(ip) = headers
