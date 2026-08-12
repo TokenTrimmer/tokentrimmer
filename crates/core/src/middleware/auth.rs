@@ -122,14 +122,20 @@ pub async fn middleware(
                 return Err(ApiError::Unauthorized);
             }
             let client_ip = crate::middleware::argon2_cap::client_ip(req.headers());
-            if let crate::middleware::argon2_cap::CapDecision::Reject { retry_after_secs } =
-                state.argon2_cap.check(client_ip)
-            {
-                tracing::debug!(
-                    ip = %client_ip,
-                    "auth: per-IP cap exceeded on sandbox (tt_test_) path, shedding"
-                );
-                return Ok(verify_cap_response(retry_after_secs));
+            match state.argon2_cap.check(client_ip).await {
+                crate::middleware::argon2_cap::CapDecision::Allow => {}
+                crate::middleware::argon2_cap::CapDecision::Reject { retry_after_secs } => {
+                    tracing::debug!(
+                        ip = %client_ip,
+                        "auth: per-IP cap exceeded on sandbox (tt_test_) path, shedding"
+                    );
+                    return Ok(verify_cap_response(retry_after_secs));
+                }
+                crate::middleware::argon2_cap::CapDecision::Unavailable => {
+                    return Err(ApiError::ServiceUnavailable(
+                        "authentication rate limiter unavailable".into(),
+                    ));
+                }
             }
             return Ok(next.run(req).await);
         }
@@ -200,14 +206,20 @@ pub async fn middleware(
                     // Cache hits (handled above) and non-`tt_live_*` traffic do
                     // not reach here, so authenticated traffic is never capped.
                     let client_ip = crate::middleware::argon2_cap::client_ip(req.headers());
-                    if let crate::middleware::argon2_cap::CapDecision::Reject { retry_after_secs } =
-                        state.argon2_cap.check(client_ip)
-                    {
-                        tracing::debug!(
-                            ip = %client_ip,
-                            "auth: per-IP argon2 verify cap exceeded, shedding pre-hash"
-                        );
-                        return Ok(verify_cap_response(retry_after_secs));
+                    match state.argon2_cap.check(client_ip).await {
+                        crate::middleware::argon2_cap::CapDecision::Allow => {}
+                        crate::middleware::argon2_cap::CapDecision::Reject { retry_after_secs } => {
+                            tracing::debug!(
+                                ip = %client_ip,
+                                "auth: per-IP argon2 verify cap exceeded, shedding pre-hash"
+                            );
+                            return Ok(verify_cap_response(retry_after_secs));
+                        }
+                        crate::middleware::argon2_cap::CapDecision::Unavailable => {
+                            return Err(ApiError::ServiceUnavailable(
+                                "authentication rate limiter unavailable".into(),
+                            ));
+                        }
                     }
 
                     // Under the cap: run the real argon2 verify.

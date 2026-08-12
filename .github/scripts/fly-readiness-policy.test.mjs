@@ -14,6 +14,16 @@ test('Fly gateway manifests route traffic on readiness rather than liveness', ()
   }
 });
 
+test('hosted gateways require the shared Redis abuse limiter', () => {
+  for (const manifest of ['fly.toml', 'fly.staging.toml']) {
+    assert.match(
+      read(manifest),
+      /TT_REQUIRE_SHARED_RATE_LIMIT\s*=\s*"true"/,
+      `${manifest} must fail boot instead of reverting to per-instance auth limits`,
+    );
+  }
+});
+
 test('runtime keeps readiness distinct from process liveness', () => {
   const router = read('crates/core/src/server.rs');
   const health = read('crates/core/src/routes/health.rs');

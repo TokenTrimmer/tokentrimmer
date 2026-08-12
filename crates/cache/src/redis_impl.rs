@@ -113,6 +113,13 @@ impl RedisL1Cache {
         })
     }
 
+    /// Clone the multiplexed connection manager for another atomic Redis
+    /// primitive in the same process. This reuses the existing socket pool.
+    #[must_use]
+    pub fn connection_manager(&self) -> redis::aio::ConnectionManager {
+        self.conn.clone()
+    }
+
     /// Enable at-rest encryption of L1 values (SEC-2). The per-org key is
     /// derived from the org parsed out of the (gateway-namespaced) L1 key. See
     /// the module docs. Default (un-wired) is plaintext, identical to today.
