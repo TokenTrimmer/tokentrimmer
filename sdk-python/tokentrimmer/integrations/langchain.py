@@ -9,10 +9,10 @@ recovers them on every LLM finish and:
    (:mod:`tokentrimmer.semconv`), so a LangSmith / Tempo / Grafana trace carries
    the same ``gen_ai.*`` / ``tokentrimmer.*`` cost attributes the gateway stamps
    on its own span; and
-2. accumulates a per-run cost / savings total, optionally enforcing a
-   ``max_cost_usd`` budget — a breach raises :class:`BudgetExceeded`, which (with
-   ``raise_error = True`` on this handler) propagates out of the chain as a
-   framework-level stop signal instead of silently overspending.
+2. accumulates a per-run cost / savings total and optionally checks a
+   ``post_response_budget_usd`` after each completed LLM call. A breach raises
+   :class:`BudgetExceeded` before the chain's next step; it cannot prevent or
+   refund the call whose response was just observed.
 
 How the callback gets the headers
 ----------------------------------
@@ -26,7 +26,7 @@ of which this callback reads in ``on_llm_end``. Wire it up like::
     from langchain_openai import ChatOpenAI
     from tokentrimmer.integrations.langchain import TokenTrimmerCostCallback
 
-    cb = TokenTrimmerCostCallback(max_cost_usd=0.50)
+    cb = TokenTrimmerCostCallback(post_response_budget_usd=0.50)
     llm = ChatOpenAI(
         model="claude-haiku-4-5",
         base_url="https://api.tokentrimmer.com/v1",
@@ -90,9 +90,11 @@ __all__ = [
 class TokenTrimmerCostCallback(BaseCallbackHandler):
     """A LangChain callback that records TokenTrimmer cost/savings on spans.
 
-    :param max_cost_usd: optional per-run budget (USD). When the accumulated
-        served cost across this handler's LLM calls exceeds it, ``on_llm_end``
-        raises :class:`BudgetExceeded`. ``None`` (default) disables the budget.
+    :param post_response_budget_usd: optional observed-cost budget (USD). After
+        each LLM response completes, ``on_llm_end`` raises
+        :class:`BudgetExceeded` if the accumulated served cost exceeds it. The
+        exception can stop the next chain step, not the completed call.
+        ``None`` (default) disables the check.
     :param record_spans: when ``True`` (default) the cost attributes are recorded
         onto the current OpenTelemetry span (if OpenTelemetry is installed and a
         span is recording). When OpenTelemetry is absent the callback still
@@ -112,12 +114,12 @@ class TokenTrimmerCostCallback(BaseCallbackHandler):
     def __init__(
         self,
         *,
-        max_cost_usd: Optional[float] = None,
+        post_response_budget_usd: Optional[float] = None,
         record_spans: bool = True,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__()
-        self.max_cost_usd = max_cost_usd
+        self.post_response_budget_usd = post_response_budget_usd
         self.record_spans = record_spans
         self._logger = logger or _logger
         #: Accumulated served cost (USD) across this handler's LLM calls.
@@ -144,8 +146,9 @@ class TokenTrimmerCostCallback(BaseCallbackHandler):
         Reads the ``x-tokentrimmer-*`` headers surfaced by
         ``include_response_headers=True`` (see the module docstring), parses them
         through the SDK's canonical :meth:`TokenTrimmerMeta.from_headers`, maps
-        them to OTel span attributes via :mod:`tokentrimmer.semconv`, and enforces
-        the optional budget. A response with no TokenTrimmer headers is a no-op.
+        them to OTel span attributes via :mod:`tokentrimmer.semconv`, and checks
+        the optional post-response budget. A response with no TokenTrimmer
+        headers is a no-op.
         """
         headers = _extract_tt_headers(response)
         if headers is None:
@@ -182,8 +185,13 @@ class TokenTrimmerCostCallback(BaseCallbackHandler):
             self.total_saved_usd,
         )
 
-        if self.max_cost_usd is not None and self.total_cost_usd > self.max_cost_usd:
-            raise BudgetExceeded(self.total_cost_usd, self.max_cost_usd)
+        if (
+            self.post_response_budget_usd is not None
+            and self.total_cost_usd > self.post_response_budget_usd
+        ):
+            raise BudgetExceeded(
+                self.total_cost_usd, self.post_response_budget_usd
+            )
 
 
 # --- helpers ----------------------------------------------------------------

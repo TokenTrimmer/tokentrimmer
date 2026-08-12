@@ -383,6 +383,14 @@ export interface TokenTrimmerChat extends Omit<OpenAI.Chat, 'completions'> {
 /** Terminal (or paused) status of a run, mirroring the Gateway's `RunStatus`. */
 export type RunStatus = 'completed' | 'incomplete' | 'failed' | 'requires_action';
 
+/** Known terminal causes; the string intersection keeps future server reasons usable. */
+export type RunStopReason =
+  | 'max_turns'
+  | 'budget_exhausted'
+  | 'budget_breach'
+  | 'runaway'
+  | (string & Record<never, never>);
+
 /**
  * Accumulated token usage + served cost across every turn of a run. `costUsd` is
  * the SUM of each turn's served cost — the agent-loop analogue of a chat
@@ -392,6 +400,10 @@ export interface RunUsage {
   promptTokens: number;
   completionTokens: number;
   costUsd: number;
+  /** Accumulated unoptimized comparison cost; null when the Gateway omits it. */
+  baselineCostUsd: number | null;
+  /** Served cost for each server-side turn, in order. */
+  perTurnCostUsd: number[];
 }
 
 /** One message in a run transcript (OpenAI chat shape; loosely typed). */
@@ -405,6 +417,13 @@ export interface RunMessage {
     function: { name: string; arguments: string };
   }>;
   [key: string]: unknown;
+}
+
+/** A client tool call awaiting output before a paused run can resume. */
+export interface PendingToolCall {
+  id: string;
+  type?: string;
+  function: { name: string; arguments: string };
 }
 
 /**
@@ -421,6 +440,8 @@ export interface Run {
   note?: string | null;
   /** Summarizer measurement tax (USD); never folded into `usage.costUsd`. */
   summarizerTaxUsd?: number | null;
+  /** Machine-readable terminal cause; null for normal completion or while paused. */
+  stopReason: RunStopReason | null;
 }
 
 /** The result of driving an agent run to a terminal state (or the resume cap). */
@@ -435,6 +456,12 @@ export interface AgentOutcome {
   messages: RunMessage[];
   /** The run's final answer text (last assistant string content), or `null`. */
   text: string | null;
+  /** Machine-readable terminal cause (`run.stopReason`). */
+  stopReason: RunStopReason | null;
+  /** Unanswered client tool calls when the returned run remains resumable. */
+  pendingToolCalls: PendingToolCall[];
+  /** Whether client tool outputs can resume the returned run. */
+  isResumable: boolean;
 }
 
 /**
@@ -458,6 +485,12 @@ export interface AgentRunParams {
   executor: AgentExecutor;
   /** Server-side per-run turn cap (Gateway clamps to `[1, 32]`); omit for default. */
   maxTurns?: number;
+  /**
+   * Server-enforced aggregate served-cost ceiling in USD. Before each turn, the
+   * Gateway stops with `budget_exhausted` if its estimate would cross the cap.
+   * An admitted turn can finish above it and report `budget_breach`.
+   */
+  maxCostUsd?: number;
   /** Client-side cap on resume round-trips before returning a still-paused run (default 8). */
   maxResumeRounds?: number;
   /** `X-TokenTrimmer-Tag` — forwarded on the create AND every resume request. */
@@ -470,9 +503,16 @@ interface RunWire {
   status?: string;
   messages?: RunMessage[];
   turns?: number;
-  usage?: { prompt_tokens?: number; completion_tokens?: number; cost_usd?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    cost_usd?: number;
+    baseline_cost_usd?: number | null;
+    per_turn_cost_usd?: number[];
+  };
   note?: string | null;
   summarizer_tax_usd?: number | null;
+  stop_reason?: string | null;
 }
 
 /** Resume (`tool_outputs`) round-trip cap, matching the Rust driver default. */
@@ -489,9 +529,12 @@ function parseRun(wire: RunWire): Run {
       promptTokens: num(u.prompt_tokens),
       completionTokens: num(u.completion_tokens),
       costUsd: num(u.cost_usd),
+      baselineCostUsd: u.baseline_cost_usd == null ? null : num(u.baseline_cost_usd),
+      perTurnCostUsd: (u.per_turn_cost_usd ?? []).map(num),
     },
     note: wire.note ?? null,
     summarizerTaxUsd: wire.summarizer_tax_usd ?? null,
+    stopReason: (wire.stop_reason ?? null) as RunStopReason | null,
   };
 }
 
@@ -504,19 +547,33 @@ function finalText(messages: RunMessage[]): string | null {
   return null;
 }
 
+/** Whether a run is paused and accepts client tool outputs. */
+export function isRunResumable(run: Pick<Run, 'status'>): boolean {
+  return run.status === 'requires_action';
+}
+
+/** Whether a run cannot accept further client tool outputs. */
+export function isRunTerminal(run: Pick<Run, 'status'>): boolean {
+  return !isRunResumable(run);
+}
+
 /**
  * The CLIENT tool calls a run is paused on: assistant `tool_calls` in the
  * transcript with NO answering `tool` message. The Gateway answers its own
  * (read-only gateway) tool calls inline before pausing, so the unanswered
  * remainder are exactly the client tools the caller must run.
  */
-function pendingToolCalls(messages: RunMessage[]) {
+export function pendingToolCalls(
+  run: Pick<Run, 'status' | 'messages'>,
+): PendingToolCall[] {
+  if (!isRunResumable(run)) return [];
+
   const answered = new Set<string>();
-  for (const m of messages) {
+  for (const m of run.messages) {
     if (m.role === 'tool' && typeof m.tool_call_id === 'string') answered.add(m.tool_call_id);
   }
-  const pending: Array<{ id: string; function: { name: string; arguments: string } }> = [];
-  for (const m of messages) {
+  const pending: PendingToolCall[] = [];
+  for (const m of run.messages) {
     if (m.role !== 'assistant' || !m.tool_calls) continue;
     for (const call of m.tool_calls) {
       if (!answered.has(call.id)) pending.push(call);
@@ -563,17 +620,17 @@ export class Agent {
    *   errors do NOT propagate — they are submitted back as the tool's output.
    */
   async run(params: AgentRunParams): Promise<AgentOutcome> {
-    const { model, messages, tools, executor, maxTurns, ttTag } = params;
+    const { model, messages, tools, executor, maxTurns, maxCostUsd, ttTag } = params;
     const maxResumeRounds = params.maxResumeRounds ?? DEFAULT_MAX_RESUME_ROUNDS;
     if (typeof model !== 'string' || model.trim() === '') {
       throw new Error('model must be a non-empty string');
     }
 
-    let run = await this.create(model, messages, tools, maxTurns, ttTag);
+    let run = await this.create(model, messages, tools, maxTurns, maxCostUsd, ttTag);
     let resumeRounds = 0;
 
-    while (run.status === 'requires_action' && resumeRounds < maxResumeRounds) {
-      const pending = pendingToolCalls(run.messages);
+    while (isRunResumable(run) && resumeRounds < maxResumeRounds) {
+      const pending = pendingToolCalls(run);
       // A `requires_action` run always has >=1 pending client tool; an empty
       // list would mean a server contract break. Stop rather than POST an empty
       // resume the Gateway would reject.
@@ -600,6 +657,9 @@ export class Agent {
       usage: run.usage,
       messages: run.messages,
       text: finalText(run.messages),
+      stopReason: run.stopReason,
+      pendingToolCalls: pendingToolCalls(run),
+      isResumable: isRunResumable(run),
     };
   }
 
@@ -608,11 +668,13 @@ export class Agent {
     messages: RunMessage[],
     tools: unknown[] | undefined,
     maxTurns: number | undefined,
+    maxCostUsd: number | undefined,
     ttTag: string | undefined,
   ): Promise<Run> {
     const body: Record<string, unknown> = { model, messages, stream: false };
     if (tools && tools.length > 0) body.tools = tools;
     if (maxTurns !== undefined) body.max_turns = maxTurns;
+    if (maxCostUsd !== undefined) body.max_cost_usd = maxCostUsd;
     return this.send('/agent/runs', body, ttTag);
   }
 
@@ -699,9 +761,9 @@ export class TokenTrimmer extends OpenAI {
       const headers = toHeaders(options.headers);
       if (ttTag !== undefined) headers.set('X-TokenTrimmer-Tag', ttTag);
       if (ttCostLimit !== undefined) {
-        if (!Number.isFinite(ttCostLimit) || ttCostLimit < 0) {
+        if (!Number.isFinite(ttCostLimit) || ttCostLimit <= 0) {
           throw new Error(
-            `ttCostLimit must be a non-negative finite number; got ${String(ttCostLimit)}`,
+            `ttCostLimit must be a positive finite number; got ${String(ttCostLimit)}`,
           );
         }
         headers.set('X-TokenTrimmer-Cost-Limit-Usd', String(ttCostLimit));

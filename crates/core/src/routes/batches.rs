@@ -36,15 +36,19 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tt_auth::ApiKeyContext;
 use tt_provider_openai::OpenAiProvider;
 use tt_shared::context::ProviderCredentials;
-use tt_shared::RequestContext;
+use tt_shared::{ProviderError, RequestContext};
 use uuid::Uuid;
 
 use crate::batch_store::{BatchJob, BatchStore};
+use crate::budget_reservation::{
+    derive_budget_dispatch, dispatch_state_for_idempotency, BudgetDispatchKind,
+    BudgetReservationError, BudgetReservationRequest, ReservationAdmission,
+};
 use crate::error::{ApiError, ApiResult};
 use crate::routes::chat::resolve_credentials;
 use crate::{AppState, DOGFOOD_ORG_ID};
@@ -117,6 +121,7 @@ async fn batch_ctx(
                 provider: BATCH_PROVIDER.to_string(),
             })?;
     Ok(RequestContext {
+        budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
         trace_id: Uuid::now_v7(),
         org_id,
         api_key_id,
@@ -214,11 +219,67 @@ pub async fn upload_file(
 
 // ── POST /v1/batches ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateBatchRequest {
     pub input_file_id: String,
     pub endpoint: String,
     pub completion_window: String,
+}
+
+async fn enforce_batch_budget(
+    state: &AppState,
+    org_id: Uuid,
+    api_key_id: Uuid,
+    headers: &HeaderMap,
+    req: &CreateBatchRequest,
+) -> ApiResult<()> {
+    let idempotency_key =
+        super::idempotency_key_from_headers(headers)?.unwrap_or_else(|| Uuid::now_v7().to_string());
+    let Some(store) = state.budget_reservation_store.as_ref() else {
+        return Ok(());
+    };
+    let dispatch_state = dispatch_state_for_idempotency(org_id, api_key_id, &idempotency_key);
+    let canonical =
+        serde_json::to_string(req).map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
+    let dispatch = derive_budget_dispatch(
+        &dispatch_state,
+        BATCH_PROVIDER,
+        BudgetDispatchKind::Batch,
+        "batch",
+        &canonical,
+    );
+    match store
+        .reserve(BudgetReservationRequest {
+            org_id,
+            api_key_id,
+            trace_id: Uuid::now_v7(),
+            dispatch,
+            model: "batch input file",
+            estimated_usd: None,
+            now: chrono::Utc::now(),
+        })
+        .await
+    {
+        Ok(ReservationAdmission::NotCapped) => Ok(()),
+        Ok(ReservationAdmission::Reserved(_)) => Err(ApiError::ServiceUnavailable(
+            "batch budget admission produced an unpriced reservation".into(),
+        )),
+        Err(BudgetReservationError::Exceeded {
+            estimated_usd,
+            remaining_usd,
+        }) => Err(ApiError::Provider(ProviderError::BudgetExceeded {
+            estimated_usd,
+            remaining_usd,
+        })),
+        Err(BudgetReservationError::PriceUnknown { model }) => {
+            Err(ApiError::Provider(ProviderError::BudgetPriceUnknown {
+                model,
+            }))
+        }
+        Err(BudgetReservationError::Unavailable(message)) => Err(ApiError::Provider(
+            ProviderError::BudgetUnavailable(message),
+        )),
+    }
 }
 
 /// `POST /v1/batches` — create the batch upstream via `create_batch`, persist an
@@ -232,6 +293,7 @@ pub async fn create_batch(
     let (org_id, api_key_id) = require_org(ctx)?;
     let provider = openai(&state)?;
     let store = store(&state)?.clone();
+    enforce_batch_budget(&state, org_id, api_key_id, &headers, &req).await?;
     let request_ctx = batch_ctx(&state, org_id, api_key_id, &headers).await?;
 
     let batch = provider

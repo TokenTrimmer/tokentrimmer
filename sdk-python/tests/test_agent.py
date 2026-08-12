@@ -7,7 +7,8 @@ terminal-on-first-response test. The gateway HTTP layer is mocked with respx so
 no network is used (and the SDK's own httpx client is exercised end to end).
 
 Endpoint shape (docs + crates/client/src/agent.rs):
-- ``POST /v1/agent/runs`` with ``{ model, messages, tools?, max_turns?, stream }``.
+- ``POST /v1/agent/runs`` with
+  ``{ model, messages, tools?, max_turns?, max_cost_usd?, stream }``.
 - Resume: ``POST /v1/agent/runs/{id}/tool_outputs`` with
   ``{ tool_outputs: [{ tool_call_id, output }] }``.
 - Transcript: ``GET|DELETE /v1/agent/runs/{id}/transcript``.
@@ -153,6 +154,10 @@ def test_run_executes_client_tool_then_resumes_to_completion():
     assert out.text == "All done."
     # Aggregate cost is read from the terminal run body, not headers.
     assert out.usage.cost_usd == pytest.approx(0.0005)
+    assert out.stop_reason is None
+    assert out.pending_tool_calls == []
+    assert not out.is_resumable
+    assert out.run.is_terminal
     assert out.usage.prompt_tokens == 22
     # The resume body carries the tool output keyed by the pending call id.
     body = json.loads(resume.calls.last.request.content)
@@ -217,6 +222,9 @@ def test_run_stops_at_resume_cap_when_run_keeps_pausing():
     )
     assert out.resume_rounds == 2
     assert out.run.status == "requires_action"
+    assert out.is_resumable
+    assert not out.run.is_terminal
+    assert len(out.pending_tool_calls) == 1
     assert resume.call_count == 2
 
 
@@ -250,32 +258,45 @@ def test_run_feeds_executor_error_back_as_tool_output():
 
 
 @respx.mock
-def test_run_forwards_tag_and_max_turns():
+def test_run_forwards_tag_turn_cap_and_cost_cap_and_exposes_budget_stop():
     route = respx.post(RUNS).mock(
         return_value=httpx.Response(
             200,
             json={
                 "id": "z",
-                "status": "completed",
+                "status": "incomplete",
                 "turns": 1,
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost_usd": 0.0},
-                "messages": [{"role": "assistant", "content": "ok"}],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "cost_usd": 0.0008,
+                    "baseline_cost_usd": 0.0012,
+                    "per_turn_cost_usd": [0.0008],
+                },
+                "messages": [{"role": "assistant", "content": "partial"}],
+                "stop_reason": "budget_exhausted",
             },
         )
     )
-    _client().agent.run(
+    out = _client().agent.run(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": "hi"}],
         executor=lambda name, args: "x",
         max_turns=4,
+        max_cost_usd=0.001,
         tt_tag="proj-x",
     )
     req = route.calls.last.request
     assert req.headers["x-tokentrimmer-tag"] == "proj-x"
     body = json.loads(req.content)
     assert body["max_turns"] == 4
+    assert body["max_cost_usd"] == pytest.approx(0.001)
     assert body["model"] == "gpt-4o-mini"
     assert body["stream"] is False
+    assert out.stop_reason == "budget_exhausted"
+    assert out.run.is_terminal
+    assert out.usage.baseline_cost_usd == pytest.approx(0.0012)
+    assert out.usage.per_turn_cost_usd == pytest.approx([0.0008])
 
 
 def test_run_without_model_raises_before_any_request():

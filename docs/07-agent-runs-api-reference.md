@@ -63,7 +63,8 @@ Carried on the `Run`/terminal events when the loop stopped short of `completed`:
 | `stop_reason` | Meaning |
 |---|---|
 | `max_turns` | The loop hit `max_turns` (clamped `[1, 32]`). |
-| `budget_exhausted` | The run's accumulated served cost reached `max_cost_usd`. |
+| `budget_exhausted` | The next turn was not admitted because accrued cost plus the best-effort estimate would exceed `max_cost_usd` (or accrued cost had reached the cap when no estimate was available). |
+| `budget_breach` | An admitted provider turn settled above `max_cost_usd`; the run terminates immediately with actual cost preserved, never clamped. |
 | `runaway` | The loop made no progress — `RUNAWAY_REPEAT_THRESHOLD` consecutive byte-identical (tool-call + tool-result) steps. The model saw the same result and re-issued the same call with no new information; left alone it would burn the budget turn after turn (the *fastest* way an agent loop leaks money — it trips well before a static cost cap). |
 
 ## SSE events (when `stream: true`)
@@ -80,7 +81,7 @@ Named typed SSE frames; the event name is the frame discriminant. The
 | `run.requires_action` | `pending_tool_calls` | A client (non-gateway) tool was called; the run paused (`requires_action`). Resume via `POST /v1/agent/runs/:id/tool_outputs`. |
 | `run.completed` | final `Run` | Terminal: `completed`. |
 | `run.failed` | final `Run` | Terminal: `failed`. |
-| `run.incomplete` | final `Run` (with `stop_reason`) | Terminal: `incomplete` (carries which `stop_reason` — `max_turns` / `budget_exhausted` / `runaway`). |
+| `run.incomplete` | final `Run` (with `stop_reason`) | Terminal: `incomplete` (carries `max_turns`, `budget_exhausted`, `budget_breach`, or `runaway`). |
 
 ## Cost accounting + receipts
 

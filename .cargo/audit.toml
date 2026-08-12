@@ -3,5 +3,6 @@
 # cargo-audit reports rsa even though the workspace enables Postgres only and
 # cargo-deny confirms sqlx-mysql is absent from the compiled feature graph.
 # RustSec has no patched rsa release. Remove this exception when SQLx no longer
-# resolves that backend or RustCrypto publishes a fix. Re-check 2026-09-15.
+# resolves that backend or RustCrypto publishes a fix. Owner:
+# Security/Dependencies. Re-check 2026-09-15.
 ignore = ["RUSTSEC-2023-0071"]

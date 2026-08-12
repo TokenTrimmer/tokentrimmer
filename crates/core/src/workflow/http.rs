@@ -434,9 +434,8 @@ pub(crate) async fn run_document_fetch(url: &str) -> Result<FetchedDocument, Htt
 
     // ---- 6. Media-set gate (fail closed) before consuming the body. ---------
     let observed = content_type.clone().unwrap_or_else(|| "<none>".to_string());
-    let media_type = resolve_document_media_type(&content_type, url).ok_or_else(|| {
-        HttpError::UnsupportedMediaType(observed.clone())
-    })?;
+    let media_type = resolve_document_media_type(&content_type, url)
+        .ok_or_else(|| HttpError::UnsupportedMediaType(observed.clone()))?;
 
     // ---- 7. Stream body up to the shared byte cap (never trust the header).--
     let mut stream = response.bytes_stream();
@@ -476,10 +475,7 @@ pub(crate) async fn run_document_fetch(url: &str) -> Result<FetchedDocument, Htt
 /// header) falls back to the URL path extension — the same extension table
 /// the gateway's document tooling uses. Returning `None` means the fetched
 /// payload is not a supported document and the caller must fail closed.
-fn resolve_document_media_type(
-    content_type: &Option<String>,
-    url: &str,
-) -> Option<String> {
+fn resolve_document_media_type(content_type: &Option<String>, url: &str) -> Option<String> {
     match content_type {
         Some(base) if !is_generic_document_content_type(base) => canonical_document_media(base),
         _ => media_type_from_url_extension(url),
@@ -489,7 +485,10 @@ fn resolve_document_media_type(
 /// `true` for the generic binary markers that carry no usable type information,
 /// forcing a fall back to the URL path extension.
 fn is_generic_document_content_type(base: &str) -> bool {
-    matches!(base, "" | "application/octet-stream" | "binary/octet-stream")
+    matches!(
+        base,
+        "" | "application/octet-stream" | "binary/octet-stream"
+    )
 }
 
 /// Normalize a Content-Type to a supported canonical member
@@ -1016,16 +1015,19 @@ mod tests {
 
     #[test]
     fn media_from_url_extension_unknown_or_missing() {
-        assert_eq!(media_type_from_url_extension("https://example.com/doc"), None);
-        assert_eq!(media_type_from_url_extension("https://example.com/doc.exe"), None);
+        assert_eq!(
+            media_type_from_url_extension("https://example.com/doc"),
+            None
+        );
+        assert_eq!(
+            media_type_from_url_extension("https://example.com/doc.exe"),
+            None
+        );
         assert_eq!(
             media_type_from_url_extension("https://example.com/noext?fmt=pdf"),
             None
         );
-        assert_eq!(
-            media_type_from_url_extension("https://example.com/"),
-            None
-        );
+        assert_eq!(media_type_from_url_extension("https://example.com/"), None);
     }
 
     // ---- resolve_document_media_type (Content-Type precedence) --------------

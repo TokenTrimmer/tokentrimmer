@@ -266,6 +266,69 @@ fn migrator_includes_route_version_request_provenance() {
 }
 
 #[test]
+fn migrator_includes_durable_budget_reservation_ledger() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_ninth = migrations
+        .iter()
+        .find(|m| m.version == 49)
+        .expect("migration version 49 not found");
+    let desc = forty_ninth.description.to_lowercase();
+    assert!(
+        desc.contains("budget") && desc.contains("reservation"),
+        "migration 0049 description is '{}', expected to mention budget reservations",
+        forty_ninth.description,
+    );
+
+    let up = include_str!("../migrations/0049_budget_reservations.up.sql");
+    for required in [
+        "gateway_budget_scope_months",
+        "gateway_budget_reservations",
+        "gateway_budget_adjustments",
+        "lease_expires_at",
+        "late_settlement_adjustment",
+        "gateway_budget_reservations_active_scope",
+        "gateway_budget_reservations_active_key_scope",
+    ] {
+        assert!(
+            up.contains(required),
+            "durable budget migration must contain {required}"
+        );
+    }
+}
+
+#[test]
+fn migrator_includes_budget_dispatch_identity_and_settlement_provenance() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let fiftieth = migrations
+        .iter()
+        .find(|migration| migration.version == 50)
+        .expect("migration version 50 not found");
+    let description = fiftieth.description.to_lowercase();
+    assert!(
+        description.contains("budget") && description.contains("dispatch"),
+        "migration 0050 description is '{}', expected budget dispatch provenance",
+        fiftieth.description,
+    );
+
+    let up = include_str!("../migrations/0050_budget_dispatch_provenance.up.sql");
+    for required in [
+        "dispatch_key BYTEA",
+        "provider TEXT",
+        "dispatch_kind TEXT",
+        "settlement_basis TEXT",
+        "settlement_observed_at TIMESTAMPTZ",
+        "gateway_budget_reservations_dispatch_key_unique",
+        "conservative_estimate",
+        "lease_expiry",
+    ] {
+        assert!(
+            up.contains(required),
+            "budget dispatch provenance migration must contain {required}"
+        );
+    }
+}
+
+#[test]
 fn migrator_includes_requested_model_snapshot_provenance() {
     let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
     let forty_second = migrations

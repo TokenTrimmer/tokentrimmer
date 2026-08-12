@@ -456,8 +456,8 @@ pub enum Error {
     /// (`0x80..=0xFF`, e.g. non-ASCII UTF-8) pass through as opaque octets.
     #[error("invalid tag (not a valid HTTP header value): {0:?}")]
     InvalidTag(String),
-    /// The cost limit is not a finite number (NaN / infinity).
-    #[error("invalid cost limit (must be a finite number): {0}")]
+    /// The cost limit is not a finite, positive number.
+    #[error("invalid cost limit (must be a finite number greater than zero): {0}")]
     InvalidCostLimit(f64),
 }
 
@@ -466,9 +466,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Attach the optional `X-TokenTrimmer-Tag` + `X-TokenTrimmer-Cost-Limit-Usd`
 /// headers, validating both. Rejects a tag that isn't a legal HTTP header value
-/// (control chars/CR/LF/DEL; high bytes pass as opaque octets) and a non-finite
-/// cost limit — surfaced at send time, before any network I/O. A finite negative
-/// cost limit is sent as-is; the gateway rejects it with 402.
+/// (control chars/CR/LF/DEL; high bytes pass as opaque octets) and rejects a
+/// non-finite, zero, or negative cost limit before any network I/O.
 ///
 /// When `interactive` is true, also attach `X-TokenTrimmer-Interactive: 1`
 /// (static value, no validation needed) — declaring that a human is waiting on
@@ -486,7 +485,7 @@ pub(crate) fn apply_tt_headers(
         req = req.header("X-TokenTrimmer-Tag", value);
     }
     if let Some(limit) = cost_limit {
-        if !limit.is_finite() {
+        if !limit.is_finite() || limit <= 0.0 {
             return Err(Error::InvalidCostLimit(limit));
         }
         req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
@@ -1795,6 +1794,11 @@ mod tests {
         let inf =
             super::apply_tt_headers(http.get(url), None, Some(f64::INFINITY), false).unwrap_err();
         assert!(matches!(inf, Error::InvalidCostLimit(_)), "{inf:?}");
+        for non_positive in [0.0, -1.0] {
+            let error = super::apply_tt_headers(http.get(url), None, Some(non_positive), false)
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidCostLimit(_)), "{error:?}");
+        }
     }
 
     #[tokio::test]

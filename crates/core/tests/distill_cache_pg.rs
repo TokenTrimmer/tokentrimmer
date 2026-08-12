@@ -26,17 +26,21 @@ use uuid::Uuid;
 /// conflict arbiter separate from the table: PostgreSQL does not allow an
 /// expression such as `COALESCE(caller_key, '')` in a primary-key constraint.
 const CREATE_CACHE_TABLE: &str = "CREATE TABLE IF NOT EXISTS public.flow_doc_distill_cache (
-    org_id         UUID        NOT NULL,
-    content_hash   TEXT        NOT NULL,
-    caller_key     TEXT,
-    distilled_text TEXT        NOT NULL,
-    pages          INTEGER     NOT NULL DEFAULT 0,
-    engine         TEXT        NOT NULL,
-    distilled_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    org_id            UUID        NOT NULL,
+    content_hash      TEXT        NOT NULL,
+    caller_key        TEXT,
+    media_type        TEXT        NOT NULL,
+    extractor_revision TEXT       NOT NULL,
+    policy_revision   TEXT        NOT NULL,
+    distilled_text    TEXT        NOT NULL,
+    pages             INTEGER     NOT NULL DEFAULT 0,
+    engine            TEXT        NOT NULL,
+    distilled_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 )";
 const CREATE_CACHE_KEY_IDX: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS flow_doc_distill_cache_key_uq \
-     ON public.flow_doc_distill_cache (org_id, content_hash, COALESCE(caller_key, ''))";
+     ON public.flow_doc_distill_cache (org_id, content_hash, COALESCE(caller_key, ''), \
+     media_type, extractor_revision, policy_revision)";
 const CREATE_EXPIRY_IDX: &str = "CREATE INDEX IF NOT EXISTS flow_doc_distill_cache_expiry_idx \
      ON public.flow_doc_distill_cache (distilled_at)";
 
@@ -75,10 +79,12 @@ async fn pool() -> sqlx::PgPool {
 }
 
 fn key(content_hash: &str) -> DistillCacheKey {
-    DistillCacheKey {
-        content_hash: content_hash.to_string(),
-        caller_key: None,
-    }
+    DistillCacheKey::new(
+        content_hash.to_string(),
+        None,
+        "application/pdf",
+        "sidecar-test",
+    )
 }
 
 fn doc(text: &str) -> CachedDistill {
@@ -160,14 +166,18 @@ async fn caller_key_partitions_the_cache() {
         pool: &pool,
     };
     // Same content hash + different caller_key → different cache slots.
-    let k1 = DistillCacheKey {
-        content_hash: "h".into(),
-        caller_key: Some("flow-A".into()),
-    };
-    let k2 = DistillCacheKey {
-        content_hash: "h".into(),
-        caller_key: Some("flow-B".into()),
-    };
+    let k1 = DistillCacheKey::new(
+        "h".into(),
+        Some("flow-A".into()),
+        "application/pdf",
+        "sidecar-test",
+    );
+    let k2 = DistillCacheKey::new(
+        "h".into(),
+        Some("flow-B".into()),
+        "application/pdf",
+        "sidecar-test",
+    );
     cache.upsert(&k1, &doc("from-A")).await;
     cache.upsert(&k2, &doc("from-B")).await;
     assert_eq!(cache.get(&k1).await.unwrap().text, "from-A");
@@ -202,14 +212,18 @@ async fn null_and_empty_caller_key_share_the_same_cache_slot() {
         org_id: org,
         pool: &pool,
     };
-    let no_key = DistillCacheKey {
-        content_hash: "null-empty-conflict".into(),
-        caller_key: None,
-    };
-    let empty_key = DistillCacheKey {
-        content_hash: "null-empty-conflict".into(),
-        caller_key: Some(String::new()),
-    };
+    let no_key = DistillCacheKey::new(
+        "null-empty-conflict".into(),
+        None,
+        "application/pdf",
+        "sidecar-test",
+    );
+    let empty_key = DistillCacheKey::new(
+        "null-empty-conflict".into(),
+        Some(String::new()),
+        "application/pdf",
+        "sidecar-test",
+    );
 
     cache.upsert(&no_key, &doc("first")).await;
     cache.upsert(&empty_key, &doc("second")).await;
@@ -226,4 +240,43 @@ async fn null_and_empty_caller_key_share_the_same_cache_slot() {
     .await
     .unwrap();
     assert_eq!(count, 1, "NULL and empty caller keys share one cache row");
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn media_extractor_and_policy_revisions_partition_the_cache() {
+    let pool = pool().await;
+    let cache = FlowDocDistillCache {
+        org_id: Uuid::new_v4(),
+        pool: &pool,
+    };
+    let pdf_v1 = DistillCacheKey::new(
+        "same-decoded-bytes".into(),
+        None,
+        "application/pdf",
+        "sidecar-v1",
+    );
+    let image_v1 =
+        DistillCacheKey::new("same-decoded-bytes".into(), None, "image/png", "sidecar-v1");
+    let pdf_v2 = DistillCacheKey::new(
+        "same-decoded-bytes".into(),
+        None,
+        "application/pdf",
+        "sidecar-v2",
+    );
+    let mut future_policy = pdf_v1.clone();
+    future_policy.policy_revision = "workflow-document-cache-future".into();
+
+    cache.upsert(&pdf_v1, &doc("pdf-v1")).await;
+    cache.upsert(&image_v1, &doc("image-v1")).await;
+    cache.upsert(&pdf_v2, &doc("pdf-v2")).await;
+    cache.upsert(&future_policy, &doc("future-policy")).await;
+
+    assert_eq!(cache.get(&pdf_v1).await.unwrap().text, "pdf-v1");
+    assert_eq!(cache.get(&image_v1).await.unwrap().text, "image-v1");
+    assert_eq!(cache.get(&pdf_v2).await.unwrap().text, "pdf-v2");
+    assert_eq!(
+        cache.get(&future_policy).await.unwrap().text,
+        "future-policy"
+    );
 }

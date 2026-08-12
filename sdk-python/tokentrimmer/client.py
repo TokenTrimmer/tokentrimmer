@@ -298,9 +298,9 @@ class TokenTrimmer(OpenAI):
             tt_cost_limit = kwargs.pop("tt_cost_limit", None)
             if tt_cost_limit is not None:
                 limit = float(tt_cost_limit)
-                if not math.isfinite(limit) or limit < 0:
+                if not math.isfinite(limit) or limit <= 0:
                     raise ValueError(
-                        f"tt_cost_limit must be a non-negative finite number; got {tt_cost_limit!r}"
+                        f"tt_cost_limit must be a positive finite number; got {tt_cost_limit!r}"
                     )
                 extra_headers["X-TokenTrimmer-Cost-Limit-Usd"] = str(limit)
             tt_cache = kwargs.pop("tt_cache", None)

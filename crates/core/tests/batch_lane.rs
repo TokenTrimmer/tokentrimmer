@@ -18,10 +18,15 @@
 //!     `FileObject` (`id, object, bytes, created_at, filename, purpose, status`);
 //!   * `GET /v1/files/{id}/content` proxies the result/error JSONL bytes.
 
-use std::sync::Arc;
+use async_trait::async_trait;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use chrono::{DateTime, Utc};
 use httpmock::prelude::*;
 use serde_json::{json, Value};
 use tower::util::ServiceExt;
@@ -30,7 +35,11 @@ use tt_auth::{
     keys::{issue, Environment},
     InMemoryKeyStore, InMemoryProviderCredentialStore, KeyStore, ProviderCredentialStore,
 };
-use tt_core::{build_router, AppState, InMemoryBatchStore, ProviderRegistry};
+use tt_core::{
+    build_router, AppState, BudgetReservation, BudgetReservationError, BudgetReservationRequest,
+    BudgetReservationStore, InMemoryBatchStore, ProviderRegistry, ReservationAdmission,
+    SettlementBasis,
+};
 use tt_provider_openai::{ClientConfig, OpenAiProvider};
 use tt_shared::context::{ProviderCredentials, SecretString};
 use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
@@ -53,9 +62,49 @@ struct Harness {
     other_key: String,
 }
 
+struct RejectUnpricedBudget {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl BudgetReservationStore for RejectUnpricedBudget {
+    async fn reserve(
+        &self,
+        request: BudgetReservationRequest<'_>,
+    ) -> Result<ReservationAdmission, BudgetReservationError> {
+        let BudgetReservationRequest {
+            model,
+            estimated_usd,
+            ..
+        } = request;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        assert!(estimated_usd.is_none());
+        Err(BudgetReservationError::PriceUnknown {
+            model: model.to_string(),
+        })
+    }
+
+    async fn settle(
+        &self,
+        _reservation: BudgetReservation,
+        _actual_usd: f64,
+        _basis: SettlementBasis,
+        _now: DateTime<Utc>,
+    ) -> Result<(), BudgetReservationError> {
+        panic!("an unpriced batch must never create a reservation")
+    }
+}
+
 /// Build the gateway app wired for the Batch Lane, with the upstream OpenAI
 /// base_url pointed at `mock_base_url` for `org`'s `openai` credential.
 async fn harness(mock_base_url: &str) -> Harness {
+    harness_with_budget(mock_base_url, None).await
+}
+
+async fn harness_with_budget(
+    mock_base_url: &str,
+    budget: Option<Arc<dyn BudgetReservationStore>>,
+) -> Harness {
     let mut registry = ProviderRegistry::new();
     // Concrete OpenAI adapter (allow_local → bypass the SSRF guard for the local
     // mock). `register_openai` registers the dispatch clone AND the concrete
@@ -89,12 +138,14 @@ async fn harness(mock_base_url: &str) -> Harness {
 
     let batch_store = Arc::new(InMemoryBatchStore::new());
 
-    let app = build_router(
-        AppState::new(registry)
-            .with_key_store(key_store)
-            .with_credential_store(cred_store)
-            .with_batch_store(batch_store),
-    );
+    let mut state = AppState::new(registry)
+        .with_key_store(key_store)
+        .with_credential_store(cred_store)
+        .with_batch_store(batch_store);
+    if let Some(budget) = budget {
+        state = state.with_budget_reservation_store(budget);
+    }
+    let app = build_router(state);
     Harness {
         app,
         key,
@@ -163,6 +214,45 @@ async fn unauthenticated_create_batch_is_401() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn capped_unpriceable_batch_fails_before_upstream_dispatch() {
+    let server = MockServer::start();
+    let create_mock = server.mock(|when, then| {
+        when.method(POST).path("/batches");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(batch_body("batch_must_not_run", "validating", false));
+    });
+    let budget = Arc::new(RejectUnpricedBudget {
+        calls: AtomicUsize::new(0),
+    });
+    let h = harness_with_budget(
+        &server.base_url(),
+        Some(Arc::clone(&budget) as Arc<dyn BudgetReservationStore>),
+    )
+    .await;
+
+    let response = h
+        .app
+        .oneshot(req(
+            "POST",
+            "/v1/batches",
+            Some(&h.key),
+            Some(json!({
+                "input_file_id": "file-input123",
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["code"], "price_unknown");
+    assert_eq!(budget.calls.load(Ordering::Relaxed), 1);
+    create_mock.assert_calls(0);
 }
 
 #[tokio::test]

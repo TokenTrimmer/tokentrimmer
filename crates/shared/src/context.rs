@@ -2,7 +2,11 @@
 //! through the request lifecycle. Adapters are stateless — every call gets a
 //! fresh context.
 
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use uuid::Uuid;
 
@@ -44,12 +48,71 @@ impl CallerTier {
         }
     }
 }
+/// Request-scoped state for deterministic provider-dispatch admission.
+///
+/// The seed is random by default and can instead be derived one-way from a
+/// caller idempotency key. Clones share per-fingerprint attempt counters, so
+/// retries of the same provider request get distinct, deterministic ordinals
+/// while a replay of the whole request starts from the same seed and ordinals.
+#[derive(Clone)]
+pub struct BudgetDispatchState {
+    seed: [u8; 32],
+    attempts: Arc<Mutex<HashMap<[u8; 32], u32>>>,
+}
+
+impl BudgetDispatchState {
+    #[must_use]
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self {
+            seed,
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[must_use]
+    pub fn seed(&self) -> &[u8; 32] {
+        &self.seed
+    }
+
+    /// Return the next zero-based attempt ordinal for one dispatch fingerprint.
+    #[must_use]
+    pub fn next_attempt(&self, fingerprint: [u8; 32]) -> u32 {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = attempts.entry(fingerprint).or_insert(0);
+        let ordinal = *next;
+        *next = next.saturating_add(1);
+        ordinal
+    }
+}
+
+impl Default for BudgetDispatchState {
+    fn default() -> Self {
+        let mut seed = [0_u8; 32];
+        seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+        Self::from_seed(seed)
+    }
+}
+
+impl std::fmt::Debug for BudgetDispatchState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BudgetDispatchState([redacted])")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub trace_id: Uuid,
     pub org_id: Uuid,
     pub api_key_id: Uuid,
+    /// One-way, request-stable state for durable provider-dispatch admission.
+    /// HTTP entry points derive its seed from a caller idempotency key; all
+    /// other callers use an unguessable request-local seed. Raw keys are never
+    /// stored.
+    pub budget_dispatch: BudgetDispatchState,
     pub credentials: ProviderCredentials,
     /// Free-form cost-attribution tag from `X-TokenTrimmer-Tag` header.
     pub tag: Option<String>,
@@ -99,6 +162,7 @@ mod tests {
     fn request_context_has_run_id_node_id_fields() {
         // construction itself is the gate; this asserts the fields exist + accept Option<Uuid>
         let ctx = RequestContext {
+            budget_dispatch: BudgetDispatchState::default(),
             trace_id: Uuid::nil(),
             org_id: Uuid::nil(),
             api_key_id: Uuid::nil(),

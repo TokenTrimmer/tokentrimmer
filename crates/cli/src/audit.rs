@@ -220,9 +220,7 @@ fn build_merkle_proof_json(
     merkle_index: Option<u64>,
 ) -> anyhow::Result<serde_json::Value> {
     if entries.is_empty() {
-        anyhow::bail!(
-            "--merkle requires at least one verified entry; the chain file has none"
-        );
+        anyhow::bail!("--merkle requires at least one verified entry; the chain file has none");
     }
     let chain_id = match org {
         Some(o) => o.to_string(),
@@ -254,8 +252,7 @@ fn build_merkle_proof_json(
 
     // Guards against any inconsistency in the builder itself before we print.
     let selected_leaf =
-        tt_telemetry::audit::merkle::leaf_from_hex(&selected.hash)
-            .expect("hash decoded above");
+        tt_telemetry::audit::merkle::leaf_from_hex(&selected.hash).expect("hash decoded above");
     tt_telemetry::audit::merkle::verify_inclusion(&proof, &selected_leaf, &proof.root)
         .map_err(|e| anyhow::anyhow!("internal merkle self-check failed: {e}"))?;
 
@@ -590,8 +587,10 @@ mod merkle_proof_tests {
 
         let proof = proof_from_json(&json);
         let leaf = tt_telemetry::audit::merkle::leaf_from_hex(&entries[2].hash).unwrap();
-        let root: [u8; 32] =
-            hex::decode(json["root"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let root: [u8; 32] = hex::decode(json["root"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         assert!(tt_telemetry::audit::merkle::verify_inclusion(&proof, &leaf, &root).is_ok());
 
         // A different leaf must NOT verify against this proof.
@@ -611,7 +610,10 @@ mod merkle_proof_tests {
 
     #[test]
     fn merkle_proof_empty_chain_is_error() {
-        expect_error(build_merkle_proof_json(&[], None, None), "at least one verified entry");
+        expect_error(
+            build_merkle_proof_json(&[], None, None),
+            "at least one verified entry",
+        );
     }
 
     #[test]
@@ -623,8 +625,7 @@ mod merkle_proof_tests {
         let p = path.to_str().unwrap().to_string();
 
         // --merkle (tip proof) and --merkle-index both succeed.
-        run_audit_verify(Some(&p), None, None, None, None, true, None)
-            .expect("--merkle verify ok");
+        run_audit_verify(Some(&p), None, None, None, None, true, None).expect("--merkle verify ok");
         run_audit_verify(Some(&p), None, None, None, None, false, Some(1))
             .expect("--merkle-index implies merkle");
     }
@@ -707,8 +708,8 @@ fn load_customer_signing_key(path: &str) -> anyhow::Result<ed25519_dalek::Signin
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path)
-            .map_err(|e| anyhow::anyhow!("customer seed {path}: {e}"))?;
+        let meta =
+            std::fs::metadata(path).map_err(|e| anyhow::anyhow!("customer seed {path}: {e}"))?;
         let mode = meta.permissions().mode();
         if mode & 0o777 != 0o600 {
             anyhow::bail!(
@@ -760,13 +761,19 @@ pub(crate) fn run_audit_create_checkpoint(
     let chain_path_str = chain.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
     let chain_path = Path::new(chain_path_str);
     if !chain_path.exists() {
-        anyhow::bail!("checkpoint FAILED: chain file {} does not exist", chain_path.display());
+        anyhow::bail!(
+            "checkpoint FAILED: chain file {} does not exist",
+            chain_path.display()
+        );
     }
     let content = std::fs::read_to_string(chain_path)
         .map_err(|e| anyhow::anyhow!("failed to read reach chain {}: {e}", chain_path.display()))?;
     let parsed = parse_chain_jsonl(&content)?;
     if parsed.entries.is_empty() {
-        anyhow::bail!("checkpoint FAILED: chain {} has no entries to co-sign", chain_path.display());
+        anyhow::bail!(
+            "checkpoint FAILED: chain {} has no entries to co-sign",
+            chain_path.display()
+        );
     }
     let tip = parsed.entries.last().expect("non-empty");
     let tip_hash = tip.hash.trim().to_lowercase();
@@ -791,7 +798,8 @@ pub(crate) fn run_audit_create_checkpoint(
     };
 
     let customer = load_customer_signing_key(customer_key)?;
-    let identity = tt_telemetry::audit::checkpoint::customer_key_identity(&customer.verifying_key());
+    let identity =
+        tt_telemetry::audit::checkpoint::customer_key_identity(&customer.verifying_key());
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let payload = tt_telemetry::audit::checkpoint::CheckpointPayload {
         org: org.trim().to_lowercase(),
@@ -807,10 +815,7 @@ pub(crate) fn run_audit_create_checkpoint(
     let output_path = output
         .map(str::to_string)
         .unwrap_or_else(|| "customer-audit-checkpoint.v1.json".to_string());
-    write_create_only(
-        &output_path,
-        &serde_json::to_string_pretty(&artifact)?,
-    )?;
+    write_create_only(&output_path, &serde_json::to_string_pretty(&artifact)?)?;
     tt_cli::ui::note(&format!(
         "wrote customer checkpoint {} (org={}, seq={})",
         output_path, payload.org, payload.sequence
@@ -828,9 +833,9 @@ pub(crate) fn run_audit_verify_checkpoint(
 ) -> anyhow::Result<()> {
     let checkpoint_value: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(checkpoint_path)
-            .map_err(|e| anyhow::anyhow!("failed to read checkpoint {}: {e}", checkpoint_path))?,
+            .map_err(|e| anyhow::anyhow!("failed to read checkpoint {checkpoint_path}: {e}"))?,
     )
-    .map_err(|e| anyhow::anyhow!("checkpoint {} is not valid JSON: {e}", checkpoint_path))?;
+    .map_err(|e| anyhow::anyhow!("checkpoint {checkpoint_path} is not valid JSON: {e}"))?;
 
     let customer_hex = if let Some(hex) = customer_key_hex_inline {
         hex.trim().to_string()
@@ -847,17 +852,23 @@ pub(crate) fn run_audit_verify_checkpoint(
     };
     let key_bytes = hex::decode(canonical_hex(&customer_hex)?)
         .map_err(|e| anyhow::anyhow!("customer key hex decode: {e}"))?;
-    let key_array: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("customer public key must be exactly 32 bytes (64 hex chars)"))?;
+    let key_array: [u8; 32] = key_bytes.try_into().map_err(|_| {
+        anyhow::anyhow!("customer public key must be exactly 32 bytes (64 hex chars)")
+    })?;
     let customer_public = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
         .map_err(|e| anyhow::anyhow!("invalid customer Ed25519 public key: {e}"))?;
 
-    let bound = tt_telemetry::audit::checkpoint::verify_checkpoint(&checkpoint_value, &customer_public)
-        .map_err(|e| anyhow::anyhow!("checkpoint signature/identity verification FAILED: {e}"))?;
+    let bound =
+        tt_telemetry::audit::checkpoint::verify_checkpoint(&checkpoint_value, &customer_public)
+            .map_err(|e| {
+                anyhow::anyhow!("checkpoint signature/identity verification FAILED: {e}")
+            })?;
     if let Some(want) = org {
         if want.trim().to_lowercase() != bound.org {
-            anyhow::bail!("checkpoint FAILED: --org={want} disagrees with checkpointed org {}", bound.org);
+            anyhow::bail!(
+                "checkpoint FAILED: --org={want} disagrees with checkpointed org {}",
+                bound.org
+            );
         }
     }
 
@@ -873,15 +884,17 @@ pub(crate) fn run_audit_verify_checkpoint(
         .map_err(|e| anyhow::anyhow!("failed to read chain {}: {e}", chain_path.display()))?;
     let parsed = parse_chain_jsonl(&chain_content)?;
     if parsed.entries.is_empty() {
-        anyhow::bail!("checkpoint FAILED: chain {} has no entries", chain_path.display());
+        anyhow::bail!(
+            "checkpoint FAILED: chain {} has no entries",
+            chain_path.display()
+        );
     }
     // Every row must belong to the checkpointed org.
-    let org_checked: Vec<uuid::Uuid> = parsed
-        .entries
+    let org_checked: Vec<uuid::Uuid> = parsed.entries.iter().map(|entry| entry.org_id).collect();
+    if org_checked
         .iter()
-        .map(|entry| entry.org_id)
-        .collect();
-    if org_checked.iter().any(|row_org| row_org.to_string() != bound.org) {
+        .any(|row_org| row_org.to_string() != bound.org)
+    {
         anyhow::bail!(
             "checkpoint FAILED: chain contains rows outside the checkpointed org {}",
             bound.org
@@ -890,7 +903,9 @@ pub(crate) fn run_audit_verify_checkpoint(
     // The chain preamble key (when present) must agree with the checkpointed key.
     if let Some(preamble) = parsed.preamble_verifying_key.as_deref() {
         if canonical_hex(preamble)?.to_lowercase() != bound.verifying_key_hex {
-            anyhow::bail!("checkpoint FAILED: chain preamble key disagrees with the checkpointed key");
+            anyhow::bail!(
+                "checkpoint FAILED: chain preamble key disagrees with the checkpointed key"
+            );
         }
     }
     let tt_key_bytes = hex::decode(&bound.verifying_key_hex)
@@ -909,8 +924,10 @@ pub(crate) fn run_audit_verify_checkpoint(
         .map_err(|e| anyhow::anyhow!("chain under checkpointed key FAILED: {e}"))?;
 
     tt_cli::ui::note(&format!(
-        "checkpoint verified: org={} seq={} tip={}" ,
-        bound.org, bound.sequence, &bound.tip_hash[..16]
+        "checkpoint verified: org={} seq={} tip={}",
+        bound.org,
+        bound.sequence,
+        &bound.tip_hash[..16]
     ));
     Ok(())
 }
@@ -925,7 +942,7 @@ mod checkpoint_cli_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Use `tt_cli::local_audit::append_entry` to build a REAL signed chain.
         let chain = dir.path().join("chain.jsonl");
-        (SigningKey::from_bytes(&[3u8; 32]), chain, dir.into_path())
+        (SigningKey::from_bytes(&[3u8; 32]), chain, dir.keep())
     }
 
     #[test]
@@ -983,7 +1000,11 @@ mod checkpoint_cli_tests {
         .expect("verify roundtrip");
 
         // Wrong customer public key must fail closed.
-        let wrong = hex::encode(SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
+        let wrong = hex::encode(
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         assert!(
             run_audit_verify_checkpoint(
                 checkpoint.to_str().unwrap(),
@@ -1048,6 +1069,9 @@ mod checkpoint_cli_tests {
             seed_path.to_str().unwrap(),
             Some(dir.join("cp.json").to_str().unwrap()),
         );
-        assert!(result.is_err(), "mode-0644 customer seed must be refused on Unix");
+        assert!(
+            result.is_err(),
+            "mode-0644 customer seed must be refused on Unix"
+        );
     }
 }

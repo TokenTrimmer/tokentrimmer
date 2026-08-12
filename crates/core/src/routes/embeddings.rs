@@ -112,6 +112,8 @@ pub async fn handler(
     } else {
         Uuid::now_v7()
     };
+    let budget_idempotency_key =
+        super::idempotency_key_from_headers(&headers)?.unwrap_or_else(|| trace_id.to_string());
 
     // 2a. Sandbox short-circuit: `tt_test_*` keys return deterministic synthetic
     //     embeddings without contacting any real provider (mirrors chat.rs).
@@ -141,6 +143,11 @@ pub async fn handler(
             extra_headers: Vec::new(),
         });
     let mut ctx = RequestContext {
+        budget_dispatch: crate::budget_reservation::dispatch_state_for_idempotency(
+            org_id,
+            api_key_id,
+            &budget_idempotency_key,
+        ),
         trace_id,
         org_id,
         api_key_id,
@@ -219,11 +226,13 @@ pub async fn handler(
     // A pin can select a different provider and therefore a different price
     // for the routed model. Preserve the route ceiling's existing matched-route
     // scope, but apply it only after that final provider selection. Output
-    // tokens are zero for embeddings; unknown pricing remains permissive.
+    // tokens are zero for embeddings; an active ceiling fails closed when
+    // pricing is unknown.
     if matched {
         enforce_cost_limit(
             route_max_cost_usd,
             provider.pricing(&req.model).as_ref(),
+            &req.model,
             route_input_tokens,
             None,
         )?;
@@ -247,8 +256,9 @@ pub async fn handler(
         let cl_input_tokens =
             tt_tokenize::estimate_tokens(provider.id(), &input_as_text(&req.input));
         enforce_cost_limit(
-            cost_limit_from_header(&headers),
+            cost_limit_from_header(&headers)?,
             provider.pricing(&req.model).as_ref(),
+            &req.model,
             cl_input_tokens,
             None,
         )?;

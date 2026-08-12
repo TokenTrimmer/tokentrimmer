@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 fn make_ctx(base_url: &str) -> RequestContext {
     RequestContext {
+        budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
         trace_id: Uuid::new_v4(),
         org_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),
@@ -456,6 +457,7 @@ async fn request_uses_api_key_header() {
     });
 
     let ctx = RequestContext {
+        budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
         trace_id: Uuid::new_v4(),
         org_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),
@@ -520,6 +522,7 @@ async fn ssrf_guard_rejects_link_local_base_url() {
 
     // Craft a context pointing at the AWS/GCP metadata endpoint.
     let ctx = RequestContext {
+        budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
         trace_id: Uuid::new_v4(),
         org_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),
@@ -566,6 +569,7 @@ async fn ssrf_guard_rejects_loopback_when_not_allow_local() {
     let prod_provider = GeminiProvider::new(ClientConfig::default());
 
     let ctx = RequestContext {
+        budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
         trace_id: Uuid::new_v4(),
         org_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),

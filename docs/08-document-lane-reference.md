@@ -20,7 +20,7 @@ spend."
 | **D1** | The raw-document-to-vision-model routing rule (`crates/inspect-rules-tier1/src/rules/inline_data_offload_candidate.rs:215` — the offline `classify_data_blob` promoted to a live classifier). |
 | **D2** | The lossless opt-in `doc_compaction` pass — a content-preserving compaction of document scaffolding (the `RouteAction::doc_compaction` opt-in; `crates/core/src/passes/doc_compaction.rs`). |
 | **D4a** | The substrate: the `DocDistillGate` scaffold (default-CLOSED, `should_distill` always `false` — a guaranteed no-op until filled in), + the `SpanFidelity` vocabulary (`Lossless`/`Lossy`). |
-| **D4b** | The out-of-process `doc-sidecar` OCR/parse binary + a fail-open Rust client (`crates/doc-sidecar/`: lib, main, ocr.rs; `crates/core/src/document_lane/sidecar_client.rs`). Disabled unless `TT_DOC_SIDECAR_URL` is set. |
+| **D4b** | The out-of-process `doc-sidecar` OCR/parse binary + a fail-open Rust client (`crates/doc-sidecar/`: lib, main, ocr.rs; `crates/core/src/document_lane/sidecar_client.rs`). Disabled unless `TT_DOC_SIDECAR_URL` is set. Workflow cache reuse additionally requires an immutable `TT_DOC_SIDECAR_REVISION`. |
 | **D4c** | The pre-routing seam in `prepare()`: when `RouteAction::document_lane` opts in, distill image/document parts to text, flip `request_has_images`/`request_has_documents` false so routing can downgrade to a text model, book the isolated `doc_vision_saved_est_usd` (gated by the `DocDistillGate` + the sticky 0.90 auto-pause floor). |
 
 ## Content parts
@@ -60,6 +60,17 @@ into the baseline like `compression`, NOT the isolated `doc_vision_saved_est_usd
 | `doc_vision_saved_est_usd` | The DISTILLATION saving (D4c) — the isolated estimated $ the vision→text model downgrade saved. NEVER part of `cost_usd`/`baseline_cost_usd`/`saved_usd` (those are catalog-priced gateway figures, not provider-invoice reconciliation); it's a conservative estimate on its own header. | migration 0032; the isolated `CostBreakdown` field (mirrors `content_compress_saved_est_usd`) |
 
 Both surface on `x-tokentrimmer-*` headers.
+
+## Workflow document cache
+
+Workflow `Document` nodes may reuse a successful extraction for 30 days. The
+cache address covers organization, the BLAKE3 hash of **decoded source bytes**,
+normalized media type, caller-provided cache key, `TT_DOC_SIDECAR_REVISION`, and
+TokenTrimmer's cache-policy revision. Set `TT_DOC_SIDECAR_REVISION` to the
+deployed sidecar image digest or immutable release identifier. Unset, blank, or
+`unknown` revisions disable cache reads and writes but do not disable fresh
+extraction. A sidecar or admission-policy upgrade therefore cannot serve stale
+text under the same byte hash.
 
 ## Fail-open posture
 

@@ -50,16 +50,17 @@ ignore = [
     # `spin` 0.9.8 is pulled by axum -> multer 3.1.0, whose current release and
     # upstream branch constrain `spin` to the 0.9 line. It has been yanked but
     # has no RustSec advisory, and no non-yanked 0.9.x replacement exists.
-    # Keep the global yanked policy at deny and exempt this exact version only;
-    # remove the exemption when multer releases support for spin >= 0.10.
-    # Re-check 2026-08-19.
+    # Owner: Security/Dependencies. Keep the global yanked policy at deny and
+    # exempt this exact version only; remove the exemption when multer releases
+    # support for spin >= 0.10. Re-check 2026-08-19.
     { crate = "spin@0.9.8", reason = "transitive via axum -> multer; no non-yanked 0.9.x exists; re-check 2026-08-19" },
     # --- ttf-parser unmaintained ----------------------------------------------
     # `ttf-parser` (font-table parsing) — unmaintained but NOT vulnerable. Pulled
     # transitively by the doc-sidecar's pure-Rust PDF text extractor
     # (pdf-extract -> lopdf -> ttf-parser) for correct glyph->text mapping. The
     # sidecar is an out-of-process operational binary; not on the gateway hot
-    # path. Blocker: lopdf must migrate off ttf-parser. Re-check 2026-09-15.
+    # path. Owner: Document Lane. Blocker: lopdf must migrate off ttf-parser.
+    # Re-check 2026-09-15.
     "RUSTSEC-2026-0192", # ttf-parser unmaintained (not vuln); blocker: lopdf transitive (doc-sidecar); re-check 2026-09-15
 ]
 

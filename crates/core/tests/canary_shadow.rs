@@ -158,7 +158,7 @@ fn chat_request(model: &str, bearer: &str, idempotency_key: Option<&str>) -> Req
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {bearer}"));
     if let Some(k) = idempotency_key {
-        b = b.header("x-idempotency-key", k);
+        b = b.header("idempotency-key", k);
     }
     b.body(Body::from(body.to_string())).unwrap()
 }

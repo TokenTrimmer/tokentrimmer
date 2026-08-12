@@ -8,7 +8,7 @@ import { TokenTrimmer } from '../src/index.js';
 // terminal-on-first-response test. The gateway is mocked via a stub `fetch`.
 //
 // Endpoint shape (crates/client/src/agent.rs):
-//   POST /v1/agent/runs                       { model, messages, tools?, max_turns?, stream }
+//   POST /v1/agent/runs   { model, messages, tools?, max_turns?, max_cost_usd?, stream }
 //   POST /v1/agent/runs/{id}/tool_outputs     { tool_outputs: [{ tool_call_id, output }] }
 //   GET|DELETE /v1/agent/runs/{id}/transcript export/erase retained resume state
 // A `Run` body = { id, status, messages, turns, usage{...,cost_usd}, ... }. NO
@@ -40,7 +40,13 @@ function completedRunAfterResume() {
     id: RUN_ID,
     status: 'completed',
     turns: 2,
-    usage: { prompt_tokens: 22, completion_tokens: 9, cost_usd: 0.0005 },
+    usage: {
+      prompt_tokens: 22,
+      completion_tokens: 9,
+      cost_usd: 0.0005,
+      baseline_cost_usd: 0.0009,
+      per_turn_cost_usd: [0.0002, 0.0003],
+    },
     messages: [
       { role: 'user', content: 'do it' },
       {
@@ -160,6 +166,11 @@ describe('TokenTrimmer agent loop', () => {
     // Aggregate cost is read from the terminal run body, not headers.
     expect(out.usage.costUsd).toBe(0.0005);
     expect(out.usage.promptTokens).toBe(22);
+    expect(out.usage.baselineCostUsd).toBe(0.0009);
+    expect(out.usage.perTurnCostUsd).toEqual([0.0002, 0.0003]);
+    expect(out.stopReason).toBeNull();
+    expect(out.pendingToolCalls).toEqual([]);
+    expect(out.isResumable).toBe(false);
     // create + 1 resume.
     expect(calls.length).toBe(2);
     expect(calls[0]!.url).toBe('http://gw.test/v1/agent/runs');
@@ -215,6 +226,8 @@ describe('TokenTrimmer agent loop', () => {
     });
     expect(out.resumeRounds).toBe(2);
     expect(out.run.status).toBe('requires_action');
+    expect(out.isResumable).toBe(true);
+    expect(out.pendingToolCalls).toHaveLength(1);
     // 1 create + 2 resumes.
     expect(calls.length).toBe(3);
   });
@@ -258,28 +271,45 @@ describe('TokenTrimmer agent loop', () => {
     expect(out.text).toBe('All done.');
   });
 
-  it('forwards ttTag and maxTurns on the create request', async () => {
+  it('forwards ttTag, maxTurns, and maxCostUsd and exposes a budget stop', async () => {
     const { calls, fetchImpl } = stubFetch({
       create: () => ({
         id: 'z',
-        status: 'completed',
+        status: 'incomplete',
         turns: 1,
-        usage: { prompt_tokens: 1, completion_tokens: 1, cost_usd: 0 },
-        messages: [{ role: 'assistant', content: 'ok' }],
+        usage: {
+          prompt_tokens: 1,
+          completion_tokens: 1,
+          cost_usd: 0.0008,
+          baseline_cost_usd: 0.0012,
+          per_turn_cost_usd: [0.0008],
+        },
+        messages: [{ role: 'assistant', content: 'partial' }],
+        stop_reason: 'budget_exhausted',
       }),
       resume: () => ({}),
     });
-    await client(fetchImpl).agent.run({
+    const out = await client(fetchImpl).agent.run({
       model: 'gpt-4o-mini',
       messages: [{ role: 'user', content: 'hi' }],
       executor: () => 'x',
       maxTurns: 4,
+      maxCostUsd: 0.001,
       ttTag: 'proj-x',
     });
     const create = calls[0]!;
     const h = new Headers(create.init.headers as HeadersInit);
     expect(h.get('x-tokentrimmer-tag')).toBe('proj-x');
-    expect(create.body).toMatchObject({ model: 'gpt-4o-mini', max_turns: 4, stream: false });
+    expect(create.body).toMatchObject({
+      model: 'gpt-4o-mini',
+      max_turns: 4,
+      max_cost_usd: 0.001,
+      stream: false,
+    });
+    expect(out.stopReason).toBe('budget_exhausted');
+    expect(out.usage.baselineCostUsd).toBe(0.0012);
+    expect(out.usage.perTurnCostUsd).toEqual([0.0008]);
+    expect(out.isResumable).toBe(false);
   });
 
   it('throws on an empty model before any request', async () => {

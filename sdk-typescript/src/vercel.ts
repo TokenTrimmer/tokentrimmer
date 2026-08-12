@@ -14,9 +14,9 @@
  *    carries the same `gen_ai.*` / `tokentrimmer.*` cost attributes the gateway
  *    stamps on its own span **and** the Python LangChain callback records; and
  * 2. accumulates a per-run cost / savings total ({@link TokenTrimmerRunCost}),
- *    optionally enforcing a `maxCostUsd` budget — a breach throws
- *    {@link BudgetExceededError}, a framework-level stop signal instead of
- *    silently overspending. Mirrors the Python `TokenTrimmerCostCallback`.
+ *    optionally checking a `postResponseBudgetUsd` after each completed call.
+ *    A breach throws {@link BudgetExceededError} before the caller starts its
+ *    next step. This never prevents or refunds the call already observed.
  *
  * ## Why a result-post-processor and not `wrapLanguageModel` middleware
  *
@@ -36,7 +36,7 @@
  * import { TokenTrimmerRunCost } from '@tokentrimmer/client/vercel';
  *
  * const gateway = openai.provider({ baseURL: 'https://api.tokentrimmer.com/v1', apiKey: 'tt_live_...' });
- * const run = new TokenTrimmerRunCost({ maxCostUsd: 0.5 });
+ * const run = new TokenTrimmerRunCost({ postResponseBudgetUsd: 0.5 });
  *
  * const result = await generateText({
  *   model: gateway('claude-haiku-4-5'),
@@ -100,31 +100,32 @@ export interface RecordTokenTrimmerCostOptions {
   /** Record attributes onto a span. Default `true`; set `false` to only parse. */
   recordSpan?: boolean;
   /**
-   * Single-call budget (USD). When this call's served `costUsd` exceeds it,
-   * throws {@link BudgetExceededError}. For an accumulated per-run budget across
-   * many calls, use {@link TokenTrimmerRunCost} instead.
+   * Post-response single-call budget (USD). After this call completes, throws
+   * {@link BudgetExceededError} when its served `costUsd` exceeds the budget.
+   * This cannot prevent the completed call's spend. For an accumulated
+   * post-response budget across many calls, use {@link TokenTrimmerRunCost}.
    */
-  maxCostUsd?: number;
+  postResponseBudgetUsd?: number;
 }
 
 /** Options for {@link TokenTrimmerRunCost}. */
 export interface TokenTrimmerRunCostOptions {
   /**
-   * Per-run budget (USD). When the accumulated served cost across this tracker's
-   * {@link TokenTrimmerRunCost.record} calls exceeds it, `record` throws
-   * {@link BudgetExceededError}. `undefined` (default) disables the budget.
+   * Post-response run budget (USD). After each completed call, `record` folds in
+   * its served cost and throws {@link BudgetExceededError} when the total exceeds
+   * this value. The exception can stop the next step, not the call just observed.
+   * `undefined` (default) disables the check.
    */
-  maxCostUsd?: number;
+  postResponseBudgetUsd?: number;
   /** Record attributes onto a span on each `record`. Default `true`. */
   recordSpan?: boolean;
 }
 
 /**
- * Thrown when a run's (accumulated) cost exceeds the configured `maxCostUsd`.
+ * Thrown when observed cost exceeds the configured post-response budget.
  *
- * Carries the offending total and the limit so a caller catching it can report
- * or react. Mirrors the Python SDK's `BudgetExceeded`, giving frameworks a
- * hard, catchable stop signal rather than silent overspend.
+ * Carries the offending total and the limit so a caller catching it can stop
+ * before its next call. It does not make the completed call pre-admission safe.
  */
 export class BudgetExceededError extends Error {
   /** The accumulated (or single-call) served cost that tripped the budget. */
@@ -134,7 +135,7 @@ export class BudgetExceededError extends Error {
 
   constructor(totalCostUsd: number, limitUsd: number) {
     super(
-      `TokenTrimmer run budget exceeded: accumulated $${totalCostUsd.toFixed(6)} ` +
+      `TokenTrimmer observed budget exceeded: accumulated $${totalCostUsd.toFixed(6)} ` +
         `> limit $${limitUsd.toFixed(6)}`,
     );
     this.name = 'BudgetExceededError';
@@ -158,8 +159,8 @@ export class BudgetExceededError extends Error {
  *   (`{ headers }`), or a raw headers container (`Headers` / `Record`).
  * @returns the parsed `{ meta, attributes }`, or `null` when the result carried
  *   no TokenTrimmer headers (a quiet no-op — never throws over missing telemetry).
- * @throws {BudgetExceededError} when `options.maxCostUsd` is set and this call's
- *   served cost exceeds it.
+ * @throws {BudgetExceededError} after the call when
+ *   `options.postResponseBudgetUsd` is set and observed served cost exceeds it.
  */
 export async function recordTokenTrimmerCost(
   result: unknown,
@@ -170,9 +171,13 @@ export async function recordTokenTrimmerCost(
 
   await applyToSpan(record.attributes, options.span, options.recordSpan ?? true);
 
-  const { maxCostUsd } = options;
-  if (maxCostUsd != null && record.meta.costUsd != null && record.meta.costUsd > maxCostUsd) {
-    throw new BudgetExceededError(record.meta.costUsd, maxCostUsd);
+  const { postResponseBudgetUsd } = options;
+  if (
+    postResponseBudgetUsd != null &&
+    record.meta.costUsd != null &&
+    record.meta.costUsd > postResponseBudgetUsd
+  ) {
+    throw new BudgetExceededError(record.meta.costUsd, postResponseBudgetUsd);
   }
   return record;
 }
@@ -183,13 +188,13 @@ export async function recordTokenTrimmerCost(
  * Reuse one instance across the LLM calls of a logical run (an agent loop, a
  * multi-step `generateText`, a chain of calls); each {@link record} folds the
  * call's TokenTrimmer cost/savings into the running totals and records the
- * semconv attributes on a span. With `maxCostUsd` set, the call that tips the
- * accumulated cost over the cap throws {@link BudgetExceededError}. Mirrors the
- * Python `TokenTrimmerCostCallback`.
+ * semconv attributes on a span. With `postResponseBudgetUsd` set, the completed
+ * call that tips observed accumulated cost over the budget throws
+ * {@link BudgetExceededError} before the caller's next step.
  */
 export class TokenTrimmerRunCost {
-  /** The per-run budget (USD), or `undefined` when disabled. */
-  readonly maxCostUsd: number | undefined;
+  /** The post-response run budget (USD), or `undefined` when disabled. */
+  readonly postResponseBudgetUsd: number | undefined;
   /** Whether {@link record} writes attributes onto a span. */
   readonly recordSpan: boolean;
 
@@ -203,7 +208,7 @@ export class TokenTrimmerRunCost {
   attributedCalls = 0;
 
   constructor(options: TokenTrimmerRunCostOptions = {}) {
-    this.maxCostUsd = options.maxCostUsd;
+    this.postResponseBudgetUsd = options.postResponseBudgetUsd;
     this.recordSpan = options.recordSpan ?? true;
   }
 
@@ -221,8 +226,8 @@ export class TokenTrimmerRunCost {
    *
    * @returns the parsed `{ meta, attributes }`, or `null` when the result had no
    *   TokenTrimmer headers (a no-op that does not advance the totals).
-   * @throws {BudgetExceededError} when `maxCostUsd` is set and the accumulated
-   *   cost (after folding in this call) exceeds it.
+   * @throws {BudgetExceededError} after a call when `postResponseBudgetUsd` is
+   *   set and observed accumulated cost exceeds it.
    */
   async record(
     result: unknown,
@@ -239,8 +244,11 @@ export class TokenTrimmerRunCost {
     if (meta.baselineCostUsd != null) this.totalBaselineUsd += meta.baselineCostUsd;
     this.attributedCalls += 1;
 
-    if (this.maxCostUsd != null && this.totalCostUsd > this.maxCostUsd) {
-      throw new BudgetExceededError(this.totalCostUsd, this.maxCostUsd);
+    if (
+      this.postResponseBudgetUsd != null &&
+      this.totalCostUsd > this.postResponseBudgetUsd
+    ) {
+      throw new BudgetExceededError(this.totalCostUsd, this.postResponseBudgetUsd);
     }
     return record;
   }

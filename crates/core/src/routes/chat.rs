@@ -76,15 +76,26 @@ pub(crate) fn estimate_cost_usd(
         / 1_000_000.0
 }
 
-/// Parse `X-TokenTrimmer-Cost-Limit-Usd` (a finite, positive USD ceiling), if
-/// present and well-formed. Malformed, non-finite, or non-positive values are
-/// ignored (no limit).
-pub(crate) fn cost_limit_from_header(headers: &HeaderMap) -> Option<f64> {
-    headers
-        .get("x-tokentrimmer-cost-limit-usd")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
+/// Parse `X-TokenTrimmer-Cost-Limit-Usd` as a finite, positive USD ceiling.
+///
+/// An explicitly supplied malformed, non-finite, zero, or negative value is a
+/// client error. Silently treating it as absent would turn a requested budget
+/// into unbounded spend.
+pub(crate) fn cost_limit_from_header(headers: &HeaderMap) -> ApiResult<Option<f64>> {
+    let Some(value) = headers.get("x-tokentrimmer-cost-limit-usd") else {
+        return Ok(None);
+    };
+    let invalid = || {
+        ApiError::InvalidRequest(
+            "X-TokenTrimmer-Cost-Limit-Usd must be a finite number greater than zero".into(),
+        )
+    };
+    let value = value.to_str().map_err(|_| invalid())?;
+    let limit = value.trim().parse::<f64>().map_err(|_| invalid())?;
+    if !limit.is_finite() || limit <= 0.0 {
+        return Err(invalid());
+    }
+    Ok(Some(limit))
 }
 
 /// `X-TokenTrimmer-Provider` — an exact provider id to pin for this request
@@ -192,23 +203,29 @@ pub(crate) async fn apply_provider_override(
     Ok((pinned, Some(creds)))
 }
 
-/// Reject with 402 when the estimated request cost exceeds the header limit.
-/// Permissive when pricing is unknown (can't prove an exceedance) — same
-/// semantics as the route `max_cost_usd` ceiling.
+/// Enforce an active request ceiling before dispatch.
+///
+/// Unknown pricing fails closed: the gateway cannot honestly claim a USD limit
+/// while admitting a model whose maximum request cost it cannot calculate.
 pub(crate) fn enforce_cost_limit(
     limit: Option<f64>,
     pricing: Option<&ModelPricing>,
+    model: &str,
     input_tokens: u32,
     max_tokens: Option<u32>,
 ) -> ApiResult<()> {
-    if let (Some(limit), Some(pr)) = (limit, pricing) {
-        let est = estimate_cost_usd(pr, input_tokens, max_tokens);
-        if est > limit {
-            return Err(ApiError::CostLimitExceeded {
-                estimated_usd: est,
-                ceiling_usd: limit,
-            });
-        }
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let pricing = pricing.ok_or_else(|| ApiError::PriceUnknown {
+        model: model.to_string(),
+    })?;
+    let estimated_usd = estimate_cost_usd(pricing, input_tokens, max_tokens);
+    if estimated_usd > limit {
+        return Err(ApiError::CostLimitExceeded {
+            estimated_usd,
+            ceiling_usd: limit,
+        });
     }
     Ok(())
 }
@@ -226,6 +243,7 @@ fn map_failover_error(error: crate::failover::FailoverError) -> ApiError {
             estimated_usd,
             ceiling_usd,
         },
+        crate::failover::FailoverError::PriceUnknown { model } => ApiError::PriceUnknown { model },
     }
 }
 
@@ -288,6 +306,9 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
             }
             // Transient or server-side errors — never cache.
             ProviderError::RateLimited { .. }
+            | ProviderError::BudgetExceeded { .. }
+            | ProviderError::BudgetPriceUnknown { .. }
+            | ProviderError::BudgetUnavailable(_)
             | ProviderError::Timeout { .. }
             | ProviderError::Network(_)
             | ProviderError::ModelNotFound { .. }
@@ -305,6 +326,7 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         // must not negative-cache.
         | ApiError::MissingProviderCredential { .. }
         | ApiError::PanelCredentialPreflight { .. }
+        | ApiError::PriceUnknown { .. }
         | ApiError::CostLimitExceeded { .. }
         | ApiError::RateLimited { .. }
         | ApiError::RequestTimeout { .. }
@@ -335,10 +357,14 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::ModelNotFound { .. } => StatusCode::NOT_FOUND,
         ApiError::MissingProviderCredential { .. } => StatusCode::BAD_REQUEST,
         ApiError::PanelCredentialPreflight { .. } => StatusCode::BAD_REQUEST,
+        ApiError::PriceUnknown { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         ApiError::CostLimitExceeded { .. } => StatusCode::PAYMENT_REQUIRED,
         ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
         ApiError::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
         ApiError::Provider(pe) => match pe {
+            ProviderError::BudgetExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            ProviderError::BudgetPriceUnknown { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            ProviderError::BudgetUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProviderError::ProviderUpstream { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
@@ -1002,8 +1028,8 @@ pub(crate) struct Prepared {
     /// Applicable route/header cost ceilings for each failover candidate. The
     /// route keeps its historical match-time input estimate; the header
     /// re-estimates the full final prompt with each resolved candidate's
-    /// provider tokenizer. `None` means neither ceiling applies; unknown
-    /// candidate pricing remains permissive.
+    /// provider tokenizer. `None` means neither ceiling applies; with a ceiling,
+    /// unknown candidate pricing fails closed.
     pub failover_cost_check: Option<crate::failover::CandidateCostCheck>,
     /// Route-derived fallback chain (its `is_empty()` selects single vs failover
     /// dispatch — the pipeline reads `route_fallbacks.is_empty()` verbatim).
@@ -1387,10 +1413,7 @@ async fn complete_once_with_retry_policy(
     // 3a. L1 exact-match cache. Cheapest lookup — try first. Gated on
     //     cache eligibility (Fix A §2.2) and tt_extras.cache mode (Fix B §2.7).
     //     Best-effort: any Redis error falls through to L2/provider.
-    let l1_key = state
-        .l1
-        .as_ref()
-        .map(|_| namespaced_l1_key(ctx.org_id, &req));
+    let l1_key = state.l1.as_ref().map(|_| namespaced_l1_key(ctx, &req));
 
     // 3a/3a-neg. Negative cache, then L1 exact-match. Gated on cache
     // eligibility + tt_extras.cache mode; best-effort (errors fall through).
@@ -2462,28 +2485,17 @@ pub async fn handler(
             .unwrap_or_else(Uuid::now_v7)
     };
 
-    // Idempotency key for the sticky canary traffic split (#454). Precedence:
-    //   1. `X-Idempotency-Key` header (client-supplied stable per-logical-request
-    //      key — the strongest signal; a retry carrying the same key is sticky to
-    //      the same arm).
-    //   2. else the `trace_id` string (stable across a single request lifecycle,
-    //      and across replicas for that request, but NOT across client retries).
-    //   3. else a fresh uuid — only reached when neither exists, which for this
-    //      handler is effectively never (trace_id always resolves above). A fresh
-    //      uuid means the request is NOT sticky across retries; that is acceptable
-    //      and documented: it just makes that one request's arm a self-consistent
-    //      one-off. The split itself stays a pure function of (org, key, pct).
-    let idempotency_key = headers
-        .get("x-idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if trace_id != Uuid::nil() {
-                trace_id.to_string()
-            } else {
-                Uuid::now_v7().to_string()
-            }
-        });
+    // Standard logical-request key shared by sticky routing and durable
+    // per-provider-attempt admission. Without one, the trace id keeps this
+    // request internally stable but deliberately does not deduplicate a later
+    // client retry.
+    let idempotency_key = super::idempotency_key_from_headers(&headers)?.unwrap_or_else(|| {
+        if trace_id != Uuid::nil() {
+            trace_id.to_string()
+        } else {
+            Uuid::now_v7().to_string()
+        }
+    });
 
     // 2b. Identity + credentials.
     //
@@ -2526,6 +2538,11 @@ pub async fn handler(
     });
 
     let mut ctx = RequestContext {
+        budget_dispatch: crate::budget_reservation::dispatch_state_for_idempotency(
+            org_id,
+            api_key_id,
+            &idempotency_key,
+        ),
         trace_id,
         org_id,
         api_key_id,
@@ -3334,7 +3351,7 @@ pub(crate) async fn prepare(
     // existing rewrite-only scope (including active modifier-only routes),
     // while the header applies to every request. The route keeps its original
     // match-time input estimate; the header prices the whole final prompt.
-    let header_cost_limit = cost_limit_from_header(headers);
+    let header_cost_limit = cost_limit_from_header(headers)?;
     let combined = tt_shared::message_text_for_estimation(req);
     let header_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
     let primary_pricing = provider.pricing(&req.model);
@@ -3342,6 +3359,7 @@ pub(crate) async fn prepare(
         enforce_cost_limit(
             route_max_cost_usd,
             primary_pricing.as_ref(),
+            &req.model,
             route_input_tokens,
             req.max_tokens,
         )?;
@@ -3349,6 +3367,7 @@ pub(crate) async fn prepare(
     enforce_cost_limit(
         header_cost_limit,
         primary_pricing.as_ref(),
+        &req.model,
         header_input_tokens,
         req.max_tokens,
     )?;
@@ -3478,7 +3497,7 @@ pub(crate) async fn prepare(
                     &cfg,
                     req,
                     provider.id(),
-                    cost_limit_from_header(headers),
+                    cost_limit_from_header(headers)?,
                 )?;
                 // Per-member-provider credential pre-resolution (spec §6.4 step 4),
                 // keyed by provider id. Mirrors the failover pre-resolution pattern
@@ -4042,17 +4061,19 @@ pub(crate) async fn prepare(
         let candidates: Vec<String> = std::iter::once(req.model.clone())
             .chain(route_fallbacks.iter().cloned())
             .collect();
-        // Distinct candidate providers, first-seen order — resolve each one's
-        // credential once. Known-priced candidates that fail the route/header
-        // admission check remain in `candidates` for dispatch-time diagnostics,
-        // but are deliberately omitted here so their credentials are never read.
+        // Distinct admitted candidate providers, first-seen order — resolve each
+        // credential once. Candidates that violate a ceiling or have unknown
+        // pricing remain in `candidates` for dispatch-time diagnostics, but are
+        // deliberately omitted here so their credentials are never read.
         let mut provider_ids: Vec<String> = Vec::new();
         for m in &candidates {
             if let Some(p) = state.registry.resolve(m) {
-                if failover_cost_check
-                    .and_then(|cost_check| cost_check.violation_for(p.as_ref(), m, req))
-                    .is_some()
-                {
+                if failover_cost_check.is_some_and(|cost_check| {
+                    !matches!(
+                        cost_check.admission_for(p.as_ref(), m, req),
+                        crate::failover::CandidateCostAdmission::Allowed
+                    )
+                }) {
                     continue;
                 }
                 let pid = p.id().to_string();
@@ -4311,10 +4332,7 @@ async fn handle_streaming(
         //     entries.
         // L1 fake-stream lookup — gated on cache eligibility (Fix A) and
         // tt_extras.cache mode (Fix B).
-        let l1_key = state
-            .l1
-            .as_ref()
-            .map(|_| namespaced_l1_key(ctx.org_id, &req));
+        let l1_key = state.l1.as_ref().map(|_| namespaced_l1_key(ctx, &req));
         if cache_behavior.do_lookup {
             if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
                 if let Ok(Some(bytes)) = l1.cache.get(key).await {
@@ -4716,10 +4734,21 @@ fn alias_canonicalizer() -> &'static AliasMapCanonicalizer {
     })
 }
 
-/// Per-org namespaced L1 cache key. Prepending `org_id` keeps tenants
-/// isolated within a shared Redis instance.
-fn namespaced_l1_key(org_id: Uuid, req: &ChatCompletionRequest) -> String {
-    format!("{}:{}", org_id, cache_key_with(req, alias_canonicalizer()))
+/// Principal-scoped L1 cache key. Verified callers retain the per-org namespace.
+/// DB-less BYOK callers have no organization, so use a one-way digest of their
+/// provider bearer instead of the shared nil UUID. This preserves useful local
+/// exact caching without allowing two anonymous credentials to read or poison
+/// each other's entries. The plaintext credential never enters Redis.
+fn namespaced_l1_key(ctx: &RequestContext, req: &ChatCompletionRequest) -> String {
+    let namespace = if ctx.org_id == Uuid::nil() {
+        format!(
+            "byok:{}",
+            blake3::hash(ctx.credentials.api_key.expose().as_bytes()).to_hex()
+        )
+    } else {
+        ctx.org_id.to_string()
+    };
+    format!("{namespace}:{}", cache_key_with(req, alias_canonicalizer()))
 }
 
 /// If `req` asks for `response_format: json_schema` but the routed provider
@@ -7997,6 +8026,7 @@ mod cache_header_tests {
 
     fn request_context() -> RequestContext {
         RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
             trace_id: Uuid::nil(),
             org_id: Uuid::nil(),
             api_key_id: Uuid::nil(),
@@ -8142,14 +8172,33 @@ mod cost_limit_header_tests {
 
     #[test]
     fn cost_limit_requires_a_finite_positive_number() {
-        assert_eq!(cost_limit_from_header(&with_cost_limit("0.25")), Some(0.25));
+        assert_eq!(
+            cost_limit_from_header(&HeaderMap::new()).unwrap(),
+            None,
+            "an absent header leaves the request uncapped"
+        );
+        assert_eq!(
+            cost_limit_from_header(&with_cost_limit("0.25")).unwrap(),
+            Some(0.25)
+        );
         for invalid in ["0", "-1", "NaN", "inf", "-inf", "not-a-number"] {
-            assert_eq!(
-                cost_limit_from_header(&with_cost_limit(invalid)),
-                None,
-                "{invalid:?} must not turn a request budget into an unbounded limit"
+            assert!(
+                matches!(
+                    cost_limit_from_header(&with_cost_limit(invalid)),
+                    Err(ApiError::InvalidRequest(_))
+                ),
+                "{invalid:?} must be rejected rather than disabling the budget"
             );
         }
+    }
+
+    #[test]
+    fn active_cost_limit_fails_closed_when_pricing_is_unknown() {
+        assert!(enforce_cost_limit(None, None, "unpriced-model", 1, Some(1)).is_ok());
+        assert!(matches!(
+            enforce_cost_limit(Some(1.0), None, "unpriced-model", 1, Some(1)),
+            Err(ApiError::PriceUnknown { model }) if model == "unpriced-model"
+        ));
     }
 }
 
@@ -8243,6 +8292,41 @@ mod cache_eligibility_tests {
             tt_extras: HashMap::new(),
             ..Default::default()
         }
+    }
+
+    fn cache_context(org_id: Uuid, api_key: &str) -> RequestContext {
+        RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
+            trace_id: Uuid::nil(),
+            org_id,
+            api_key_id: Uuid::nil(),
+            credentials: ProviderCredentials {
+                api_key: SecretString::new(api_key),
+                base_url: None,
+                extra_headers: vec![],
+            },
+            tag: None,
+            deadline: None,
+            run_id: None,
+            node_id: None,
+        }
+    }
+
+    #[test]
+    fn anonymous_cache_namespace_is_bearer_scoped_and_secret_free() {
+        let req = base_req();
+        let first = namespaced_l1_key(&cache_context(Uuid::nil(), "provider-secret-first"), &req);
+        let second = namespaced_l1_key(&cache_context(Uuid::nil(), "provider-secret-second"), &req);
+        assert_ne!(first, second);
+        assert!(!first.contains("provider-secret-first"));
+        assert!(!second.contains("provider-secret-second"));
+
+        let org = Uuid::new_v4();
+        assert_eq!(
+            namespaced_l1_key(&cache_context(org, "old-provider-key"), &req),
+            namespaced_l1_key(&cache_context(org, "rotated-provider-key"), &req),
+            "verified callers remain scoped by stable organization identity"
+        );
     }
 
     fn assistant_resp(tool_calls: Vec<tt_shared::ToolCall>) -> ChatCompletionResponse {
@@ -8646,6 +8730,7 @@ mod l2_baseline_tests {
     #[test]
     fn l2_hit_log_preserves_matched_immutable_route_version() {
         let ctx = RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
             trace_id: Uuid::nil(),
             org_id: Uuid::nil(),
             api_key_id: Uuid::nil(),
@@ -11390,6 +11475,7 @@ mod telemetry_drain_tests {
 
         fn make_ctx(run_id: Option<Uuid>, node_id: Option<Uuid>) -> RequestContext {
             RequestContext {
+                budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
                 trace_id: Uuid::nil(),
                 org_id: Uuid::nil(),
                 api_key_id: Uuid::nil(),

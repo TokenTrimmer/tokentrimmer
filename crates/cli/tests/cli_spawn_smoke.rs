@@ -362,6 +362,30 @@ fn proxy_spawns_without_panic() {
 }
 
 #[test]
+fn proxy_hybrid_refuses_remote_gateway_before_listening() {
+    let home = tempfile::tempdir().unwrap();
+    let args = &[
+        "proxy",
+        "--mode",
+        "hybrid",
+        "--tt-api-base",
+        "https://api.tokentrimmer.com",
+        "--no-tui",
+        "--no-preview",
+        "--port",
+        "0",
+    ];
+    let r = run_tt(home.path(), args, EXIT_WAIT);
+    assert!(r.exited, "remote hybrid target must fail at startup");
+    assert_no_panic(args, &r.stderr);
+    assert!(
+        r.stderr.contains("requires a loopback --tt-api-base"),
+        "expected identity-boundary error, got stderr:\n{}",
+        r.stderr
+    );
+}
+
+#[test]
 fn route_spawns_without_panic() {
     assert_exits_cleanly(&[
         "route",
@@ -463,9 +487,15 @@ fn audit_verify_merkle_prints_machine_readable_proof() {
     }
 
     // Tip proof (default).
-    let tip = output_tt(home.path(), &["audit", "verify", "--merkle", chain_path.to_str().unwrap()]);
+    let tip = output_tt(
+        home.path(),
+        &["audit", "verify", "--merkle", chain_path.to_str().unwrap()],
+    );
     assert!(tip.status.success(), "--merkle exited non-zero: {tip:?}");
-    assert_no_panic(&["audit", "verify", "--merkle"], &String::from_utf8_lossy(&tip.stderr));
+    assert_no_panic(
+        &["audit", "verify", "--merkle"],
+        &String::from_utf8_lossy(&tip.stderr),
+    );
     let tip_stdout = String::from_utf8_lossy(&tip.stdout);
     let proof: serde_json::Value = serde_json::from_str(&tip_stdout)
         .unwrap_or_else(|e| panic!("stdout must be the proof JSON, got: {tip_stdout:?} — {e}"));
@@ -475,16 +505,28 @@ fn audit_verify_merkle_prints_machine_readable_proof() {
     assert_eq!(proof["root"].as_str().unwrap().len(), 64);
     assert!(!proof["sibling_path"].as_array().unwrap().is_empty());
     assert!(
-        proof["note"].as_str().unwrap().contains("NOT a transparency-log publication"),
+        proof["note"]
+            .as_str()
+            .unwrap()
+            .contains("NOT a transparency-log publication"),
         "proof must be explicitly labeled non-transparency: {proof}"
     );
 
     // Selected index.
     let sel = output_tt(
         home.path(),
-        &["audit", "verify", "--merkle-index", "2", chain_path.to_str().unwrap()],
+        &[
+            "audit",
+            "verify",
+            "--merkle-index",
+            "2",
+            chain_path.to_str().unwrap(),
+        ],
     );
-    assert!(sel.status.success(), "--merkle-index exited non-zero: {sel:?}");
+    assert!(
+        sel.status.success(),
+        "--merkle-index exited non-zero: {sel:?}"
+    );
     let sel_proof: serde_json::Value =
         serde_json::from_slice(&sel.stdout).expect("stdout must be the proof JSON");
     assert_eq!(sel_proof["leaf_index"], 2);
@@ -492,9 +534,18 @@ fn audit_verify_merkle_prints_machine_readable_proof() {
     // Out-of-range index fails fast (non-zero), never panics.
     let bad = output_tt(
         home.path(),
-        &["audit", "verify", "--merkle-index", "99", chain_path.to_str().unwrap()],
+        &[
+            "audit",
+            "verify",
+            "--merkle-index",
+            "99",
+            chain_path.to_str().unwrap(),
+        ],
     );
-    assert!(!bad.status.success(), "out-of-range --merkle-index must error");
+    assert!(
+        !bad.status.success(),
+        "out-of-range --merkle-index must error"
+    );
     assert_no_panic(
         &["audit", "verify", "--merkle-index", "99"],
         &String::from_utf8_lossy(&bad.stderr),

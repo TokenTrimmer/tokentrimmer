@@ -328,29 +328,15 @@ pub struct NodeOutputView {
     pub cost_usd: f64,
 }
 
-/// Standard header used to bind a retried logical invocation to its original
-/// gateway run. The raw value is validated here and hashed before persistence.
-const WORKFLOW_RUN_IDEMPOTENCY_HEADER: &str = "idempotency-key";
-const MAX_WORKFLOW_RUN_IDEMPOTENCY_KEY_BYTES: usize = 256;
+#[cfg(test)]
+const WORKFLOW_RUN_IDEMPOTENCY_HEADER: &str = super::IDEMPOTENCY_HEADER;
+#[cfg(test)]
+const MAX_WORKFLOW_RUN_IDEMPOTENCY_KEY_BYTES: usize = super::MAX_IDEMPOTENCY_KEY_BYTES;
 
-/// Extract an optional stable invocation key without changing legacy callers:
+/// Extract the shared logical-request key without changing legacy callers:
 /// no `Idempotency-Key` retains the historical fresh-run behavior.
 fn workflow_run_idempotency_key(headers: &HeaderMap) -> ApiResult<Option<String>> {
-    let Some(value) = headers.get(WORKFLOW_RUN_IDEMPOTENCY_HEADER) else {
-        return Ok(None);
-    };
-    let value = value.to_str().map_err(|_| {
-        ApiError::InvalidRequest("Idempotency-Key must be valid visible text".into())
-    })?;
-    if value.trim().is_empty()
-        || value.len() > MAX_WORKFLOW_RUN_IDEMPOTENCY_KEY_BYTES
-        || value.chars().any(char::is_control)
-    {
-        return Err(ApiError::InvalidRequest(format!(
-            "Idempotency-Key must be 1..={MAX_WORKFLOW_RUN_IDEMPOTENCY_KEY_BYTES} visible bytes"
-        )));
-    }
-    Ok(Some(value.to_owned()))
+    super::idempotency_key_from_headers(headers)
 }
 
 /// A duplicate logical invocation is a status/reconciliation response, never
@@ -855,6 +841,11 @@ fn spawn_flow_quality_gate(
             return;
         };
         let judge_ctx = RequestContext {
+            budget_dispatch: crate::budget_reservation::dispatch_state_for_idempotency(
+                org_id,
+                api_key_id,
+                &run_id.to_string(),
+            ),
             trace_id: run_id,
             org_id,
             api_key_id,

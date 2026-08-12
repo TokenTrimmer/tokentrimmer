@@ -140,6 +140,21 @@ fn chat_request(model: &str, stream: bool) -> Request<Body> {
         .unwrap()
 }
 
+fn chat_request_with_bearer(model: &str, bearer: &str) -> Request<Body> {
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "same private prompt" }],
+        "stream": false,
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn l1_miss_then_hit_serves_cached_response_without_second_dispatch() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -229,6 +244,47 @@ async fn l1_miss_then_hit_serves_cached_response_without_second_dispatch() {
     assert!(!body["choices"].as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn anonymous_byok_cache_is_isolated_by_provider_bearer() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let state = AppState::new(registry).with_l1(Arc::new(InMemoryL1Cache::new()), None);
+    let app = build_router(state);
+
+    let first = app
+        .clone()
+        .oneshot(chat_request_with_bearer("counting-1", "provider-key-a"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let other_credential = app
+        .clone()
+        .oneshot(chat_request_with_bearer("counting-1", "provider-key-b"))
+        .await
+        .unwrap();
+    assert_eq!(other_credential.status(), StatusCode::OK);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "another anonymous provider credential must not read the first credential's cache"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let same_credential = app
+        .oneshot(chat_request_with_bearer("counting-1", "provider-key-a"))
+        .await
+        .unwrap();
+    assert_eq!(same_credential.status(), StatusCode::OK);
+    assert_eq!(same_credential.headers()["x-tokentrimmer-cache"], "hit-l1");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
 /// Backward-compat: a pre-envelope L1 entry (raw `ChatCompletionResponse`
 /// bytes written by an older gateway version) must still resolve to a usable
 /// hit. The baseline falls back to the synthetic-from-usage estimate so the
@@ -275,8 +331,9 @@ async fn l1_legacy_entry_falls_back_to_synthetic_baseline() {
     };
     let legacy_bytes = serde_json::to_vec(&legacy_response).unwrap();
 
-    // The chat handler namespaces L1 keys as "{org_id}:{cache_key(req)}". The
-    // test path runs with org_id = Uuid::nil(); reproduce that key here.
+    // The handler namespaces an anonymous BYOK caller by a one-way digest of
+    // its provider bearer. This fixture sends no bearer, so reproduce the
+    // digest of the empty credential while testing the old response envelope.
     let req = serde_json::from_str::<tt_shared::ChatCompletionRequest>(
         &json!({
             "model": "counting-1",
@@ -286,7 +343,8 @@ async fn l1_legacy_entry_falls_back_to_synthetic_baseline() {
         .to_string(),
     )
     .unwrap();
-    let key = format!("{}:{}", uuid::Uuid::nil(), tt_cache::key::cache_key(&req));
+    let namespace = format!("byok:{}", blake3::hash(b"").to_hex());
+    let key = format!("{namespace}:{}", tt_cache::key::cache_key(&req));
     l1.set(&key, &legacy_bytes, 60).await.unwrap();
 
     // Request now hits the legacy entry — handler must not panic, must return

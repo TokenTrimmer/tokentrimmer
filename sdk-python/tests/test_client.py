@@ -188,7 +188,7 @@ def test_invalid_tt_cache_raises_before_send():
 @respx.mock
 def test_invalid_tt_cost_limit_raises_before_send():
     route = _completion_route()
-    for bad in (float("inf"), float("nan"), -1.0):
+    for bad in (float("inf"), float("nan"), 0.0, -1.0):
         with pytest.raises(ValueError):
             _client().chat.completions.create(
                 model="m",

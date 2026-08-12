@@ -32,6 +32,7 @@ COPY . .
 # Inject with: docker build --build-arg TT_GIT_SHA=$(git rev-parse HEAD) ...
 # Declared after `cargo chef cook` so changing the SHA never busts the dep cache.
 ARG TT_GIT_SHA
+RUN test -n "${TT_GIT_SHA}"
 ENV TT_GIT_SHA=${TT_GIT_SHA}
 RUN cargo build --release -p tt-cli
 RUN strip /app/target/release/tt

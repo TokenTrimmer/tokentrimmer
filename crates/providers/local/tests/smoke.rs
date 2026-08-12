@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 fn ctx() -> RequestContext {
     RequestContext {
+        budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
         trace_id: Uuid::new_v4(),
         org_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),

@@ -10,10 +10,10 @@ TokenTrimmer ships the full substrate to fix this — natively, no SDK change:
 1. **The gateway natively serves Anthropic's `/v1/messages`.** Claude Code,
    Cursor, and every Anthropic-SDK agent can point `ANTHROPIC_BASE_URL` at the
    gateway and keep working exactly as before.
-2. **Hard `$` caps + a kill-switch apply at the gateway**, not in your code.
-   `monthly_cap_usd` (the budget enforcer) + the `CircuitBreaker` (the route
-   kill-switch) — set them per org / per key; a runaway agent trips the
-   breaker before the bill does.
+2. **Durable `$` budget admission + a kill-switch apply at the gateway**, not
+   in your code. `monthly_cap_usd` atomically reserves an estimated upper bound
+   before every provider attempt, per org and per key; the `CircuitBreaker`
+   remains the route kill-switch.
 3. **Eligible compression events can be signed.** A Verifiable Compression
    Receipt (VCR): `POST /v1/admin/requests/{trace_id}/compression-receipt/sign`
    mints an Ed25519-signed record of a calculated `{savings, route, model,
@@ -34,9 +34,10 @@ This page wires the shipped pieces into one 5-minute path.
   non-streaming `{type:"message",...}` JSON or Anthropic typed SSE frames
   (`message_start`, `content_block_*`, `message_delta`, `message_stop`). The
   `x-tokentrimmer-*` cost headers are preserved verbatim.
-- **Runtime `$` cap + kill-switch** — `crates/core/src/budget.rs`
-  (`monthly_cap_usd`, the `BudgetEnforcer`) + `crates/core/src/state.rs`
-  (`CircuitBreaker`). Set per org / per api-key.
+- **Durable runtime `$` admission + kill-switch** —
+  `crates/core/src/budget_reservation.rs` (Postgres reservation, settlement,
+  retry identity, and provenance) + `crates/core/src/state.rs`
+  (`CircuitBreaker`). Set per org / per API key.
 - **Signed receipts** — `tt_telemetry::vcr` (the `vcr:v1|` Ed25519 primitive) +
   the cloud mint endpoint + `tt verify-receipt` (the offline verify CLI).
 - **`tt init`** — installs the TokenTrimmer best-practices harness into a repo
@@ -52,15 +53,18 @@ This page wires the shipped pieces into one 5-minute path.
 TokenTrimmer has **two** cost-control surfaces, at different points in the dev
 loop. Both are shipped; the coding-agent wedge uses both:
 
-### 1. Runtime `$` cap + kill-switch (the runaway-agent guard)
-Set per org / per key on the gateway. A long-running `claude code` session that
-blows past `monthly_cap_usd` trips the `BudgetEnforcer` (the request is
-rejected before it dispatches — the agent gets a clean 402, you get a
-predictable bill). The `CircuitBreaker` is the route-level kill-switch: a route
-that degrades quality trips the breaker, fail-safe to the expensive direction.
+### 1. Runtime `$` admission + kill-switch (the runaway-agent guard)
+Set per org / per key on the gateway. For capped tenants, every provider
+attempt atomically reserves catalog-estimated headroom in Postgres before
+dispatch. Concurrent gateway replicas share the same monthly totals; retries
+with the same `Idempotency-Key` cannot admit the same provider attempt twice.
+Provider-reported usage settles the reservation, while missing usage settles
+conservatively with explicit provenance. Unknown pricing fails closed. The
+agent receives a clean 402 when no headroom remains.
 
-This is the cap the marketing claim "hard $ caps, kill-switches ... on
-coding-agent spend" refers to. It's the runtime guard against a runaway agent.
+This is a durable admission bound, not provider-invoice reconciliation or a
+promise that final provider usage cannot exceed a catalog estimate. The
+`CircuitBreaker` is the separate route-level quality kill-switch.
 
 ### 2. PR cost-gate (the `.tokentrimmer/budgets.toml` — the endemic-inflation guard)
 A declarative, per-glob ceiling on the **per-call cost of model references that

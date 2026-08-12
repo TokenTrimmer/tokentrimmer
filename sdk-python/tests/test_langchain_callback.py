@@ -134,7 +134,7 @@ def test_callback_accumulates_across_calls():
 
 def test_no_headers_degrades_gracefully():
     """A plain (non-gateway) response records nothing and never raises."""
-    cb = TokenTrimmerCostCallback(max_cost_usd=0.0001, record_spans=False)
+    cb = TokenTrimmerCostCallback(post_response_budget_usd=0.0001, record_spans=False)
     plain = LLMResult(
         generations=[[ChatGeneration(message=AIMessage(content="hi"))]],
         llm_output={"token_usage": {"prompt_tokens": 1, "completion_tokens": 1}},
@@ -146,7 +146,7 @@ def test_no_headers_degrades_gracefully():
 
 
 def test_budget_exceeded_raises_past_the_cap():
-    cb = TokenTrimmerCostCallback(max_cost_usd=0.05, record_spans=False)
+    cb = TokenTrimmerCostCallback(post_response_budget_usd=0.05, record_spans=False)
     # First call stays under the cap.
     cb.on_llm_end(_result_with_headers_in_message(cost="0.03"), run_id="r1")
     assert cb.total_cost_usd == pytest.approx(0.03)
@@ -159,7 +159,7 @@ def test_budget_exceeded_raises_past_the_cap():
 
 def test_budget_not_exceeded_exactly_at_cap():
     """At exactly the cap is not a breach (strictly-greater triggers)."""
-    cb = TokenTrimmerCostCallback(max_cost_usd=0.0034, record_spans=False)
+    cb = TokenTrimmerCostCallback(post_response_budget_usd=0.0034, record_spans=False)
     cb.on_llm_end(_result_with_headers_in_message(), run_id="r1")  # cost 0.0034
     assert cb.total_cost_usd == pytest.approx(0.0034)
 

@@ -1638,12 +1638,13 @@ fn validate_panel_catalog_admission(
     let required = tt_shared::RequiredCapabilities::from_request(req);
 
     for member in &cfg.members {
-        let info = state
-            .registry
-            .model_info(&member.model)
-            .ok_or_else(|| ApiError::ModelNotFound {
-                model: member.model.clone(),
-            })?;
+        let info =
+            state
+                .registry
+                .model_info(&member.model)
+                .ok_or_else(|| ApiError::ModelNotFound {
+                    model: member.model.clone(),
+                })?;
         // estimated_tokens = 0 skips the local-tokenizer window check; we only
         // fail on capabilities we positively know are missing from the catalog
         // row (see doc comment above).
@@ -3358,6 +3359,7 @@ mod tests {
 
     fn direct_engine_admission_context() -> RequestContext {
         RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
             trace_id: Uuid::nil(),
             org_id: Uuid::nil(),
             api_key_id: Uuid::nil(),
@@ -3943,10 +3945,7 @@ mod tests {
     #[tokio::test]
     async fn admission_revalidation_fails_closed_against_current_catalog() {
         let mint_state = catalog_state(vec![
-            catalog_member(
-                "member-capable",
-                vec![Capability::Text, Capability::Tools],
-            ),
+            catalog_member("member-capable", vec![Capability::Text, Capability::Tools]),
             catalog_member("arbiter-capable", vec![Capability::Text]),
         ]);
         let cfg = catalog_tools_cfg();
@@ -3972,7 +3971,9 @@ mod tests {
             Duration::from_secs(1),
         )
         .await
-        .expect_err("revalidation must stop before fan-out when the current catalog loses a capability");
+        .expect_err(
+            "revalidation must stop before fan-out when the current catalog loses a capability",
+        );
         assert!(
             matches!(
                 &error,
@@ -4000,7 +4001,9 @@ mod tests {
             Duration::from_secs(1),
         )
         .await
-        .expect_err("revalidation must stop before fan-out when the current catalog drops a member");
+        .expect_err(
+            "revalidation must stop before fan-out when the current catalog drops a member",
+        );
         assert!(
             matches!(&error, ApiError::ModelNotFound { model } if model == "member-capable"),
             "expected ModelNotFound revalidation error, got {error:?}"
@@ -4014,10 +4017,7 @@ mod tests {
     #[tokio::test]
     async fn admission_revalidation_with_capable_catalog_reaches_credential_fence() {
         let state = catalog_state(vec![
-            catalog_member(
-                "member-capable",
-                vec![Capability::Text, Capability::Tools],
-            ),
+            catalog_member("member-capable", vec![Capability::Text, Capability::Tools]),
             catalog_member("arbiter-capable", vec![Capability::Text]),
         ]);
         let cfg = catalog_tools_cfg();
@@ -4037,7 +4037,9 @@ mod tests {
             Duration::from_secs(1),
         )
         .await
-        .expect_err("capable catalog passes catalog revalidation; credential preflight rejects next");
+        .expect_err(
+            "capable catalog passes catalog revalidation; credential preflight rejects next",
+        );
         assert!(
             matches!(
                 &error,

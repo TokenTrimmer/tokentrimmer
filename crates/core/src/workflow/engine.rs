@@ -66,6 +66,7 @@ use std::sync::{
     Arc,
 };
 
+use base64::Engine as _;
 use futures::future::BoxFuture;
 use tt_shared::context::SecretString;
 use uuid::Uuid;
@@ -1476,19 +1477,16 @@ fn run_workflow_boxed<'a>(
                     }
 
                     // ---------------------------------------------------------------
-                    // D6 — Document node: distill the document's text layer to text
-                    // the downstream nodes can use. v1 (no cache yet): distills fresh
-                    // via the document_lane seam on every run (the per-org content-hash
-                    // reuse cache `flow_doc_distill_cache` is a follow-up slice that
-                    // skips the sidecar call on a cache hit). Fail-loud: a sidecar
-                    // error / disabled sidecar → an error NodeOutput (the node never
-                    // silently emits raw bytes — a downstream Model node would be
-                    // misled). The isolated `doc_vision_saved_est_usd` is booked $0
-                    // in v1 (the saving is realized on the downstream Model node,
-                    // which sends text-not-image tokens at the served model's rate;
-                    // booking it here would need that model, known only downstream).
+                    // D6 — distill a document's text layer for downstream nodes.
+                    // A complete semantic cache hit skips extraction. A miss uses
+                    // the Document Lane seam; sidecar failure emits an error
+                    // NodeOutput rather than mislabeling raw bytes as text. The
+                    // isolated `doc_vision_saved_est_usd` remains $0 here because
+                    // the downstream served model—and therefore avoided vision
+                    // cost—is not known at this node.
                     NodeKind::Document { source, cache_key } => {
-                        let _ = cache_key; // TODO D6 cache slice: compose into the cache key.
+                        // Resolve the document bytes before constructing the
+                        // complete semantic cache identity.
                         // Resolve the document's bytes: an inline base64 source
                         // passes through untouched; a URL source is fetched
                         // through the gateway's guarded egress (the SAME
@@ -1508,8 +1506,7 @@ fn run_workflow_boxed<'a>(
                                     Err(e) => {
                                         // SECURITY: HttpError strings are
                                         // sanitized — the URL is never echoed.
-                                        let err =
-                                            format!("document node source fetch failed: {e}");
+                                        let err = format!("document node source fetch failed: {e}");
                                         journal(NodeJournalEntry {
                                             node_id: node_id.clone(),
                                             status: "failed".into(),
@@ -1535,8 +1532,7 @@ fn run_workflow_boxed<'a>(
                                             cost_usd: 0.0,
                                             run_cost_usd: accrued,
                                             baseline_cost_usd: accrued_baseline,
-                                            saved_usd_so_far: (accrued_baseline - accrued)
-                                                .max(0.0),
+                                            saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
                                             budget_remaining_usd: run_max_cost_usd
                                                 .map(|m| m - accrued),
                                         });
@@ -1546,23 +1542,30 @@ fn run_workflow_boxed<'a>(
                                 }
                             }
                         };
-                        // The cache key: blake3(content_bytes) + the optional
-                        // caller-supplied `cache_key` (substituted against the
-                        // trigger's outputs, like a Transform expr). Per-org
-                        // isolation is the store impl's responsibility — the
-                        // concrete `DistillCacheStore` is constructed per-run with
-                        // the org_id + scopes its get/upsert to that org.
+                        // Cache reuse requires decoded-byte identity, normalized
+                        // media type, caller key, an immutable sidecar revision,
+                        // and the TokenTrimmer policy revision. Missing/invalid
+                        // provenance disables reuse but never extraction.
                         let caller_key = cache_key
                             .as_ref()
-                            .map(|k| substitute(k, &trigger_id, &outputs, variables));
-                        let content_hash = blake3::hash(data_b64.as_bytes()).to_hex().to_string();
-                        let key = DistillCacheKey {
-                            content_hash,
-                            caller_key,
+                            .map(|value| substitute(value, &trigger_id, &outputs, variables));
+                        let harness = crate::document_lane::seam::DistillHarness::from_env();
+                        let key = harness.cache_revision.as_ref().and_then(|revision| {
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(data_b64.trim())
+                                .ok()?;
+                            Some(DistillCacheKey::new(
+                                blake3::hash(&bytes).to_hex().to_string(),
+                                caller_key,
+                                &media_type,
+                                revision,
+                            ))
+                        });
+                        let cached = match key.as_ref() {
+                            Some(key) => cache.get(key).await,
+                            None => None,
                         };
-                        // Cache hit → emit the cached text ($0, no sidecar call).
-                        // Fail-open: a cache error → None → distills fresh.
-                        if let Some(cached) = cache.get(&key).await {
+                        if let Some(cached) = cached {
                             let content = serde_json::Value::String(cached.text.clone());
                             journal(NodeJournalEntry {
                                 node_id: node_id.clone(),
@@ -1599,7 +1602,6 @@ fn run_workflow_boxed<'a>(
                         // seam (the same extraction a routed chat request runs).
                         // Fail-loud on any sidecar error / disabled sidecar (the
                         // seam returns DistillOutcome::Disabled/ExtractFailed).
-                        let harness = crate::document_lane::seam::DistillHarness::from_env();
                         let distilled_outcome = crate::document_lane::seam::distill_part(
                             &harness,
                             &media_type,
@@ -1608,25 +1610,23 @@ fn run_workflow_boxed<'a>(
                         .await;
                         let out = match distilled_outcome {
                             crate::document_lane::seam::DistillOutcome::Distilled {
-                                text, ..
+                                text,
+                                engine,
+                                pages,
+                                ..
                             } => {
-                                // Upsert the fresh distillation into the cache
-                                // (fail-open: an upsert error is swallowed — the
-                                // next run re-tries + re-stores). The bookkeeping's
-                                // `pages` is not carried by `distill_part`'s outcome
-                                // (it returns only the joined text); the cached row
-                                // records `pages: 0` + the engine tag (the cache is
-                                // a perf optimization — the page count is advisory).
-                                cache
-                                    .upsert(
-                                        &key,
-                                        &CachedDistill {
-                                            text: text.clone(),
-                                            pages: 0,
-                                            engine: "document_lane::seam".to_string(),
-                                        },
-                                    )
-                                    .await;
+                                if let Some(key) = key.as_ref() {
+                                    cache
+                                        .upsert(
+                                            key,
+                                            &CachedDistill {
+                                                text: text.clone(),
+                                                pages,
+                                                engine,
+                                            },
+                                        )
+                                        .await;
+                                }
                                 let content = serde_json::Value::String(text.clone());
                                 journal(NodeJournalEntry {
                                     node_id: node_id.clone(),
@@ -1913,8 +1913,9 @@ fn capture_input(
     outputs: &HashMap<String, NodeOutput>,
     variables: &BTreeMap<String, String>,
 ) -> Option<serde_json::Value> {
-    let captured =
-        capture_node_input(template, |ref_str| resolve_ref(ref_str, trigger_id, outputs, variables))?;
+    let captured = capture_node_input(template, |ref_str| {
+        resolve_ref(ref_str, trigger_id, outputs, variables)
+    })?;
     serde_json::to_value(captured).ok()
 }
 
@@ -2603,9 +2604,14 @@ mod tests {
 
         // Per-node input capture: the `{{input}}` ref resolved to the trigger
         // value; Template is the expr itself.
-        let captured: CapturedNodeInput =
-            serde_json::from_value(transform_entry.input.as_ref().expect("transform input captured").clone())
-                .expect("captured input is a valid CapturedNodeInput");
+        let captured: CapturedNodeInput = serde_json::from_value(
+            transform_entry
+                .input
+                .as_ref()
+                .expect("transform input captured")
+                .clone(),
+        )
+        .expect("captured input is a valid CapturedNodeInput");
         assert_eq!(captured.template, "{{input}} processed");
         assert_eq!(
             captured.refs.get("input").map(String::as_str),
@@ -6087,12 +6093,12 @@ mod tests {
     /// of get/upsert calls. Used to prove the Document node consults the cache
     /// (hit → cached text, no sidecar; miss → upsert after the distill).
     struct RecordingCache {
-        /// Pre-seeded cache hits keyed by `content_hash`.
-        hits: std::sync::Mutex<HashMap<String, CachedDistill>>,
-        /// Append-only log of `(op, content_hash)` calls.
-        ops: std::sync::Mutex<Vec<(&'static str, String)>>,
-        /// The text an upsert stores (so a get-after-upsert returns it).
-        upserted: std::sync::Mutex<HashMap<String, CachedDistill>>,
+        /// Pre-seeded cache hits keyed by complete semantic identity.
+        hits: std::sync::Mutex<HashMap<DistillCacheKey, CachedDistill>>,
+        /// Append-only log of `(op, key)` calls.
+        ops: std::sync::Mutex<Vec<(&'static str, DistillCacheKey)>>,
+        /// Values written during the test.
+        upserted: std::sync::Mutex<HashMap<DistillCacheKey, CachedDistill>>,
     }
 
     impl RecordingCache {
@@ -6103,10 +6109,10 @@ mod tests {
                 upserted: std::sync::Mutex::new(HashMap::new()),
             }
         }
-        fn seed(content_hash: &str, text: &str) -> Self {
+        fn seed(key: DistillCacheKey, text: &str) -> Self {
             let cache = Self::empty();
             cache.hits.lock().unwrap().insert(
-                content_hash.to_string(),
+                key,
                 CachedDistill {
                     text: text.to_string(),
                     pages: 1,
@@ -6120,7 +6126,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(op, h)| (op.to_string(), h.clone()))
+                .map(|(op, key)| (op.to_string(), key.content_hash.clone()))
                 .collect()
         }
     }
@@ -6128,41 +6134,27 @@ mod tests {
     #[async_trait]
     impl DistillCacheStore for RecordingCache {
         async fn get(&self, key: &DistillCacheKey) -> Option<CachedDistill> {
-            self.ops
-                .lock()
-                .unwrap()
-                .push(("get", key.content_hash.clone()));
+            self.ops.lock().unwrap().push(("get", key.clone()));
             // A hit from the seed OR a prior upsert.
             self.hits
                 .lock()
                 .unwrap()
-                .get(&key.content_hash)
+                .get(key)
                 .cloned()
-                .or_else(|| {
-                    self.upserted
-                        .lock()
-                        .unwrap()
-                        .get(&key.content_hash)
-                        .cloned()
-                })
+                .or_else(|| self.upserted.lock().unwrap().get(key).cloned())
         }
         async fn upsert(&self, key: &DistillCacheKey, doc: &CachedDistill) {
-            self.ops
-                .lock()
-                .unwrap()
-                .push(("upsert", key.content_hash.clone()));
+            self.ops.lock().unwrap().push(("upsert", key.clone()));
             self.upserted
                 .lock()
                 .unwrap()
-                .insert(key.content_hash.clone(), doc.clone());
+                .insert(key.clone(), doc.clone());
         }
     }
 
     /// Build a minimal Trigger → Document → Output flow whose Document node
-    /// sources a base64 PDF whose content hash is `hash_of(data)`.
+    /// sources an inline base64 PDF; cache identity hashes its decoded bytes.
     fn doc_node_flow(data: &str) -> WorkflowDefinition {
-        let expected_hash = blake3::hash(data.as_bytes()).to_hex().to_string();
-        let _ = expected_hash; // the node computes this at runtime; here for reference.
         WorkflowDefinition {
             triggers: vec![],
             id: Uuid::nil(),
@@ -6213,9 +6205,18 @@ mod tests {
         // does NOT consult the sidecar (no sidecar is configured, so a cache
         // MISS would fail; the hit short-circuits before the distill).
         std::env::remove_var("TT_DOC_SIDECAR_URL");
-        let data = "JVBERi0="; // the cached text is keyed on blake3(this).
-        let cache_hash = blake3::hash(data.as_bytes()).to_hex().to_string();
-        let cache = RecordingCache::seed(&cache_hash, "cached-distilled-text");
+        std::env::set_var("TT_DOC_SIDECAR_REVISION", "sidecar-test");
+        let data = "JVBERi0=";
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        let cache_key = DistillCacheKey::new(
+            blake3::hash(&decoded).to_hex().to_string(),
+            None,
+            "application/pdf",
+            "sidecar-test",
+        );
+        let cache = RecordingCache::seed(cache_key, "cached-distilled-text");
         let def = doc_node_flow(data);
         let result = run_workflow(
             &StubExecutor::new(vec![]),
@@ -6253,6 +6254,7 @@ mod tests {
             json!("cached-distilled-text"),
             "a cache hit → the Output node carries the cached text"
         );
+        std::env::remove_var("TT_DOC_SIDECAR_REVISION");
     }
 
     #[tokio::test]

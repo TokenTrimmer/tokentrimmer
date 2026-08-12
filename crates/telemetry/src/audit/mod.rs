@@ -13,10 +13,10 @@
 //! - [`merkle`] — local-only Merkle inclusion proofs over the chain.
 //! - [`AuditError`] / [`VerifyError`] — error enums.
 
+pub mod checkpoint;
+pub mod merkle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-pub mod merkle;
-pub mod checkpoint;
 pub mod writer;
 
 use chrono::{DateTime, Utc};

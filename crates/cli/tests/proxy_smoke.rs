@@ -63,37 +63,33 @@ async fn anthropic_route_forwards_to_upstream_and_logs() {
     assert_eq!(snap.unmeasured_request_deltas, 1);
 }
 
-/// The gateway now exposes an Anthropic-native /v1/messages ingress that runs
-/// the same routing/cache/failover pipeline as /v1/chat/completions. So
-/// Gateway and Hybrid mode forward /v1/messages to the GATEWAY (Gateway injects
-/// the TokenTrimmer key; Hybrid passes the client's own credential through).
-/// Only Bypass mode forwards direct to the Anthropic upstream, with the
-/// client's own credential and no TokenTrimmer key injection.
+/// Gateway and Hybrid mode forward `/v1/messages` to a gateway. Gateway strips
+/// every client provider credential and injects only its TokenTrimmer key;
+/// Hybrid preserves the client credential but is restricted to a loopback
+/// self-hosted gateway. Bypass forwards directly to Anthropic with the client
+/// credential and no TokenTrimmer key.
 #[tokio::test]
 async fn messages_route_to_gateway_in_gateway_and_hybrid_else_anthropic() {
     // Helper: build a config whose configured upstream points at `upstream` and
     // whose *other* upstream is unroutable, so a mis-routed request 502s.
-    for (mode, expect_tt_key_injected) in [
-        (Mode::Gateway, true),
-        (Mode::Hybrid, false),
-        (Mode::Bypass, false),
+    for (mode, expect_tt_key_injected, expect_client_key_forwarded) in [
+        (Mode::Gateway, true, false),
+        (Mode::Hybrid, false, true),
+        (Mode::Bypass, false, true),
     ] {
         let routed = MockServer::start_async().await;
         let mock = routed
             .mock_async(move |when, then| {
-                when.method(POST)
-                    .path("/v1/messages")
-                    // Client's own Anthropic credential must always pass through.
-                    .header("x-api-key", "client-anthropic-key")
-                    // In Gateway mode the proxy injects its TokenTrimmer key on
-                    // `authorization`; in Hybrid/Bypass it must NOT (that would
-                    // leak it / clobber the client's OAuth on the Anthropic path).
-                    .is_true(move |req| {
-                        let has_auth = req.headers_vec().iter().any(|(k, v)| {
-                            k.eq_ignore_ascii_case("authorization") && v == "Bearer tt-secret"
-                        });
-                        has_auth == expect_tt_key_injected
+                when.method(POST).path("/v1/messages").is_true(move |req| {
+                    let has_tt_auth = req.headers_vec().iter().any(|(key, value)| {
+                        key.eq_ignore_ascii_case("authorization") && value == "Bearer tt-secret"
                     });
+                    let has_client_key = req.headers_vec().iter().any(|(key, value)| {
+                        key.eq_ignore_ascii_case("x-api-key") && value == "client-anthropic-key"
+                    });
+                    has_tt_auth == expect_tt_key_injected
+                        && has_client_key == expect_client_key_forwarded
+                });
                 then.status(200).body("ok");
             })
             .await;

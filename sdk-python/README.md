@@ -146,10 +146,10 @@ if stream.tt is not None:
 
 For multi-step tool-using runs, `client.agent.run(...)` drives the Gateway's
 server-side agent loop (`POST /v1/agent/runs`). The Gateway owns the loop
-(down-routing, judge-gated summarize, substep cache); the SDK just executes any
-**client** tool the run pauses on (via your `executor`) and resumes — until a
-final answer. Aggregate cost spans every turn and is read from the run body
-(`outcome.usage.cost_usd`), not response headers.
+(down-routing, judge-gated summarize, substep cache); the SDK executes any
+**client** tool the run pauses on (via your `executor`) and resumes until a
+terminal status or the client-side resume cap. Aggregate and per-turn cost come
+from the run body, not response headers.
 
 ```python
 def executor(name: str, arguments: str) -> str:
@@ -171,14 +171,27 @@ outcome = client.agent.run(
         },
     }],
     executor=executor,
-    max_turns=8,          # optional: server-side per-run turn cap
+    max_turns=8,          # server-side turn cap
+    max_cost_usd=0.05,    # aggregate served-cost admission cap
     tt_tag="feature=agent",
 )
 
-print(outcome.text)                       # final assistant answer
+print(outcome.text)                       # final assistant answer, if completed
 print(f"cost   ${outcome.usage.cost_usd:.4f}")
+print(f"turns  {outcome.usage.per_turn_cost_usd}")
 print(f"rounds {outcome.resume_rounds}")  # client-side tool_outputs resumes made
-```
+
+if outcome.stop_reason is not None:
+    print(f"stopped: {outcome.stop_reason}")
+if outcome.is_resumable:
+    # The client-side resume cap was hit; persist or dispatch these calls yourself.
+    print(outcome.pending_tool_calls)
+
+`max_cost_usd` is enforced before each server-side turn using accrued cost plus
+a best-effort estimate. The terminal `stop_reason` is `budget_exhausted` when
+the next turn is rejected, `budget_breach` when an already-admitted turn settles
+above the cap, `max_turns`, or `runaway`. It is an execution guard, not a
+provider-invoice guarantee.
 
 Paused/resumed transcripts remain in Redis for one hour. You can explicitly
 export or erase that short-lived resume state without deleting durable
@@ -196,7 +209,7 @@ the `x-tokentrimmer-*` cost/savings headers are invisible to LangSmith / OTel.
 `TokenTrimmerCostCallback` recovers them on every LLM finish, records them as
 OpenTelemetry span attributes (the **same** `gen_ai.*` / `tokentrimmer.*` keys
 the Gateway stamps on its own span — see `tokentrimmer.semconv`), and accumulates
-a per-run cost / savings total with an optional budget.
+a per-run cost / savings total with an optional post-response budget check.
 
 Optional extras — the base package never depends on LangChain or OpenTelemetry:
 
@@ -210,7 +223,7 @@ from tokentrimmer.integrations.langchain import (
     make_gateway_chat_openai,
 )
 
-cb = TokenTrimmerCostCallback(max_cost_usd=0.50)   # optional per-run budget
+cb = TokenTrimmerCostCallback(post_response_budget_usd=0.50)
 
 # make_gateway_chat_openai sets the two easy-to-miss flags for you:
 #   include_response_headers=True  → surfaces the x-tokentrimmer-* headers
@@ -233,10 +246,11 @@ The cost attributes land on whatever span is active when the LLM call finishes
 already run picks them up. Without the `otel` extra the callback still tallies
 `total_cost_usd` / `total_saved_usd` — span recording is a no-op.
 
-**Budget stop hook.** With `max_cost_usd` set, the finish that tips the
-accumulated cost past the cap raises `BudgetExceeded`; the handler sets
-`raise_error = True`, so LangChain propagates it out of `invoke` / `stream`
-instead of silently overspending.
+**Post-response budget hook.** With `post_response_budget_usd` set, the completed
+LLM response that tips observed accumulated cost over the budget raises
+`BudgetExceeded`; `raise_error = True` asks LangChain to propagate it out of
+`invoke` / `stream` before the chain starts its next step. The call that crossed
+the budget is already spent, so this is not a pre-dispatch hard cap.
 
 If you build `ChatOpenAI` yourself, set `include_response_headers=True` (and
 `use_responses_api=False`) — that is the hook the callback reads from
@@ -269,7 +283,7 @@ graph.add_edge(START, "model")
 graph.add_edge("model", END)
 app = graph.compile()
 
-cb = TokenTrimmerCostCallback(max_cost_usd=0.50)
+cb = TokenTrimmerCostCallback(post_response_budget_usd=0.50)
 app.invoke({"messages": [("user", "Hello")]}, config={"callbacks": [cb]})
 
 print(f"run cost  ${cb.total_cost_usd:.4f}")
@@ -295,7 +309,7 @@ from tokentrimmer.integrations.litellm import TokenTrimmerLiteLLMLogger
 
 # install() sets litellm.return_response_headers=True (required for LiteLLM to
 # expose the gateway headers) and registers the logger on litellm.callbacks.
-logger = TokenTrimmerLiteLLMLogger.install(max_cost_usd=0.50)
+logger = TokenTrimmerLiteLLMLogger.install(post_response_budget_usd=0.50)
 
 resp = litellm.completion(
     model="openai/claude-haiku-4-5",
@@ -303,7 +317,7 @@ resp = litellm.completion(
     api_key="tt_live_...",
     messages=[{"role": "user", "content": "Hello"}],
 )
-logger.raise_if_exceeded()          # enforce the budget at your checkpoint
+logger.raise_if_exceeded()  # stop before the next call if observed cost crossed
 
 print(f"run cost  ${logger.total_cost_usd:.4f}")
 print(f"run saved ${logger.total_saved_usd:.4f}")
@@ -319,12 +333,12 @@ background success event. It also reads `response._response_headers` /
 so a response without TokenTrimmer headers (self-hosted gateway, no pricing)
 simply records nothing.
 
-**Budget stop.** LiteLLM's callbacks are post-hoc *logging* events — LiteLLM
-swallows exceptions raised inside them — so, unlike the LangChain callback's
-inline `raise_error` stop, the budget is enforced at a **checkpoint**: crossing
-`max_cost_usd` flips `logger.budget_exceeded` and `logger.raise_if_exceeded()`
-raises `BudgetExceeded` (the same class both integrations share). Call it right
-after each `completion` to cap a multi-call loop.
+**Post-response budget checkpoint.** LiteLLM's callbacks are post-hoc *logging*
+events and swallow exceptions raised inside them. Crossing
+`post_response_budget_usd` therefore flips `logger.budget_exceeded`;
+`logger.raise_if_exceeded()` raises the shared `BudgetExceeded` at the caller's
+checkpoint. Call it after each `completion` to stop before the next call. It does
+not prevent or refund the completion whose response crossed the budget.
 
 The immediate checkpoint is guaranteed for synchronous OpenAI-compatible
 `completion()` responses that expose the gateway headers. Async completion uses

@@ -1,6 +1,7 @@
 //! Provider registry — central lookup from model ID to Provider impl.
 //! Adapters register themselves at server startup.
 
+use crate::budget_reservation::{BudgetReservationStore, BudgetedProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ use tt_provider_openrouter::OpenRouterProvider;
 use tt_provider_together::TogetherProvider;
 use tt_shared::{ModelInfo, Provider};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderRegistry {
     by_id: HashMap<&'static str, Arc<dyn Provider>>,
     by_model: HashMap<String, Arc<dyn Provider>>,
@@ -32,6 +33,7 @@ pub struct ProviderRegistry {
     /// enabled. Set explicitly by [`register_providers`] (the trait-object
     /// [`register`](Self::register) cannot recover the concrete type).
     openai: Option<Arc<OpenAiProvider>>,
+    budget_reservations_enabled: bool,
 }
 
 impl ProviderRegistry {
@@ -47,6 +49,28 @@ impl ProviderRegistry {
                 .insert(model.id.clone(), Arc::clone(&provider));
         }
         self.by_id.insert(id, provider);
+    }
+
+    /// Decorate every type-erased provider dispatch with the same durable
+    /// reservation store. Concrete OpenAI Batch API methods remain separate;
+    /// the Batch route uses the retained store to reject unpriced capped jobs.
+    pub(crate) fn enable_budget_reservations(&mut self, store: Arc<dyn BudgetReservationStore>) {
+        if self.budget_reservations_enabled {
+            return;
+        }
+        let providers = std::mem::take(&mut self.by_id);
+        for (id, provider) in providers {
+            self.by_id.insert(
+                id,
+                Arc::new(BudgetedProvider::new(provider, Arc::clone(&store))),
+            );
+        }
+        for provider in self.by_model.values_mut() {
+            if let Some(budgeted) = self.by_id.get(provider.id()) {
+                *provider = Arc::clone(budgeted);
+            }
+        }
+        self.budget_reservations_enabled = true;
     }
 
     /// Look up the static [`ModelInfo`] for `model_id`.

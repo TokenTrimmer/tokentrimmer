@@ -8,6 +8,7 @@
 #   DATABASE_URL        Neon Postgres connection string
 #   REDIS_URL           Upstash Redis URL
 #   TT_MASTER_KEY       Hex-encoded XChaCha20-Poly1305 root key (provider creds at rest)
+#   TT_METRICS_TOKEN    Dedicated bearer secret required by /metrics
 #   OTEL_EXPORTER_OTLP_ENDPOINT  (optional) — enables OTLP tracing export
 #
 # Deploy: `fly deploy`
@@ -55,3 +56,4 @@ primary_region = "iad"
 [env]
   RUST_LOG  = "info,tt_core=info,tt_provider_openai=info"
   PORT      = "8080"
+  TT_REQUIRE_METRICS_AUTH = "true"

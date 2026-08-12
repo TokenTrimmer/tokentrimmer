@@ -4,9 +4,9 @@
 //! * `GET  /v1/spend` — spend-today + MTD + budget-remaining. Backs the MCP
 //!   `get_spend_today` / `check_budget_remaining` tools.
 //! * `POST /v1/spend/limit` — set (or clear) the org's monthly spend cap, or a
-//!   per-key cap (key-ownership-gated). Backs the MCP `set_cost_limit` tool. The
-//!   gateway already READS these caps for enforcement ([`crate::tier_resolver`]);
-//!   this is the matching tenant-self-serve write on the same auth seam.
+//!   per-key cap (key-ownership-gated). Backs the MCP `set_cost_limit` tool.
+//!   [`crate::budget_reservation`] reads these caps for atomic provider-attempt
+//!   admission; this is the matching tenant-self-serve write on the same seam.
 
 use axum::{extract::State, Extension, Json};
 use serde::{Deserialize, Serialize};

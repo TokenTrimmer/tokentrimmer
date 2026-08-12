@@ -4,7 +4,8 @@
 # prod (always-on per ADR-016). Single region iad to match prod.
 #
 # Deploy:  fly deploy --config fly.staging.toml
-# Secrets: DATABASE_URL (Neon `staging` branch, DIRECT endpoint), TT_MASTER_KEY.
+# Secrets: DATABASE_URL (Neon `staging` branch, DIRECT endpoint), TT_MASTER_KEY,
+# TT_METRICS_TOKEN (dedicated bearer secret for /metrics).
 
 app            = "tokentrimmer-staging"
 primary_region = "iad"
@@ -47,3 +48,4 @@ primary_region = "iad"
 [env]
   RUST_LOG  = "info,tt_core=info"
   PORT      = "8080"
+  TT_REQUIRE_METRICS_AUTH = "true"

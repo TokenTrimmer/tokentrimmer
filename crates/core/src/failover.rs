@@ -144,8 +144,8 @@ pub struct HeaderCostConstraint {
 /// Optional route and request-header cost ceilings for failover candidates.
 ///
 /// Both constraints are evaluated when present, in route-then-header order.
-/// Candidates with unknown pricing remain permissive, matching the existing
-/// direct admission policy.
+/// Because this value exists only when at least one ceiling is active, unknown
+/// pricing is a rejection rather than an uncapped dispatch.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CandidateCostCheck {
     pub route: Option<RouteCostConstraint>,
@@ -164,20 +164,28 @@ pub(crate) struct CostLimitViolation {
     pub(crate) ceiling_usd: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CandidateCostAdmission {
+    Allowed,
+    PriceUnknown,
+    Violated(CostLimitViolation),
+}
+
 impl CandidateCostCheck {
-    /// Return the first applicable ceiling the resolved candidate exceeds.
+    /// Evaluate all active ceilings for a resolved candidate.
     ///
     /// Route checks retain their historical route-match token estimate. Header
     /// checks rebuild the final text-only prompt for the candidate provider so
     /// cross-provider fallback is admitted against that provider's tokenizer.
-    /// Unknown pricing is intentionally permissive, matching direct admission.
-    pub(crate) fn violation_for(
+    pub(crate) fn admission_for(
         &self,
         provider: &dyn Provider,
         model: &str,
         req: &ChatCompletionRequest,
-    ) -> Option<CostLimitViolation> {
-        let pricing = provider.pricing(model)?;
+    ) -> CandidateCostAdmission {
+        let Some(pricing) = provider.pricing(model) else {
+            return CandidateCostAdmission::PriceUnknown;
+        };
 
         if let Some(route) = self.route {
             let estimated_usd = crate::routes::chat::estimate_cost_usd(
@@ -186,7 +194,7 @@ impl CandidateCostCheck {
                 route.max_tokens,
             );
             if estimated_usd > route.ceiling_usd {
-                return Some(CostLimitViolation {
+                return CandidateCostAdmission::Violated(CostLimitViolation {
                     limit_kind: "route",
                     estimated_usd,
                     ceiling_usd: route.ceiling_usd,
@@ -194,25 +202,30 @@ impl CandidateCostCheck {
             }
         }
 
-        let header = self.header?;
+        let Some(header) = self.header else {
+            return CandidateCostAdmission::Allowed;
+        };
         let prompt = tt_shared::message_text_for_estimation(req);
         let input_tokens = tt_tokenize::estimate_tokens(provider.id(), &prompt);
         let estimated_usd =
             crate::routes::chat::estimate_cost_usd(&pricing, input_tokens, header.max_tokens);
-        (estimated_usd > header.ceiling_usd).then_some(CostLimitViolation {
-            limit_kind: "header",
-            estimated_usd,
-            ceiling_usd: header.ceiling_usd,
-        })
+        if estimated_usd > header.ceiling_usd {
+            CandidateCostAdmission::Violated(CostLimitViolation {
+                limit_kind: "header",
+                estimated_usd,
+                ceiling_usd: header.ceiling_usd,
+            })
+        } else {
+            CandidateCostAdmission::Allowed
+        }
     }
 }
 
 /// Error returned while selecting a provider from a failover chain.
 ///
-/// Provider errors preserve the historical retry/failover semantics. A known
-/// priced candidate that exceeds an applicable ceiling is reported
-/// separately so callers can serialize it as a request cost-limit error
-/// instead of a generic unavailable-upstream failure.
+/// Provider errors preserve the historical retry/failover semantics. Cost-gate
+/// rejections remain typed so callers never turn a requested USD ceiling into
+/// an unpriced dispatch or a generic unavailable-upstream response.
 #[derive(Debug, thiserror::Error)]
 pub enum FailoverError {
     #[error(transparent)]
@@ -225,26 +238,41 @@ pub enum FailoverError {
         estimated_usd: f64,
         ceiling_usd: f64,
     },
+
+    #[error("pricing is unavailable for model {model}; cannot enforce the requested cost ceiling")]
+    PriceUnknown { model: String },
+}
+
+#[derive(Debug)]
+enum CostGateRejection {
+    Limit(CostLimitViolation),
+    PriceUnknown { model: String },
 }
 
 /// Exhaustion state for cost-gated failover.
 ///
 /// A terminal cost rejection is useful only when it was the sole remaining
-/// recovery blocker: a primary may have failed before the final, over-ceiling
-/// fallback, but a later ordinary failure or any capability/resolution/
-/// credential/breaker skip means the chain was not exhausted *because of*
-/// cost alone. Keep this state shared by buffered and streaming dispatch so
-/// their public error priority stays identical.
+/// recovery blocker: a primary may have failed before the final gated fallback,
+/// but a later ordinary failure or any capability/resolution/credential/breaker
+/// skip means the chain was not exhausted because of cost admission alone.
 #[derive(Default)]
 struct CostGateExhaustion {
-    first_violation: Option<CostLimitViolation>,
+    first_rejection: Option<CostGateRejection>,
     saw_non_cost_skip: bool,
-    saw_attempt_failure_after_cost: bool,
+    saw_attempt_failure_after_rejection: bool,
 }
 
 impl CostGateExhaustion {
     fn record_cost_violation(&mut self, violation: CostLimitViolation) {
-        self.first_violation.get_or_insert(violation);
+        self.first_rejection
+            .get_or_insert(CostGateRejection::Limit(violation));
+    }
+
+    fn record_price_unknown(&mut self, model: &str) {
+        self.first_rejection
+            .get_or_insert_with(|| CostGateRejection::PriceUnknown {
+                model: model.to_string(),
+            });
     }
 
     fn record_non_cost_skip(&mut self) {
@@ -252,19 +280,24 @@ impl CostGateExhaustion {
     }
 
     fn record_attempt_failure(&mut self) {
-        if self.first_violation.is_some() {
-            self.saw_attempt_failure_after_cost = true;
+        if self.first_rejection.is_some() {
+            self.saw_attempt_failure_after_rejection = true;
         }
     }
 
     fn terminal_error(&self) -> Option<FailoverError> {
-        let violation = self.first_violation?;
-        (!self.saw_non_cost_skip && !self.saw_attempt_failure_after_cost).then_some(
-            FailoverError::CostLimitExceeded {
+        if self.saw_non_cost_skip || self.saw_attempt_failure_after_rejection {
+            return None;
+        }
+        match self.first_rejection.as_ref()? {
+            CostGateRejection::Limit(violation) => Some(FailoverError::CostLimitExceeded {
                 estimated_usd: violation.estimated_usd,
                 ceiling_usd: violation.ceiling_usd,
-            },
-        )
+            }),
+            CostGateRejection::PriceUnknown { model } => Some(FailoverError::PriceUnknown {
+                model: model.clone(),
+            }),
+        }
     }
 }
 
@@ -446,9 +479,9 @@ impl Default for CircuitBreaker {
 /// the check is skipped (with a `route_skipped_capability` tracing event)
 /// rather than dispatched.  Unknown-catalog models are permissive — not blocked.
 ///
-/// When `cost_check` is present, each resolved and known-priced candidate must
-/// satisfy its route and header ceilings before credentials, breaker state, or
-/// provider dispatch are touched. Unknown pricing remains permissive.
+/// When `cost_check` is present, each resolved candidate must have known
+/// pricing and satisfy its route and header ceilings before credentials,
+/// breaker state, or provider dispatch are touched.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_with_failover(
     registry: &ProviderRegistry,
@@ -499,23 +532,34 @@ pub async fn dispatch_with_failover(
             cost_exhaustion.record_non_cost_skip();
             continue;
         };
-        // Cost guard: resolved candidates with known pricing must fit each
-        // active ceiling before they can claim credentials, a breaker trial,
-        // or an upstream attempt. Route limits run first so a candidate that
-        // violates both reports the route ceiling deterministically.
-        if let Some(violation) = cost_check
-            .and_then(|cost_check| cost_check.violation_for(provider.as_ref(), model, req))
-        {
-            tracing::info!(
-                model = %model,
-                provider = %provider.id(),
-                limit_kind = violation.limit_kind,
-                estimated_usd = violation.estimated_usd,
-                ceiling_usd = violation.ceiling_usd,
-                "route_skipped_cost_limit: failover candidate exceeds request cost ceiling"
-            );
-            cost_exhaustion.record_cost_violation(violation);
-            continue 'candidates;
+        // Cost guard: every resolved candidate must have known pricing and fit
+        // each active ceiling before it can claim credentials, a breaker trial,
+        // or an upstream attempt.
+        if let Some(cost_check) = cost_check {
+            match cost_check.admission_for(provider.as_ref(), model, req) {
+                CandidateCostAdmission::Allowed => {}
+                CandidateCostAdmission::PriceUnknown => {
+                    tracing::info!(
+                        model = %model,
+                        provider = %provider.id(),
+                        "route_skipped_price_unknown: failover candidate cannot be cost-capped"
+                    );
+                    cost_exhaustion.record_price_unknown(model);
+                    continue 'candidates;
+                }
+                CandidateCostAdmission::Violated(violation) => {
+                    tracing::info!(
+                        model = %model,
+                        provider = %provider.id(),
+                        limit_kind = violation.limit_kind,
+                        estimated_usd = violation.estimated_usd,
+                        ceiling_usd = violation.ceiling_usd,
+                        "route_skipped_cost_limit: failover candidate exceeds request cost ceiling"
+                    );
+                    cost_exhaustion.record_cost_violation(violation);
+                    continue 'candidates;
+                }
+            }
         }
         // Per-candidate upstream credentials: each candidate may live on a
         // different provider than the request (cross-provider failover). Skip a
@@ -598,9 +642,9 @@ pub async fn dispatch_with_failover(
 /// the serving provider, the model it served, and the stream.
 ///
 /// Accepts the same [`CapCheck`] and [`CandidateCostCheck`] parameters as
-/// [`dispatch_with_failover`] — incapable or over-ceiling candidates are
-/// skipped before dispatch, and unknown-catalog or unknown-priced models are
-/// permissive.
+/// [`dispatch_with_failover`] — incapable, unpriced, or over-ceiling candidates
+/// are skipped before dispatch. Unknown capability metadata remains permissive;
+/// unknown pricing does not when a USD ceiling is active.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_stream_with_failover(
     registry: &ProviderRegistry,
@@ -657,22 +701,34 @@ pub async fn dispatch_stream_with_failover(
             cost_exhaustion.record_non_cost_skip();
             continue;
         };
-        // Keep stream establishment on the same admission boundary as
-        // buffered dispatch. Once a stream begins, failover is no longer
+        // Keep stream establishment on the same fail-closed admission boundary
+        // as buffered dispatch. Once a stream begins, failover is no longer
         // possible, so this must happen before credentials/breaker/dispatch.
-        if let Some(violation) = cost_check
-            .and_then(|cost_check| cost_check.violation_for(provider.as_ref(), model, req))
-        {
-            tracing::info!(
-                model = %model,
-                provider = %provider.id(),
-                limit_kind = violation.limit_kind,
-                estimated_usd = violation.estimated_usd,
-                ceiling_usd = violation.ceiling_usd,
-                "route_skipped_cost_limit: failover stream candidate exceeds request cost ceiling"
-            );
-            cost_exhaustion.record_cost_violation(violation);
-            continue 'candidates;
+        if let Some(cost_check) = cost_check {
+            match cost_check.admission_for(provider.as_ref(), model, req) {
+                CandidateCostAdmission::Allowed => {}
+                CandidateCostAdmission::PriceUnknown => {
+                    tracing::info!(
+                        model = %model,
+                        provider = %provider.id(),
+                        "route_skipped_price_unknown: failover stream candidate cannot be cost-capped"
+                    );
+                    cost_exhaustion.record_price_unknown(model);
+                    continue 'candidates;
+                }
+                CandidateCostAdmission::Violated(violation) => {
+                    tracing::info!(
+                        model = %model,
+                        provider = %provider.id(),
+                        limit_kind = violation.limit_kind,
+                        estimated_usd = violation.estimated_usd,
+                        ceiling_usd = violation.ceiling_usd,
+                        "route_skipped_cost_limit: failover stream candidate exceeds request cost ceiling"
+                    );
+                    cost_exhaustion.record_cost_violation(violation);
+                    continue 'candidates;
+                }
+            }
         }
         // Per-candidate upstream credentials: each candidate may live on a
         // different provider than the request (cross-provider failover). Skip a
@@ -1075,6 +1131,7 @@ mod tests {
 
     fn ctx() -> RequestContext {
         RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
             trace_id: uuid::Uuid::nil(),
             org_id: uuid::Uuid::nil(),
             api_key_id: uuid::Uuid::nil(),
@@ -1932,6 +1989,60 @@ mod tests {
         ) -> Result<EmbeddingsResponse, ProviderError> {
             Err(ProviderError::Unsupported("n/a".into()))
         }
+    }
+
+    #[tokio::test]
+    async fn active_cost_gate_rejects_unpriced_buffered_and_stream_candidates() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CapMockProvider {
+            id: "text-prov",
+            info: model_info_with("unpriced-model", vec![Capability::Text], 128_000),
+        }));
+        let candidates = vec!["unpriced-model".to_string()];
+        let request = req("unpriced-model");
+        let cost_check = CandidateCostCheck {
+            route: None,
+            header: Some(HeaderCostConstraint {
+                ceiling_usd: 1.0,
+                max_tokens: Some(1),
+            }),
+        };
+
+        let buffered = dispatch_with_failover(
+            &registry,
+            &CircuitBreaker::default(),
+            &fast(),
+            &candidates,
+            &request,
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+            Some(cost_check),
+        )
+        .await;
+        assert!(matches!(
+            buffered,
+            Err(FailoverError::PriceUnknown { model }) if model == "unpriced-model"
+        ));
+
+        let streaming = dispatch_stream_with_failover(
+            &registry,
+            &CircuitBreaker::default(),
+            &fast(),
+            &candidates,
+            &request,
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+            Some(cost_check),
+        )
+        .await;
+        assert!(matches!(
+            streaming,
+            Err(FailoverError::PriceUnknown { model }) if model == "unpriced-model"
+        ));
     }
 
     /// (a) Vision request is NOT dispatched to a text-only model; passthrough

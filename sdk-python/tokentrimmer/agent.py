@@ -48,14 +48,23 @@ class RunUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float = 0.0
+    # Unoptimized comparison cost aggregated across the run's turns.
+    baseline_cost_usd: Optional[float] = None
+    # Served cost for each server-side turn, in order.
+    per_turn_cost_usd: List[float] = field(default_factory=list)
 
     @classmethod
     def _from_payload(cls, data: Optional[Dict[str, Any]]) -> "RunUsage":
         data = data or {}
+        baseline = data.get("baseline_cost_usd")
         return cls(
             prompt_tokens=int(data.get("prompt_tokens", 0)),
             completion_tokens=int(data.get("completion_tokens", 0)),
             cost_usd=float(data.get("cost_usd", 0.0)),
+            baseline_cost_usd=float(baseline) if baseline is not None else None,
+            per_turn_cost_usd=[
+                float(value) for value in data.get("per_turn_cost_usd", [])
+            ],
         )
 
 
@@ -75,6 +84,8 @@ class Run:
     usage: RunUsage
     note: Optional[str] = None
     summarizer_tax_usd: Optional[float] = None
+    # Machine-readable terminal cause. None for normal completion or while paused.
+    stop_reason: Optional[str] = None
 
     @classmethod
     def _from_payload(cls, data: Dict[str, Any]) -> "Run":
@@ -86,12 +97,18 @@ class Run:
             usage=RunUsage._from_payload(data.get("usage")),
             note=data.get("note"),
             summarizer_tax_usd=data.get("summarizer_tax_usd"),
+            stop_reason=data.get("stop_reason"),
         )
 
     @property
+    def is_resumable(self) -> bool:
+        """Whether client tool outputs can resume this run."""
+        return self.status == "requires_action"
+
+    @property
     def is_terminal(self) -> bool:
-        """True once the run can no longer be resumed (anything but ``requires_action``)."""
-        return self.status != "requires_action"
+        """Whether the run cannot accept further tool outputs."""
+        return not self.is_resumable
 
     @property
     def text(self) -> Optional[str]:
@@ -112,6 +129,9 @@ class Run:
         are exactly the client tools the caller must run. Empty unless
         ``status == "requires_action"``.
         """
+        if not self.is_resumable:
+            return []
+
         answered = {
             msg.get("tool_call_id")
             for msg in self.messages
@@ -149,6 +169,21 @@ class AgentOutcome:
     def messages(self) -> List[Dict[str, Any]]:
         """The full final transcript of the run."""
         return self.run.messages
+
+    @property
+    def stop_reason(self) -> Optional[str]:
+        """Machine-readable reason the server stopped the run, if any."""
+        return self.run.stop_reason
+
+    @property
+    def pending_tool_calls(self) -> List[Dict[str, Any]]:
+        """Unanswered client tool calls when the run is resumable."""
+        return self.run.pending_tool_calls()
+
+    @property
+    def is_resumable(self) -> bool:
+        """Whether client tool outputs can resume the returned run."""
+        return self.run.is_resumable
 
 
 def _executor_error_output(exc: BaseException) -> str:
@@ -192,6 +227,7 @@ class Agent:
         executor: Executor,
         tools: Optional[List[Dict[str, Any]]] = None,
         max_turns: Optional[int] = None,
+        max_cost_usd: Optional[float] = None,
         max_resume_rounds: int = DEFAULT_MAX_RESUME_ROUNDS,
         tt_tag: Optional[str] = None,
     ) -> AgentOutcome:
@@ -208,6 +244,10 @@ class Agent:
             run only pauses on tools the Gateway does NOT execute itself.
         :param max_turns: server-side per-run turn cap (the Gateway clamps to
             ``[1, 32]``); ``None`` uses the Gateway default.
+        :param max_cost_usd: server-enforced aggregate served-cost ceiling.
+            Before each turn, the Gateway stops with ``budget_exhausted`` if
+            that turn's estimate would cross the cap. An admitted turn can
+            finish above it and report ``budget_breach``.
         :param max_resume_rounds: client-side cap on resume round-trips
             (default 8) before the driver returns a still-paused run.
         :param tt_tag: ``X-TokenTrimmer-Tag`` cost-attribution tag, forwarded on
@@ -219,10 +259,12 @@ class Agent:
         if not model or not model.strip():
             raise ValueError("model must be a non-empty string")
 
-        run = self._create(model, messages, tools, max_turns, tt_tag)
+        run = self._create(
+            model, messages, tools, max_turns, max_cost_usd, tt_tag
+        )
         resume_rounds = 0
 
-        while run.status == "requires_action" and resume_rounds < max_resume_rounds:
+        while run.is_resumable and resume_rounds < max_resume_rounds:
             pending = run.pending_tool_calls()
             # A ``requires_action`` run always has >=1 pending client tool; an
             # empty list would mean a server contract break. Stop rather than
@@ -267,6 +309,7 @@ class Agent:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
         max_turns: Optional[int],
+        max_cost_usd: Optional[float],
         tt_tag: Optional[str],
     ) -> Run:
         body: Dict[str, Any] = {"model": model, "messages": messages, "stream": False}
@@ -274,6 +317,8 @@ class Agent:
             body["tools"] = tools
         if max_turns is not None:
             body["max_turns"] = max_turns
+        if max_cost_usd is not None:
+            body["max_cost_usd"] = max_cost_usd
         return self._send(f"{self._base}/agent/runs", body, tt_tag)
 
     def _resume(

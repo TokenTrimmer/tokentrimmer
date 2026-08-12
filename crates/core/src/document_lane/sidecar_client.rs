@@ -10,6 +10,8 @@
 //!
 //! - Disabled by default: the sidecar URL comes from `TT_DOC_SIDECAR_URL`
 //!   ([`sidecar_url_from_env`]); unset/blank means "no sidecar" → `None`.
+//! - Cache provenance comes from immutable `TT_DOC_SIDECAR_REVISION`; a missing
+//!   or unknown revision disables reuse, not extraction.
 //! - Short timeout (5s) so a wedged sidecar can't add latency to the hot path.
 //! - The wire span `kind` (`"lossless"`/`"lossy"`) maps onto D4a's
 //!   [`SpanFidelity`] so the D4c gate can branch on it.
@@ -23,6 +25,10 @@ use super::SpanFidelity;
 /// Environment variable holding the sidecar base URL (e.g.
 /// `http://127.0.0.1:8088`). Unset or blank disables the Document Lane sidecar.
 pub const SIDECAR_URL_ENV: &str = "TT_DOC_SIDECAR_URL";
+/// Immutable sidecar build/config revision used by the document cache key.
+/// Caching is disabled when this value is absent rather than reusing extraction
+/// output across an unknown sidecar upgrade.
+pub const SIDECAR_REVISION_ENV: &str = "TT_DOC_SIDECAR_REVISION";
 
 /// Hard ceiling on a single sidecar round-trip. Kept short: the seam is on the
 /// post-match hot path, and a distillation is optional, so a slow sidecar must
@@ -52,6 +58,8 @@ pub struct Extraction {
     pub spans: Vec<ExtractSpan>,
     /// Number of pages the extractor saw.
     pub pages: u32,
+    /// Extractor engine reported by the sidecar (for provenance).
+    pub engine: String,
 }
 
 impl Extraction {
@@ -76,6 +84,15 @@ pub fn sidecar_url_from_env() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Read the immutable sidecar build/config revision used for cache identity.
+#[must_use]
+pub fn sidecar_revision_from_env() -> Option<String> {
+    std::env::var(SIDECAR_REVISION_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "unknown")
 }
 
 /// Extract text from a document via the sidecar. **Fail-open:** returns `None`
@@ -139,6 +156,8 @@ struct WireResponse {
     spans: Vec<WireSpan>,
     #[serde(default)]
     pages: u32,
+    #[serde(default)]
+    engine: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +181,7 @@ impl WireResponse {
         if self.text.trim().is_empty()
             || self.spans.is_empty()
             || self.pages == 0
+            || self.engine.trim().is_empty()
             || !self.spans.iter().any(|span| span.chars > 0)
         {
             return None;
@@ -170,6 +190,7 @@ impl WireResponse {
         Some(Extraction {
             text: self.text,
             pages: self.pages,
+            engine: self.engine,
             spans: self
                 .spans
                 .into_iter()
@@ -248,6 +269,7 @@ mod tests {
         let extraction = got.expect("a structurally valid 200 must parse into Some");
         assert_eq!(extraction.text, "Hello TokenTrimmer");
         assert_eq!(extraction.pages, 2);
+        assert_eq!(extraction.engine, "future-extractor-v9");
         assert_eq!(extraction.spans.len(), 2);
         assert_eq!(extraction.spans[0].fidelity, SpanFidelity::Lossless);
         assert_eq!(extraction.spans[0].chars, 11);
@@ -272,16 +294,19 @@ mod tests {
                 text: " \t".to_string(),
                 spans: vec![span()],
                 pages: 1,
+                engine: "test".to_string(),
             },
             WireResponse {
                 text: "text".to_string(),
                 spans: vec![],
                 pages: 1,
+                engine: "test".to_string(),
             },
             WireResponse {
                 text: "text".to_string(),
                 spans: vec![span()],
                 pages: 0,
+                engine: "test".to_string(),
             },
             WireResponse {
                 text: "text".to_string(),
@@ -291,6 +316,13 @@ mod tests {
                     chars: 0,
                 }],
                 pages: 1,
+                engine: "test".to_string(),
+            },
+            WireResponse {
+                text: "text".to_string(),
+                spans: vec![span()],
+                pages: 1,
+                engine: String::new(),
             },
         ];
 
@@ -473,6 +505,7 @@ mod tests {
             text: "text".to_string(),
             spans: vec![],
             pages: 1,
+            engine: "test".to_string(),
         };
 
         assert!(!extraction.is_lossless());

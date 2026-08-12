@@ -147,7 +147,7 @@ def test_hidden_params_as_object_attribute():
 
 def test_no_headers_degrades_gracefully():
     """A plain (non-gateway) response records nothing and never raises."""
-    logger = TokenTrimmerLiteLLMLogger(max_cost_usd=0.0001, record_spans=False)
+    logger = TokenTrimmerLiteLLMLogger(post_response_budget_usd=0.0001, record_spans=False)
     plain = _response(response_headers={"content-type": "application/json"})
     _emit(logger, plain)
     assert logger.total_cost_usd == 0.0
@@ -164,7 +164,7 @@ def test_missing_headers_entirely_is_noop():
 
 
 def test_budget_breach_records_flag_and_raise_if_exceeded():
-    logger = TokenTrimmerLiteLLMLogger(max_cost_usd=0.05, record_spans=False)
+    logger = TokenTrimmerLiteLLMLogger(post_response_budget_usd=0.05, record_spans=False)
     # First call stays under the cap.
     _emit(logger, _response(response_headers=_headers("0.03")))
     assert logger.total_cost_usd == pytest.approx(0.03)
@@ -184,7 +184,7 @@ def test_budget_breach_records_flag_and_raise_if_exceeded():
 
 def test_budget_not_exceeded_exactly_at_cap():
     """At exactly the cap is not a breach (strictly-greater triggers)."""
-    logger = TokenTrimmerLiteLLMLogger(max_cost_usd=0.0034, record_spans=False)
+    logger = TokenTrimmerLiteLLMLogger(post_response_budget_usd=0.0034, record_spans=False)
     _emit(logger, _response(response_headers=_headers("0.0034")))
     assert logger.budget_exceeded is False
     logger.raise_if_exceeded()
@@ -214,7 +214,7 @@ def test_async_log_success_event_records():
 
 
 def test_sync_post_api_hook_accounts_immediately_without_success_double_count():
-    logger = TokenTrimmerLiteLLMLogger(max_cost_usd=0.001, record_spans=False)
+    logger = TokenTrimmerLiteLLMLogger(post_response_budget_usd=0.001, record_spans=False)
     kwargs = {
         "litellm_call_id": "call-1",
         "response_headers": TT_HEADERS,
@@ -248,10 +248,10 @@ def test_install_sets_return_response_headers_and_registers():
     try:
         litellm.callbacks = []
         litellm.return_response_headers = False
-        logger = TokenTrimmerLiteLLMLogger.install(max_cost_usd=0.5)
+        logger = TokenTrimmerLiteLLMLogger.install(post_response_budget_usd=0.5)
         assert litellm.return_response_headers is True
         assert logger in litellm.callbacks
-        assert logger.max_cost_usd == 0.5
+        assert logger.post_response_budget_usd == 0.5
         # Idempotent: installing the same handler again does not duplicate it.
         # (a fresh install() makes a new handler, so register it explicitly)
         litellm.callbacks.append(logger)
@@ -295,7 +295,7 @@ def test_end_to_end_litellm_completion_captures_cost():
     headers = {"content-type": "application/json", **TT_HEADERS}
     try:
         litellm.callbacks = []
-        logger = TokenTrimmerLiteLLMLogger.install(max_cost_usd=0.001)
+        logger = TokenTrimmerLiteLLMLogger.install(post_response_budget_usd=0.001)
         with respx.mock:
             respx.post("https://api.openai.com/v1/chat/completions").mock(
                 return_value=httpx.Response(200, json=body, headers=headers)

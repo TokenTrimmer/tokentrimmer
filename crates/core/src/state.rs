@@ -14,6 +14,7 @@ use tt_telemetry::{
 };
 
 use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
+use crate::budget_reservation::BudgetReservationStore;
 use crate::failover::CircuitBreaker;
 use crate::middleware::argon2_cap::{Argon2Cap, Argon2CapConfig, Argon2VerifyCap};
 use crate::middleware::key_cache::{KeyVerifyCache, RevocationRegistry, VerifyCache};
@@ -215,6 +216,10 @@ pub struct AppState {
     /// checks it pre-flight (429 on deny) and the chat handler records realized
     /// spend. `None` disables budget enforcement (tests, dev, unmetered orgs).
     pub budget: Option<Arc<dyn BudgetEnforcer>>,
+    /// Durable provider-attempt reservation store. The registry decorator
+    /// covers type-erased chat/stream/embedding calls; direct batch methods use
+    /// this same handle to fail closed when their input cannot be priced.
+    pub budget_reservation_store: Option<Arc<dyn BudgetReservationStore>>,
     /// Optional per-org subscription tier resolver. When `Some`, the auth
     /// middleware resolves the org's effective tier, stamps
     /// `ApiKeyContext.tier`, and uses the resolved [`BudgetLimits`] for the
@@ -387,6 +392,7 @@ impl AppState {
             dogfood_enabled: false,
             dogfood_bind_is_loopback: false,
             budget: None,
+            budget_reservation_store: None,
             tier_resolver: None,
             dynamic_budget: Arc::new(DynamicBudgetEnforcer::new()),
             // Reads `TT_BREAKER_FAILURE_THRESHOLD` / `TT_BREAKER_COOLDOWN_SECS`
@@ -420,6 +426,16 @@ impl AppState {
     #[must_use]
     pub fn with_db_pool(mut self, pool: sqlx::PgPool) -> Self {
         self.db_pool = Some(pool);
+        self
+    }
+
+    /// Install the durable pre-dispatch reservation decorator on every
+    /// type-erased provider. `Arc::make_mut` keeps the builder safe even if a
+    /// caller cloned an intermediate state.
+    #[must_use]
+    pub fn with_budget_reservation_store(mut self, store: Arc<dyn BudgetReservationStore>) -> Self {
+        Arc::make_mut(&mut self.registry).enable_budget_reservations(Arc::clone(&store));
+        self.budget_reservation_store = Some(store);
         self
     }
 

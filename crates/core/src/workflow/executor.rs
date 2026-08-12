@@ -271,7 +271,9 @@ fn terminal_run_to_node_outcome(run: agent_run::Run, capped: bool) -> NodeRunOut
     if capped && run.status == RunStatus::Failed {
         return NodeRunOutcome::ProviderCallFailed {
             accrued_cost_usd: run.usage.cost_usd,
-            reason: run.note.unwrap_or_else(|| "provider call failed".to_string()),
+            reason: run
+                .note
+                .unwrap_or_else(|| "provider call failed".to_string()),
         };
     }
     // Extract the last assistant text from the transcript.
@@ -417,7 +419,11 @@ mod tests {
     #[test]
     fn capped_budget_control_stop_still_produces_node_output() {
         let outcome = terminal_run_to_node_outcome(
-            run_with(RunStatus::Incomplete, 0.50, Some("run cost cap $0.40 breached")),
+            run_with(
+                RunStatus::Incomplete,
+                0.50,
+                Some("run cost cap $0.40 breached"),
+            ),
             /* capped */ true,
         );
         assert!(
