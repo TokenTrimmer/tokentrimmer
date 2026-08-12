@@ -341,35 +341,45 @@ pub fn build_router_with_retrieval(
     // bearer-auth layer keeps the tenant bearer out of this trust boundary;
     // the handler requires its own short-lived, domain-separated HMAC
     // capability and fails closed unless boot explicitly wires it.
-    base.route(
-        "/internal/v1/account-purge/l1",
-        post(routes::account_purge::purge_l1),
-    )
-    .layer(axum::middleware::from_fn(middleware::trace::middleware))
-    .layer(TraceLayer::new_for_http())
-    // Request timeouts are applied per-route above (ARCH-4), not as a single
-    // flat layer here, so streaming completions keep the long ceiling while
-    // non-streaming endpoints get a short one.
-    //
-    // CORS is intentionally fully open (any origin/method/header): this is a
-    // bearer-token API with no cookies/ambient credentials, so a permissive
-    // CORS policy grants a browser nothing it couldn't already do server-side
-    // — every request must still carry a valid `Authorization: Bearer` key.
-    .layer(
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any),
-    )
-    // Explicit request-body cap. Axum's default is only 2MB — too small for
-    // large-context chat requests (256k-token windows can exceed it). Sized
-    // for the largest supported context; returns 413 on exceed. (§4.15)
-    .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-    // Outermost app middleware: stamps `X-TokenTrimmer-Latency-Ms` on EVERY
-    // response — including the timeout 504 and body-limit 413 produced by the
-    // layers it wraps (the later `.layer()` is the outer one in axum/tower).
-    .layer(axum::middleware::from_fn(middleware::latency::middleware))
-    .with_state(state)
+    let app = base
+        .route(
+            "/internal/v1/account-purge/l1",
+            post(routes::account_purge::purge_l1),
+        )
+        .layer(axum::middleware::from_fn(middleware::trace::middleware))
+        .layer(TraceLayer::new_for_http())
+        // Request timeouts are applied per-route above (ARCH-4), not as a single
+        // flat layer here, so streaming completions keep the long ceiling while
+        // non-streaming endpoints get a short one.
+        //
+        // CORS is intentionally fully open (any origin/method/header): this is a
+        // bearer-token API with no cookies/ambient credentials, so a permissive
+        // CORS policy grants a browser nothing it couldn't already do server-side
+        // — every request must still carry a valid `Authorization: Bearer` key.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        // Explicit request-body cap. Axum's default is only 2MB — too small for
+        // large-context chat requests (256k-token windows can exceed it). Sized
+        // for the largest supported context; returns 413 on exceed. (§4.15)
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        // Outermost app middleware: stamps `X-TokenTrimmer-Latency-Ms` on EVERY
+        // response — including the timeout 504 and body-limit 413 produced by the
+        // layers it wraps (the later `.layer()` is the outer one in axum/tower).
+        .layer(axum::middleware::from_fn(middleware::latency::middleware));
+
+    let app = match middleware::canonical_host::configured_host() {
+        Some(expected) => app.layer(axum::middleware::from_fn_with_state(
+            expected,
+            middleware::canonical_host::middleware,
+        )),
+        None => app,
+    };
+
+    app.with_state(state)
 }
 
 #[cfg(test)]

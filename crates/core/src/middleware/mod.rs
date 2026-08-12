@@ -14,6 +14,7 @@
 
 pub mod argon2_cap;
 pub mod auth;
+pub mod canonical_host;
 pub mod key_cache;
 pub mod latency;
 pub mod retrieval;
