@@ -1888,9 +1888,10 @@ fn build_credential_store(
 /// Reads config from env (see [`tt_config::Config::from_env`]). A configured
 /// database is a hard dependency: connect, migration, and exact-ledger
 /// readback must all succeed before bind. An absent database remains supported
-/// only for the explicit loopback dev mode. Redis stays optional/best-effort.
-/// Bind / serve are fatal, including the refusal to expose a DB-less gateway
-/// without an explicit unsafe public-bind opt-in.
+/// only for explicit loopback development. Redis is optional only in that local
+/// mode; hosted manifests require it for shared pre-auth abuse limits. Bind /
+/// serve are fatal, including refusal to expose a DB-less gateway without an
+/// explicit unsafe public-bind opt-in.
 async fn connect_configured_gateway_database(
     url: &str,
     boot_timeout: std::time::Duration,
@@ -1908,6 +1909,10 @@ async fn connect_configured_gateway_database(
         "gateway schema migration or exact-ledger verification failed; refusing to bind HTTP",
     )?;
     Ok(pool)
+}
+
+fn redis_namespace(app_name: &str, component: &str) -> String {
+    format!("tt:{app_name}:{component}")
 }
 
 async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
@@ -1965,6 +1970,9 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // remains deterministic and bounded per process.
     let require_shared_rate_limit =
         std::env::var("TT_REQUIRE_SHARED_RATE_LIMIT").as_deref() == Ok("true");
+    let redis_app_namespace = std::env::var("FLY_APP_NAME").unwrap_or_else(|_| "local".to_string());
+    let l1_namespace = redis_namespace(&redis_app_namespace, "l1");
+    let rate_limit_namespace = redis_namespace(&redis_app_namespace, "rate-limit");
     let (l1_cache, shared_rate_limiter): (
         Option<Arc<dyn tt_cache::L1Cache>>,
         Option<tt_cache::RedisRateLimiter>,
@@ -1973,14 +1981,14 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
             tracing::info!("connecting to redis (L1 cache + shared abuse limiter)");
             match tokio::time::timeout(
                 boot_timeout,
-                tt_cache::redis_impl::RedisL1Cache::connect(url, "tt:l1"),
+                tt_cache::redis_impl::RedisL1Cache::connect(url, l1_namespace),
             )
             .await
             {
                 Ok(Ok(c)) => {
                     let limiter = tt_cache::RedisRateLimiter::from_connection_manager(
                         c.connection_manager(),
-                        "tt:rate-limit",
+                        rate_limit_namespace,
                     );
                     let cache = match tt_cache::ResponseCodec::from_env() {
                         Ok(Some(codec)) => {
@@ -2550,6 +2558,19 @@ mod gateway_fail_closed_tests {
     const ANY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
     const PUBLIC: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+
+    #[test]
+    fn hosted_redis_namespaces_isolate_apps_and_components() {
+        assert_eq!(redis_namespace("tokentrimmer", "l1"), "tt:tokentrimmer:l1");
+        assert_ne!(
+            redis_namespace("tokentrimmer", "rate-limit"),
+            redis_namespace("tokentrimmer-staging", "rate-limit")
+        );
+        assert_ne!(
+            redis_namespace("tokentrimmer", "l1"),
+            redis_namespace("tokentrimmer", "rate-limit")
+        );
+    }
 
     // -- startup-config matrix ------------------------------------------------
 
