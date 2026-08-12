@@ -133,9 +133,12 @@ pub(crate) fn replay_transform(input: &CapturedNodeInput) -> Result<String, Repl
             break;
         };
         let ref_str = remaining[..close].trim();
-        let value = input.refs.get(ref_str).ok_or_else(|| ReplayError::MissingRef {
-            name: ref_str.to_string(),
-        })?;
+        let value = input
+            .refs
+            .get(ref_str)
+            .ok_or_else(|| ReplayError::MissingRef {
+                name: ref_str.to_string(),
+            })?;
         result.push_str(value);
         remaining = &remaining[close + 2..];
     }
@@ -165,7 +168,10 @@ mod tests {
         let mut expected = BTreeMap::new();
         expected.insert("input".to_string(), "hello".to_string());
         expected.insert("m1.score".to_string(), "0.98".to_string());
-        assert_eq!(refs, expected, "keys trimmed; duplicates collapse to first resolution");
+        assert_eq!(
+            refs, expected,
+            "keys trimmed; duplicates collapse to first resolution"
+        );
     }
 
     #[test]
@@ -173,7 +179,10 @@ mod tests {
         // `{{m1}}` and `{{m1.score}}` are distinct refs; secrets come back as the
         // engine's redaction marker so a capture is value-free by construction.
         let refs = capture_refs("{{m1}} then {{m1.score}} and {{secrets.K}}", resolve_static);
-        assert_eq!(refs.get("m1").map(String::as_str), Some(r#"{"score":0.98}"#));
+        assert_eq!(
+            refs.get("m1").map(String::as_str),
+            Some(r#"{"score":0.98}"#)
+        );
         assert_eq!(refs.get("m1.score").map(String::as_str), Some("0.98"));
         assert_eq!(refs.get("secrets.K").map(String::as_str), Some("***"));
     }
@@ -211,8 +220,9 @@ mod tests {
         // Template truncated at MAX_CAPTURED_TEMPLATE_LEN (ref placed first so
         // it survives the truncation window, mirroring in-order templates).
         let huge_template = "a".repeat(MAX_CAPTURED_TEMPLATE_LEN + 500);
-        let capture2 = capture_node_input(&format!("{{{{input}}}} {huge_template}"), resolve_static)
-            .expect("has a ref");
+        let capture2 =
+            capture_node_input(&format!("{{{{input}}}} {huge_template}"), resolve_static)
+                .expect("has a ref");
         assert!(capture2.template.chars().count() <= MAX_CAPTURED_TEMPLATE_LEN);
         // The truncation window keeps the leading ref + drops the trailing pad.
         assert_eq!(capture2.template.chars().count(), MAX_CAPTURED_TEMPLATE_LEN);
@@ -231,10 +241,7 @@ mod tests {
                 ("variables.REGION".to_string(), "us-east".to_string()),
             ]),
         };
-        assert_eq!(
-            replay_transform(&input).unwrap(),
-            "hello|0.98|us-east"
-        );
+        assert_eq!(replay_transform(&input).unwrap(), "hello|0.98|us-east");
     }
 
     #[test]

@@ -491,6 +491,7 @@ async fn lossless_inline_pdf_conversion_can_reach_the_text_target() {
                 json!({
                     "text": "Lossless memo text",
                     "pages": 1,
+                    "engine": "pdf-text-layer",
                     "spans": [{"kind": "lossless", "page": 0, "chars": 18}]
                 })
                 .to_string(),
@@ -586,6 +587,7 @@ async fn route_selected_panel_suppresses_document_lane_and_keeps_raw_members() {
                 json!({
                     "text": "must not be used",
                     "pages": 1,
+                    "engine": "pdf-text-layer",
                     "spans": [{"kind": "lossless", "page": 0, "chars": 16}]
                 })
                 .to_string(),
@@ -624,6 +626,7 @@ async fn header_selected_panel_suppresses_document_lane_and_keeps_raw_members() 
                 json!({
                     "text": "must not be used",
                     "pages": 1,
+                    "engine": "pdf-text-layer",
                     "spans": [{"kind": "lossless", "page": 0, "chars": 16}]
                 })
                 .to_string(),

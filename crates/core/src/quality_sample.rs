@@ -2944,6 +2944,7 @@ mod tests {
 
     fn test_ctx() -> RequestContext {
         RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
             trace_id: Uuid::now_v7(),
             org_id: Uuid::now_v7(),
             api_key_id: Uuid::now_v7(),

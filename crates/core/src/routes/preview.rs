@@ -112,7 +112,14 @@ pub async fn post_preview(
         // otherwise a resolved panel body budget is the comparison ceiling.
         // This still does not run the admission gate or prove that live
         // credentials, provider state, or dispatch will match the preview.
-        let ceiling = cost_limit_from_header(&headers).or(cfg.max_cost_usd);
+        let ceiling = cost_limit_from_header(&headers)
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": error.to_string() })),
+                )
+            })?
+            .or(cfg.max_cost_usd);
 
         // within_budget: None when no ceiling supplied; false when the known
         // static plan is incomplete/unpriceable or exceeds that ceiling.

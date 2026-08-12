@@ -12,7 +12,8 @@
   ],
   "components": {
     "securitySchemes": {
-      "BearerAuth": { "type": "http", "scheme": "bearer", "description": "A tt_live_ (production) or tt_test_ (sandbox) API key." }
+      "BearerAuth": { "type": "http", "scheme": "bearer", "description": "A tt_live_ (production) or tt_test_ (sandbox) API key." },
+      "MetricsBearer": { "type": "http", "scheme": "bearer", "description": "The dedicated TT_METRICS_TOKEN operator credential; never a tenant or admin token." }
     }
   },
   "security": [ { "BearerAuth": [] } ],
@@ -36,7 +37,7 @@
       "post": { "summary": "Offline cost preview", "description": "Projects the cost + savings + route suggestions for a request WITHOUT calling any model (pure, synchronous, no network).", "responses": { "200": { "description": "The preview (projected tokens, cost, savings, route suggestions)." } } }
     },
     "/v1/agent/runs": {
-      "post": { "summary": "Create + run an agentic loop", "description": "Server-side model→tool→model loop over the read-only gateway tools. Non-streaming returns a JSON Run; stream:true returns SSE events (run.turn, run.turn_cost, run.message, run.tool_result, run.requires_action, run.completed, run.failed, run.incomplete). Stops on max_turns, budget_exhausted, or the runaway-repeat detector.", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "model": { "type": "string" }, "messages": { "type": "array" }, "tools": { "type": "array" }, "max_turns": { "type": "integer", "minimum": 1, "maximum": 32, "default": 8 }, "max_cost_usd": { "type": "number", "nullable": true }, "stream": { "type": "boolean", "default": false } } } } } }, "responses": { "200": { "description": "The run (JSON or SSE)." } } },
+      "post": { "summary": "Create + run an agentic loop", "description": "Server-side model→tool→model loop over the read-only gateway tools. Non-streaming returns a JSON Run; stream:true returns SSE events (run.turn, run.turn_cost, run.message, run.tool_result, run.requires_action, run.completed, run.failed, run.incomplete). Stops on max_turns, budget_exhausted, budget_breach, or the runaway-repeat detector.", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "model": { "type": "string" }, "messages": { "type": "array" }, "tools": { "type": "array" }, "max_turns": { "type": "integer", "minimum": 1, "maximum": 32, "default": 8 }, "max_cost_usd": { "type": "number", "nullable": true }, "stream": { "type": "boolean", "default": false } } } } } }, "responses": { "200": { "description": "The run (JSON or SSE). Run usage includes aggregate and per-turn served cost; incomplete runs expose stop_reason." } } },
       "get": { "summary": "List the caller's runs", "responses": { "200": { "description": "The run list (org-scoped, newest-first)." } } }
     },
     "/v1/agent/runs/{id}": {
@@ -86,7 +87,7 @@
       "get": { "summary": "Stream provider-held Batch Lane file content", "description": "Requires the exact file id on one of the authenticated organization's retained Batch rows before upstream I/O, then streams the successful provider response without accumulating it. Availability also depends on the provider still retaining the file and the organization retaining both a live gateway key and the matching upstream credential; this is not a retention guarantee.", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ], "responses": { "200": { "description": "The streamed JSONL file content." }, "401": { "description": "A verified tenant key is required." }, "404": { "description": "The file id is not present on this organization's retained Batch rows." }, "503": { "description": "Batch storage or OpenAI is not configured." } } }
     },
     "/v1/batches": {
-      "post": { "summary": "Create a batch", "responses": { "200": { "description": "The batch." } } },
+      "post": { "summary": "Create a batch", "description": "OpenAI-only. Tenants with an org or API-key USD cap fail closed before upstream dispatch because provider-held input files do not expose a defensible whole-job cost bound.", "responses": { "200": { "description": "The batch." }, "422": { "description": "price_unknown for capped traffic." } } },
       "get": { "summary": "List batches", "responses": { "200": { "description": "The batch list." } } }
     },
     "/v1/batches/{id}": {
@@ -97,7 +98,7 @@
     },
     "/health": { "get": { "summary": "Liveness", "security": [], "responses": { "200": { "description": "ok" } } } },
     "/ready": { "get": { "summary": "Readiness", "security": [], "responses": { "200": { "description": "ready" } } } },
-    "/metrics": { "get": { "summary": "Prometheus metrics", "security": [], "responses": { "200": { "description": "Prometheus exposition." } } } }
+    "/metrics": { "get": { "summary": "Prometheus metrics", "security": [ { "MetricsBearer": [] } ], "responses": { "200": { "description": "Prometheus exposition." }, "401": { "description": "Missing or invalid metrics bearer." }, "503": { "description": "Metrics authentication is required but not configured." } } } }
     }
   }
 }

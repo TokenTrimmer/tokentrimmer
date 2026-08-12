@@ -1306,6 +1306,7 @@ mod tests {
 
     fn make_ctx(tag: Option<&str>) -> RequestContext {
         RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
             trace_id: Uuid::now_v7(),
             org_id: Uuid::nil(),
             api_key_id: Uuid::nil(),

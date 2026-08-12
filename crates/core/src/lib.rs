@@ -3,6 +3,7 @@
 //! See `docs/04-gateway-api-reference.md` for the public API contract.
 pub mod batch_store;
 pub mod budget;
+pub mod budget_reservation;
 pub mod cache_volatility;
 pub mod content_compress;
 pub mod db;
@@ -37,6 +38,11 @@ pub use batch_store::{
 pub use budget::{
     tier_budget_limits, BudgetDecision, BudgetEnforcer, BudgetLimits, DynamicBudgetEnforcer,
     InMemoryBudgetEnforcer, SpendSink,
+};
+pub use budget_reservation::{
+    BudgetDispatch, BudgetDispatchKind, BudgetReservation, BudgetReservationError,
+    BudgetReservationRequest, BudgetReservationStore, PostgresBudgetReservationStore,
+    ReservationAdmission, SettlementBasis,
 };
 pub use cache_volatility::{classify_volatility, l2_ttl_with_volatility, VolatilityClass};
 pub use db::{connect, migrate, migrate_only, verify_migration_ledger, MIGRATOR};

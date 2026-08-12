@@ -38,6 +38,12 @@ impl RunStatus {
     pub fn is_terminal(self) -> bool {
         !matches!(self, RunStatus::RequiresAction)
     }
+
+    /// True when the run is paused and can be resumed with client tool outputs.
+    #[must_use]
+    pub fn is_resumable(self) -> bool {
+        matches!(self, RunStatus::RequiresAction)
+    }
 }
 
 /// Accumulated token usage + served cost across every turn of a run, mirroring
@@ -50,6 +56,10 @@ pub struct RunUsage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub cost_usd: f64,
+    /// Accumulated unoptimized baseline cost (USD) across the run's turns.
+    /// `None` when an older or self-hosted gateway does not report it.
+    #[serde(default)]
+    pub baseline_cost_usd: Option<f64>,
     /// Per-turn served cost (USD) for each server-side turn of the run.
     /// Empty when the server does not include this field (older versions).
     #[serde(default)]
@@ -72,10 +82,10 @@ pub struct Run {
     /// into `usage.cost_usd`. `None` when unmetered / no summarization.
     #[serde(default)]
     pub summarizer_tax_usd: Option<f64>,
-    /// Why the run stopped: `"max_turns"` when the server-side turn cap was
-    /// reached, `"budget_exhausted"` when `max_cost_usd` was hit, or `None`
-    /// when the run completed normally. Plain `String` for forward-compatibility
-    /// with future gateway stop reasons.
+    /// Why the run stopped: `"max_turns"`, `"budget_exhausted"` (the next turn
+    /// was not admitted), `"budget_breach"` (an admitted turn settled above the
+    /// cap), or `"runaway"`. `None` on normal completion. Plain `String` keeps
+    /// future gateway stop reasons forward-compatible.
     #[serde(default)]
     pub stop_reason: Option<String>,
 }
@@ -101,6 +111,10 @@ impl Run {
     /// Empty unless [`status`](Self::status) is `RequiresAction`.
     #[must_use]
     pub fn pending_tool_calls(&self) -> Vec<ToolCall> {
+        if !self.status.is_resumable() {
+            return Vec::new();
+        }
+
         let answered: std::collections::HashSet<&str> = self
             .messages
             .iter()
@@ -132,6 +146,8 @@ pub struct AgentRunRecord {
     pub turns: i32,
     #[serde(default)]
     pub max_turns: Option<i32>,
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
     pub cost_usd: f64,
     #[serde(default)]
     pub stop_reason: Option<String>,
@@ -197,6 +213,24 @@ impl AgentOutcome {
     pub fn text(&self) -> Option<&str> {
         self.run.text()
     }
+
+    /// Machine-readable reason the server stopped the run, if any.
+    #[must_use]
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.run.stop_reason.as_deref()
+    }
+
+    /// Unanswered client tool calls when the returned run remains resumable.
+    #[must_use]
+    pub fn pending_tool_calls(&self) -> Vec<ToolCall> {
+        self.run.pending_tool_calls()
+    }
+
+    /// Whether client tool outputs can resume the returned run.
+    #[must_use]
+    pub fn is_resumable(&self) -> bool {
+        self.run.status.is_resumable()
+    }
 }
 
 /// One tool output submitted to resume a paused run. Wire shape:
@@ -216,9 +250,9 @@ pub struct AgentBuilder<'a> {
     /// Server-side per-run turn cap; `None` ⇒ the gateway default. Forwarded as
     /// the request's `max_turns` (the gateway clamps it to `[1, 32]`).
     max_turns: Option<u32>,
-    /// Hard ceiling (USD) on the run's total served cost. Sent in the POST body
-    /// as `max_cost_usd`. Distinct from `cost_limit` (the per-turn estimate
-    /// header `X-TokenTrimmer-Cost-Limit-Usd`).
+    /// Aggregate served-cost admission cap (USD), sent as `max_cost_usd`.
+    /// Distinct from `cost_limit` (the per-turn estimate header
+    /// `X-TokenTrimmer-Cost-Limit-Usd`).
     max_cost_usd: Option<f64>,
     tag: Option<String>,
     cost_limit: Option<f64>,
@@ -275,8 +309,10 @@ impl<'a> AgentBuilder<'a> {
         self.max_turns = Some(n);
         self
     }
-    /// Hard ceiling (USD) on the run's total served cost. The gateway stops the
-    /// run before a turn that would breach it (`stop_reason = budget_exhausted`).
+    /// Aggregate served-cost admission cap (USD). Before each turn, the gateway
+    /// stops with `budget_exhausted` if accrued cost plus its estimate would
+    /// exceed the cap. An admitted turn can settle above it and terminate with
+    /// `budget_breach`; actual cost is never clamped.
     #[must_use]
     pub fn max_cost_usd(mut self, usd: f64) -> Self {
         self.max_cost_usd = Some(usd);
@@ -442,6 +478,7 @@ mod tests {
                             "model": "gpt-4o-mini",
                             "turns": 3,
                             "max_turns": 8,
+                            "max_cost_usd": 0.01,
                             "cost_usd": 0.0012,
                             "stop_reason": null,
                             "tag": "proj-a"
@@ -466,12 +503,14 @@ mod tests {
         assert_eq!(runs[0].model, "gpt-4o-mini");
         assert_eq!(runs[0].turns, 3);
         assert_eq!(runs[0].max_turns, Some(8));
+        assert_eq!(runs[0].max_cost_usd, Some(0.01));
         assert!((runs[0].cost_usd - 0.0012).abs() < 1e-9);
         assert_eq!(runs[0].tag.as_deref(), Some("proj-a"));
         assert!(runs[0].stop_reason.is_none());
         assert_eq!(runs[1].id, "00000000-0000-0000-0000-000000000002");
         assert_eq!(runs[1].status, "failed");
         assert_eq!(runs[1].max_turns, None);
+        assert_eq!(runs[1].max_cost_usd, None);
         assert_eq!(runs[1].tag, None);
     }
 
@@ -806,11 +845,22 @@ mod tests {
     }
 
     #[test]
-    fn client_run_usage_deserializes_per_turn_cost_and_stop_reason() {
-        let json = r#"{"id":"r","status":"incomplete","messages":[],"turns":2,"usage":{"prompt_tokens":1,"completion_tokens":1,"cost_usd":0.5,"per_turn_cost_usd":[0.25,0.25]},"stop_reason":"budget_exhausted"}"#;
+    fn client_run_usage_deserializes_cost_breakdown_and_stop_reason() {
+        let json = r#"{"id":"r","status":"incomplete","messages":[],"turns":2,"usage":{"prompt_tokens":1,"completion_tokens":1,"cost_usd":0.5,"baseline_cost_usd":0.8,"per_turn_cost_usd":[0.25,0.25]},"stop_reason":"budget_exhausted"}"#;
         let run: Run = serde_json::from_str(json).unwrap();
+        assert_eq!(run.usage.baseline_cost_usd, Some(0.8));
         assert_eq!(run.usage.per_turn_cost_usd, vec![0.25, 0.25]);
         assert_eq!(run.stop_reason.as_deref(), Some("budget_exhausted"));
+        assert!(!run.status.is_resumable());
+        assert!(run.status.is_terminal());
+
+        let outcome = AgentOutcome {
+            run,
+            resume_rounds: 0,
+        };
+        assert_eq!(outcome.stop_reason(), Some("budget_exhausted"));
+        assert!(!outcome.is_resumable());
+        assert!(outcome.pending_tool_calls().is_empty());
     }
 
     #[tokio::test]

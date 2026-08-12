@@ -1,0 +1,7 @@
+# Exact historical false positives only. A recurrence in a new commit keeps
+# failing the full-history secret scan.
+#
+# Deleted review prose used a cryptographic algorithm label that the generic
+# detector treated as a credential. No credential material was present.
+1f3b087a5491f65f52d3ccf443f8b039197e31d2:PROJECT_REVIEW.md:generic-api-key:9
+9ee8f598bd22951e4951404bdfaf9c15b66293c4:PROJECT_REVIEW.md:generic-api-key:9

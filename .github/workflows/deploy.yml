@@ -157,10 +157,13 @@ jobs:
           TT_GIT_SHA: ${{ github.sha }}
         run: flyctl deploy --remote-only --config fly.staging.toml --build-arg "TT_GIT_SHA=$TT_GIT_SHA"
 
-      - name: Post-deploy staging smoke (wake scale-to-zero, check /health)
+      - name: Post-deploy staging provenance smoke
+        env:
+          EXPECTED_GIT_SHA: ${{ github.sha }}
         run: |
-          curl -sf --retry 8 --retry-all-errors --retry-delay 5 \
-            https://tokentrimmer-staging.fly.dev/health
+          health="$(curl -sf --retry 8 --retry-all-errors --retry-delay 5 \
+            https://tokentrimmer-staging.fly.dev/health)"
+          test "$(printf '%s' "$health" | jq -er '.git_sha')" = "$EXPECTED_GIT_SHA"
 
   # ── PROD ─────────────────────────────────────────────────────────────────────
   # Gated by the `production` GitHub Environment → requires a manual approval
@@ -198,7 +201,10 @@ jobs:
           TT_GIT_SHA: ${{ github.sha }}
         run: flyctl deploy --remote-only --config fly.toml --build-arg "TT_GIT_SHA=$TT_GIT_SHA"
 
-      - name: Post-deploy prod smoke
+      - name: Post-deploy prod provenance smoke
+        env:
+          EXPECTED_GIT_SHA: ${{ github.sha }}
         run: |
-          curl -sf --retry 5 --retry-all-errors --retry-delay 5 \
-            https://tokentrimmer.fly.dev/health
+          health="$(curl -sf --retry 5 --retry-all-errors --retry-delay 5 \
+            https://tokentrimmer.fly.dev/health)"
+          test "$(printf '%s' "$health" | jq -er '.git_sha')" = "$EXPECTED_GIT_SHA"

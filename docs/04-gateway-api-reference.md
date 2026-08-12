@@ -28,7 +28,7 @@ Gateway implements the following OpenAI API endpoints, with the OpenAI request/r
 | `/v1/models` | GET | ✓ v1 |
 | `/v1/capabilities` | GET | ✓ gateway-runtime evidence v1 |
 | `/v1/completions` (legacy) | POST | ✗ not supported |
-| `/v1/responses` (OpenAI Responses API) | POST | ✗ not yet supported — use `/v1/chat/completions` |
+| `/v1/responses` (OpenAI Responses API) | POST | △ stateless, non-streaming bridge; text/images/audio, function tools, structured output, routing, caching, and cost headers are supported. Stateful conversations, background jobs, `include` expansions, non-function built-in tools, and Responses SSE are rejected. **Current Codex CLI is not compatible; use `/v1/chat/completions` or the direct local Codex runtime.** |
 | `/v1/images/generations` | POST | ✗ not supported (v2 candidate) |
 | `/v1/audio/transcriptions` | POST | ✗ not supported (v2 candidate) |
 | `/v1/audio/speech` | POST | ✗ not supported (v2 candidate) |
@@ -75,6 +75,13 @@ status, list, and cancellation use OpenAI-compatible request/response shapes.
 Every durable row is scoped to the organization derived from the gateway key;
 unknown and cross-organization Batch ids return `404`.
 
+Batch input files are provider-held and the create request does not expose
+their model/token bounds. Therefore a tenant with an org or API-key USD cap
+receives `422 price_unknown` on `POST /v1/batches` before credential lookup or
+provider dispatch. This fail-closed restriction remains until Batch upload
+metadata supports a defensible whole-job reservation; uncapped tenants are
+unchanged.
+
 `GET /v1/files/:id/content` requires the exact input, output, or error file id
 to appear on one of that organization's durable Batch rows before the gateway
 makes any provider request. Possession of the same upstream OpenAI credential
@@ -102,18 +109,18 @@ Content-Type: application/json
 ```
 
 TokenTrimmer keys are prefixed:
-- `tt_live_*` — production
-- `tt_test_*` — sandbox (no real provider calls, returns synthetic responses for testing)
+- `tt_live_*` — production identity; verified against the configured key store
+- `tt_test_*` — no-provider sandbox credential, accepted only by `POST /v1/chat/completions`, `/v1/messages`, `/v1/responses`, and `/v1/embeddings`
 
-OpenAI SDKs that pass the key via `api_key` parameter work without modification — the SDK forwards it as `Authorization: Bearer <key>`.
+Hosted model and tenant routes reject missing credentials, upstream-provider bearer keys, invalid `tt_live_*` keys, and `tt_test_*` keys outside those four sandbox endpoints. OpenAI SDKs that pass the key via `api_key` work without modification—the SDK forwards it as `Authorization: Bearer <key>`.
 
 ### 2.2 Self-hosted mode
 
-Two options:
+Two explicit identity modes:
 
-**Pass-through mode** (default): the customer's provider key is forwarded as-is to the upstream provider. The customer provides the provider API key in the request (via `Authorization` header) or in Gateway config.
+**Local BYOK mode** (`DATABASE_URL` unset): each non-sandbox Bearer value is treated only as the caller's upstream provider credential. The Gateway binds loopback by default and refuses a non-loopback bind unless the operator deliberately sets both a non-loopback `TT_BIND_ADDR` and `TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND=1`. It never turns that bearer into a TokenTrimmer tenant principal or serves operator env provider keys. L1 exact-cache entries are isolated by a one-way digest of that Bearer (the plaintext never enters the cache key), and anonymous callers are not eligible for L2 semantic caching.
 
-**Managed mode:** customer issues TokenTrimmer-style local API keys (configured in YAML), Gateway resolves them to upstream provider credentials internally. Same UX as hosted.
+**Store-backed mode** (`DATABASE_URL` configured): `tt_live_*` keys are verified and bind the request to an organization; per-org upstream credentials come from the encrypted provider-credential store. Database connection or migration failure aborts startup rather than falling back to anonymous service. Serving operator env provider keys is a separate, single-tenant-only `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` opt-in.
 
 ### 2.3 Provider credentials
 
@@ -135,7 +142,19 @@ Without any persistent store at all (no `DATABASE_URL`, dev mode), the gateway n
 
 Local providers (Ollama, vLLM, LM Studio) don't require keys.
 
-### 2.4 Security: custom provider URLs & headers
+### 2.4 `tt proxy` mode and credential contract
+
+`tt proxy --help` is the generated authority for proxy modes: Clap renders each mode from the same `ModeContract` that routing, startup validation, and request-header preparation use. The contract is:
+
+| Mode | Request target | Credential sent | Gateway features |
+|---|---|---|---|
+| `gateway` | Hosted/configured TokenTrimmer gateway | Strips client `Authorization`, `Proxy-Authorization`, `X-API-Key`, `Api-Key`, `X-Goog-Api-Key`, and `Cookie`; injects only the configured TokenTrimmer key. A TokenTrimmer key is required. | Hosted routing, cache, budget, failover, accounting, and preview. |
+| `bypass` | OpenAI or Anthropic directly | Preserves the client's provider credential byte-for-byte; never injects a TokenTrimmer key. | Local session logging only; no gateway routing, cache, budget, or preview. |
+| `hybrid` | Configured **loopback-only** self-hosted TokenTrimmer gateway | Preserves the client's provider credential byte-for-byte; never injects a TokenTrimmer key. A remote target is rejected before the listener opens. | Whatever that self-hosted gateway provides. |
+
+The listener exposes `/v1/chat/completions`, `/v1/messages`, and `/v1/models`. It does not expose `/v1/responses`; current Codex CLI is therefore not supported. Never use `hybrid` to relay a subscription OAuth/session credential to a remote TokenTrimmer service.
+
+### 2.5 Security: custom provider URLs & headers
 
 When a caller supplies a custom provider `base_url` and/or `extra_headers` (pass-through / BYOK setups), the gateway validates them before dispatching any request, to prevent SSRF and header injection:
 
@@ -625,7 +644,8 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | Header | Purpose | Status | Example |
 |---|---|---|---|
 | `X-TokenTrimmer-Tag` | Free-form tag for cost attribution | Honored | `feature=chat-support,user=u_123` |
-| `X-TokenTrimmer-Cost-Limit-Usd` | Reject (402) if estimated cost > limit | Honored | `0.05` |
+| `Idempotency-Key` | Stable logical-request key for deterministic canary routing and durable per-provider-attempt spend admission. The gateway derives a one-way seed bound to the authenticated org and API key; the raw value is never persisted. This is **not** a chat/embeddings response-replay store: a retry served by cache succeeds normally, but if the same paid provider attempt was already admitted and no cached response is available, the gateway fails closed with `503` rather than risk duplicate spend. | Honored | `req_01J...` |
+| `X-TokenTrimmer-Cost-Limit-Usd` | Pre-dispatch USD ceiling. Must be a finite number greater than zero (`400 invalid_request` otherwise). Requests whose estimate exceeds it fail with `402 cost_limit_exceeded`; models without catalog pricing fail closed with `422 price_unknown`. The same gate applies to every failover candidate before credential lookup or dispatch. | Honored | `0.05` |
 | `X-TokenTrimmer-Cache` | Override cache behavior for this request (overrides the request-body `tt_extras.cache`; a privacy route's `disable_cache` still wins). | Honored | `bypass` / `force-write` / `read-only` / `disabled` |
 | `X-TokenTrimmer-Route` | Force a specific named route, ignoring its conditions (unknown name → `400`; chat completions only). | Honored | `cheap-for-short` |
 | `X-TokenTrimmer-Provider` | Pin the upstream provider for this request (routing still sets the model). Requires that provider's stored credential for cross-provider pins (else `400`); disables route fallbacks. Unknown provider → `400`. | Honored | `anthropic` |
@@ -821,6 +841,7 @@ All errors follow OpenAI's error response shape:
 | 404 | Model or route not found |
 | 408 | Timeout exceeded |
 | 413 | Request too large |
+| 422 | A requested USD cost ceiling cannot be enforced because the selected model has no catalog price (`price_unknown`) |
 | 429 | Rate limited (TokenTrimmer key or upstream provider) |
 | 500 | Internal Gateway error |
 | 502 | Upstream provider returned 5xx after retries |
@@ -860,14 +881,17 @@ The request's trace id is returned on the **`X-TokenTrimmer-Trace-Id`** response
 
 ## 8. Sandbox mode (test keys)
 
-Test keys (`tt_test_*`) return synthetic responses without calling real providers:
+Test keys (`tt_test_*`) are accepted only by `POST /v1/chat/completions`,
+`/v1/messages`, `/v1/responses`, and `/v1/embeddings`. Those handlers return
+synthetic responses without calling a provider:
 
-- Chat completions return a deterministic response based on a hash of the request
-- Embeddings return deterministic vectors
-- All response headers and metadata are populated as if real
-- Cost is reported as estimated, no actual charge
+- Chat, Messages, and Responses return a synthetic completion identifying the requested model.
+- Embeddings return deterministic fixed vectors.
+- Standard TokenTrimmer response metadata reports `provider=sandbox`, `cache=sandbox`, and zero cost.
+- A per-IP pre-authentication cap rate-limits sandbox traffic.
+- A sandbox key is not a tenant principal: agent, workflow, spend, route-management, and admin endpoints reject it.
 
-Useful for CI, integration tests, and SDK development.
+Useful for CI, integration tests, and SDK development without provider spend.
 
 ---
 
@@ -1394,9 +1418,10 @@ GET /health
 
 A `/metrics` endpoint is exposed for ops (Prometheus exposition format):
 
-```
-GET /metrics
-→ 200 text/plain; version=0.0.4; charset=utf-8
+```bash
+curl -H "Authorization: Bearer $TT_METRICS_TOKEN" \
+  https://api.tokentrimmer.com/metrics
+# → 200 text/plain; version=0.0.4; charset=utf-8
 ```
 
 Exposed metric families:
@@ -1415,7 +1440,11 @@ Exposed metric families:
 | `tt_build_info` | gauge | `version` |
 | `process_uptime_seconds` | gauge | — |
 
-> **Operator note:** `/metrics` is unauthenticated (like `/health`). Restrict it at the network / reverse-proxy layer so internal ops counters are not publicly scrapeable.
+> **Operator note:** Hosted deployments require the dedicated
+> `TT_METRICS_TOKEN` bearer and return `401` without it. Do not reuse a tenant
+> API key or a broader admin credential. Self-hosted/local deployments may
+> leave metrics auth disabled; set `TT_REQUIRE_METRICS_AUTH=true` to fail closed
+> when `TT_METRICS_TOKEN` is absent.
 
 ---
 
@@ -1872,8 +1901,8 @@ Authenticate the same way as chat completions (§2): a TokenTrimmer key in `Auth
 | `model` | string | yes | Model id for every turn. Routing may rewrite it per turn. |
 | `messages` | array | yes | Initial transcript — system/user messages in OpenAI format. |
 | `tools` | array | no | Tool definitions advertised to the model. Defaults to `[]`. |
-| `max_turns` | integer | no | Turn cap; clamped to `[1, 32]`. Default: 10. |
-| `max_cost_usd` | number | no | Admission guard on accumulated served cost (USD). Before a new turn, the run stops as `incomplete` with `stop_reason: "budget_exhausted"` when accrued cost—plus a best-effort estimate when the model is priced—reaches the cap. A turn already started can settle beyond the cap; this is not a reservation/settlement or provider-invoice guarantee. |
+| `max_turns` | integer | no | Turn cap; clamped to `[1, 32]`. Default: 8. |
+| `max_cost_usd` | number | no | Admission guard on accumulated served cost (USD). Before a new turn, the run stops as `incomplete` with `stop_reason: "budget_exhausted"` when accrued cost plus a best-effort estimate (for priced models) would exceed the cap. A turn already started can settle beyond the cap and terminates with `stop_reason: "budget_breach"`; this is not a reservation/settlement or provider-invoice guarantee. |
 | `stream` | boolean | no | When `true`, the response is a stream of SSE run events (see §23.4). Default `false`. |
 
 ### 23.3 Response (non-streaming)
@@ -1888,6 +1917,7 @@ Authenticate the same way as chat completions (§2): a TokenTrimmer key in `Auth
     "prompt_tokens": 520,
     "completion_tokens": 210,
     "cost_usd": 0.00214,
+    "baseline_cost_usd": 0.00382,
     "per_turn_cost_usd": [0.00063, 0.00091, 0.00060]
   }
 }
@@ -1914,15 +1944,15 @@ An `incomplete` run that hit the budget cap looks like:
 
 | Field | Type | Description |
 |---|---|---|
-| `id` | string (UUID) | Unique run identifier. |
-| `status` | string | `"completed"` — model returned a final answer; `"incomplete"` — loop stopped without a final answer (turn cap or budget); `"failed"` — a turn errored. |
+| `status` | string | `"completed"` — model returned a final answer; `"requires_action"` — paused for client tool outputs; `"incomplete"` — loop stopped without a final answer (turn cap, budget, or runaway); `"failed"` — a turn errored. |
 | `messages` | array | Full message transcript (request messages plus model/tool exchanges). |
 | `turns` | integer | Number of model turns completed. |
 | `usage.prompt_tokens` | integer | Accumulated prompt tokens across all turns. |
 | `usage.completion_tokens` | integer | Accumulated completion tokens across all turns. |
 | `usage.cost_usd` | number | Total accumulated served cost (USD) across all turns. |
+| `usage.baseline_cost_usd` | number \| null | Accumulated unoptimized comparison cost across all turns; `null` when unavailable. |
 | `usage.per_turn_cost_usd` | number[] | Served cost (USD) of each completed turn, in turn order. Lets callers see where spend accumulated without per-turn headers. |
-| `stop_reason` | string \| null | Machine-readable termination cause — `"max_turns"` (turn cap reached) or `"budget_exhausted"` (`max_cost_usd` would have been exceeded). Omitted on `completed` and `failed` runs. |
+| `stop_reason` | string \| null | Machine-readable termination cause: `"max_turns"`, `"budget_exhausted"` (the next turn was not admitted), `"budget_breach"` (an admitted turn settled above the cap), or `"runaway"`. `null`/omitted on normal completion and failures. |
 | `note` | string | (optional) Human-readable note on why the run ended early. |
 
 ### 23.4 Response (streaming, `stream: true`)
@@ -2045,6 +2075,7 @@ Response:
       "model": "gpt-4o-mini",
       "turns": 3,
       "max_turns": 8,
+      "max_cost_usd": 0.05,
       "cost_usd": 0.00214,
       "stop_reason": null,
       "tag": "feature=research"
@@ -2062,8 +2093,9 @@ Response:
 | `model` | string | Model id used for this run. |
 | `turns` | integer | Number of model turns completed so far. |
 | `max_turns` | integer \| null | Turn cap supplied at run creation, if any. |
+| `max_cost_usd` | number \| null | Aggregate served-cost cap supplied at run creation, if any. |
 | `cost_usd` | number | Accumulated served cost (USD) across all completed turns. |
-| `stop_reason` | string \| null | `"max_turns"` or `"budget_exhausted"` on incomplete runs; `null` otherwise. |
+| `stop_reason` | string \| null | `"max_turns"`, `"budget_exhausted"`, `"budget_breach"`, or `"runaway"` on incomplete runs; `null` otherwise. |
 | `tag` | string \| null | Cost-attribution tag from `X-TokenTrimmer-Tag` at run creation, if supplied. |
 
 From the CLI: `tt agent runs`.

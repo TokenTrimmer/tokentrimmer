@@ -147,7 +147,10 @@ impl LangfuseTraceLink {
                 origin.push_str(&format!(":{port}"));
             }
         }
-        Ok(Self { origin, project_id: None })
+        Ok(Self {
+            origin,
+            project_id: None,
+        })
     }
 
     /// Attach a Langfuse project id so generated links are project-scoped
@@ -193,7 +196,10 @@ impl LangfuseTraceLink {
         }
         let url = match &self.project_id {
             Some(project_id) => {
-                format!("{}/project/{project_id}/traces/{otel_trace_id}", self.origin)
+                format!(
+                    "{}/project/{project_id}/traces/{otel_trace_id}",
+                    self.origin
+                )
             }
             None => format!("{}/trace/{otel_trace_id}", self.origin),
         };
@@ -371,7 +377,10 @@ mod tests {
 
     #[test]
     fn rejects_unparsable_origins() {
-        assert_eq!(LangfuseTraceLink::new(""), Err(TraceLinkError::InvalidOrigin));
+        assert_eq!(
+            LangfuseTraceLink::new(""),
+            Err(TraceLinkError::InvalidOrigin)
+        );
         assert_eq!(
             LangfuseTraceLink::new("not a url"),
             Err(TraceLinkError::InvalidOrigin)
@@ -476,8 +485,8 @@ mod tests {
         let link = LangfuseTraceLink::default();
         for bad in [
             "",
-            "4BF92F3577B34DA6A3CE929D0E0E4736", // uppercase
-            "4bf92f3577b34da6a3ce929d0e0e473",  // 31 hex (too short)
+            "4BF92F3577B34DA6A3CE929D0E0E4736",  // uppercase
+            "4bf92f3577b34da6a3ce929d0e0e473",   // 31 hex (too short)
             "4bf92f3577b34da6a3ce929d0e0e47360", // 33 hex (too long)
             "4bf92f3577b34da6a3ce929d0e0e473g",  // non-hex char
             "4bf92f3577b34da6 a3ce929d0e0e4736", // embedded space
@@ -496,7 +505,11 @@ mod tests {
         let link = LangfuseTraceLink::default();
         for blank in ["", "   ", "\t"] {
             let trace = RetainedTrace::new(blank, Some(TRACE_ID_HEX), None);
-            assert_eq!(link.deep_link(&trace), None, "blank {blank:?} must not link");
+            assert_eq!(
+                link.deep_link(&trace),
+                None,
+                "blank {blank:?} must not link"
+            );
         }
     }
 

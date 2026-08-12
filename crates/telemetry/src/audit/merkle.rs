@@ -72,9 +72,8 @@ pub fn combine(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 /// Decode an audit entry's hex `hash` field into the 32-byte raw leaf digest
 /// used by the Merkle tree.
 pub fn leaf_from_hex(hex_hash: &str) -> Result<[u8; 32], MerkleError> {
-    let bytes = hex::decode(hex_hash.trim()).map_err(|e| {
-        MerkleError::InvalidLeaf(format!("hex decode of {hex_hash:?} failed: {e}"))
-    })?;
+    let bytes = hex::decode(hex_hash.trim())
+        .map_err(|e| MerkleError::InvalidLeaf(format!("hex decode of {hex_hash:?} failed: {e}")))?;
     <[u8; 32]>::try_from(bytes.as_slice())
         .map_err(|_| MerkleError::InvalidLeaf(format!("{hex_hash:?} is not 32 bytes")))
 }
@@ -611,8 +610,17 @@ mod tests {
     fn leaf_from_hex_validates() {
         let hex_hash = hex::encode(leaf(7));
         assert_eq!(leaf_from_hex(&hex_hash).unwrap(), leaf(7));
-        assert!(matches!(leaf_from_hex("abcd"), Err(MerkleError::InvalidLeaf(_))));
-        assert!(matches!(leaf_from_hex("zz"), Err(MerkleError::InvalidLeaf(_))));
-        assert!(matches!(leaf_from_hex(""), Err(MerkleError::InvalidLeaf(_))));
+        assert!(matches!(
+            leaf_from_hex("abcd"),
+            Err(MerkleError::InvalidLeaf(_))
+        ));
+        assert!(matches!(
+            leaf_from_hex("zz"),
+            Err(MerkleError::InvalidLeaf(_))
+        ));
+        assert!(matches!(
+            leaf_from_hex(""),
+            Err(MerkleError::InvalidLeaf(_))
+        ));
     }
 }

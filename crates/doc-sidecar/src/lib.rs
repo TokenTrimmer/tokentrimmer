@@ -121,11 +121,12 @@ async fn extract_handler(Json(req): Json<ExtractRequest>) -> Response {
     (StatusCode::OK, Json(extract(&req.media_type, &bytes))).into_response()
 }
 
-/// Dispatch extraction on the media type. PDFs → lossless text-layer pull;
-/// images → (feature-gated) OCR; anything else → an empty `unsupported` result.
+/// Dispatch extraction on the MIME essence. Parameters and case do not change
+/// extraction semantics; PDFs use the lossless text-layer pull, images use
+/// feature-gated OCR, and anything else yields `unsupported`.
 #[must_use]
 pub fn extract(media_type: &str, bytes: &[u8]) -> ExtractResponse {
-    let media_type = media_type.trim();
+    let media_type = media_type.split(';').next().unwrap_or_default().trim();
     if media_type.eq_ignore_ascii_case("application/pdf") {
         extract_pdf(bytes)
     } else if media_type.to_ascii_lowercase().starts_with("image/") {
@@ -266,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn pdf_text_layer_yields_lossless_spans() {
         let b64 = base64::engine::general_purpose::STANDARD.encode(text_layer_pdf());
-        let (status, resp) = post_extract("application/pdf", &b64).await;
+        let (status, resp) = post_extract(" Application/PDF ; charset=binary ", &b64).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(resp.engine, "pdf-extract");

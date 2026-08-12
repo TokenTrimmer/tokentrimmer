@@ -1,11 +1,10 @@
-"""Shared per-run budget primitive for the framework integrations.
+"""Shared post-response budget exception for framework integrations.
 
-:class:`BudgetExceeded` is raised when a run's accumulated served cost exceeds a
-caller-configured cap. Both the LangChain callback
-(:mod:`tokentrimmer.integrations.langchain`) and the LiteLLM logger
-(:mod:`tokentrimmer.integrations.litellm`) enforce the *same* budget primitive,
-so it lives here — a dependency-free module (a plain ``RuntimeError`` subclass)
-that is always importable, with no framework extra installed.
+:class:`BudgetExceeded` reports when accumulated *observed* served cost exceeds
+a caller-configured budget. It is not the Gateway agent runner's pre-dispatch
+``max_cost_usd`` admission guard: every integration raises only after receiving
+the response whose cost crossed the budget. This dependency-free module keeps
+the same exception type importable without any framework extra installed.
 
 Backwards compatibility: ``BudgetExceeded`` was introduced in the LangChain
 integration (0.2.0). It is still importable as
@@ -18,18 +17,18 @@ from __future__ import annotations
 
 
 class BudgetExceeded(RuntimeError):
-    """Raised when a run's accumulated cost exceeds the configured budget.
+    """Raised after observed accumulated cost exceeds a configured budget.
 
-    Carries the offending total and the limit so a caller catching it can report
-    or react.
+    Carries the offending total and limit. Catching it lets a caller stop before
+    its next framework step; it does not undo or prevent the completed call.
 
     How it stops a run differs per framework, because the frameworks expose
     different callback contracts:
 
     * **LangChain** (:mod:`~tokentrimmer.integrations.langchain`) sets
       ``raise_error = True`` on its handler, so raising this from ``on_llm_end``
-      propagates straight out of ``invoke`` / ``stream`` — an *inline* stop on the
-      finish that tips the accumulated cost past the cap.
+      propagates out of ``invoke`` / ``stream`` after the completed LLM response,
+      preventing a subsequent chain step when the framework honors the callback.
     * **LiteLLM** (:mod:`~tokentrimmer.integrations.litellm`) runs its success
       callback as a post-hoc *logging* event that swallows exceptions, so an
       inline raise cannot abort the call. There the logger records the breach and
@@ -41,6 +40,6 @@ class BudgetExceeded(RuntimeError):
         self.total_cost_usd = total_cost_usd
         self.limit_usd = limit_usd
         super().__init__(
-            f"TokenTrimmer run budget exceeded: accumulated ${total_cost_usd:.6f} "
-            f"> limit ${limit_usd:.6f}"
+            f"TokenTrimmer observed budget exceeded: accumulated "
+            f"${total_cost_usd:.6f} > limit ${limit_usd:.6f}"
         )

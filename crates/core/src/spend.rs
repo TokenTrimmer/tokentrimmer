@@ -9,11 +9,11 @@
 //! paths use, so the figure never inflates on a request the gateway couldn't
 //! price exactly.
 //!
-//! WRITE: [`SpendSource::set_org_monthly_cap`] / [`SpendSource::set_key_monthly_cap`]
-//! upsert `org_budget_caps` / `api_key_budget_caps`. The gateway already READS
-//! these tables for enforcement ([`crate::tier_resolver`]), so the symmetric
-//! tenant-self-serve WRITE lives here on the SAME auth seam rather than needing a
-//! separate cloud surface. No new ledger, no new table.
+//! WRITE: [`SpendSource::set_org_monthly_cap`] /
+//! [`SpendSource::set_key_monthly_cap`] upsert `org_budget_caps` /
+//! `api_key_budget_caps`. [`crate::budget_reservation`] reads those rows and
+//! atomically reserves every capped provider attempt. The reporting view here
+//! remains settled request telemetry and does not include active reservations.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
@@ -114,8 +114,7 @@ pub trait SpendSource: Send + Sync {
     ) -> Result<OrgSpend, SpendError>;
 
     /// Set (or clear, with `None`) the org's monthly spend cap in
-    /// `org_budget_caps`. The gateway already READS this table for enforcement
-    /// ([`crate::tier_resolver`]); this is the matching tenant-self-serve WRITE.
+    /// `org_budget_caps`; [`crate::budget_reservation`] enforces that row.
     async fn set_org_monthly_cap(
         &self,
         org_id: Uuid,
@@ -144,8 +143,8 @@ pub const SPEND_SQL: &str = r#"SELECT
 FROM request_logs
 WHERE org_id = $1 AND ts >= $3"#;
 
-/// The org's monthly cap. `$1=org`. Mirrors the read in
-/// [`crate::tier_resolver`]. Absent row ⇒ no cap.
+/// The org's monthly cap. `$1=org`. Mirrors the durable reservation layer's
+/// cap lookup. Absent row ⇒ no cap.
 pub const ORG_CAP_SQL: &str =
     r#"SELECT monthly_cap_usd::float8 AS monthly_cap_usd FROM org_budget_caps WHERE org_id = $1"#;
 

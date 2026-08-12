@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 fn make_ctx(base_url: &str) -> RequestContext {
     RequestContext {
+        budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
         trace_id: Uuid::new_v4(),
         org_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),
@@ -418,6 +419,7 @@ async fn extra_headers_denylist_drops_auth_and_host() {
 
     // Build a context with denied headers plus a legitimate custom header.
     let ctx = RequestContext {
+        budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
         trace_id: uuid::Uuid::new_v4(),
         org_id: uuid::Uuid::new_v4(),
         api_key_id: uuid::Uuid::new_v4(),

@@ -153,10 +153,10 @@ console.log(`saved $${stream.tt?.savedUsd.toFixed(4)}`);
 
 For multi-step tool-using runs, `client.agent.run(...)` drives the Gateway's
 server-side agent loop (`POST /v1/agent/runs`). The Gateway owns the loop
-(down-routing, judge-gated summarize, substep cache); the SDK just executes any
-**client** tool the run pauses on (via your `executor`) and resumes — until a
-final answer. Aggregate cost spans every turn and is read from the run body
-(`outcome.usage.costUsd`), not response headers.
+(down-routing, judge-gated summarize, substep cache); the SDK executes any
+**client** tool the run pauses on (via your `executor`) and resumes until a
+terminal status or the client-side resume cap. Aggregate and per-turn cost come
+from the run body, not response headers.
 
 ```ts
 const outcome = await client.agent.run({
@@ -178,14 +178,29 @@ const outcome = await client.agent.run({
     if (name === 'get_weather') return JSON.stringify({ temp_c: 21, sky: 'clear' });
     return '{}';
   },
-  maxTurns: 8,          // optional: server-side per-run turn cap
+  maxTurns: 8,          // server-side turn cap
+  maxCostUsd: 0.05,     // aggregate served-cost admission cap
   ttTag: 'feature=agent',
 });
 
-console.log(outcome.text);                          // final assistant answer
+console.log(outcome.text);                          // final assistant answer, if completed
 console.log(`cost   $${outcome.usage.costUsd.toFixed(4)}`);
+console.log(`turns  ${outcome.usage.perTurnCostUsd.join(', ')}`);
 console.log(`rounds ${outcome.resumeRounds}`);      // client-side tool_outputs resumes made
-```
+
+if (outcome.stopReason) {
+  console.log(`stopped: ${outcome.stopReason}`);
+}
+if (outcome.isResumable) {
+  // The client-side resume cap was hit; persist or dispatch these calls yourself.
+  console.log(outcome.pendingToolCalls);
+}
+
+`maxCostUsd` is enforced before each server-side turn using accrued cost plus a
+best-effort estimate. The terminal `stopReason` is `budget_exhausted` when the
+next turn is rejected, `budget_breach` when an already-admitted turn settles
+above the cap, `max_turns`, or `runaway`. It is an execution guard, not a
+provider-invoice guarantee.
 
 Paused/resumed transcripts remain in Redis for one hour. You can explicitly
 export or erase that short-lived resume state without deleting durable
@@ -259,7 +274,7 @@ import { generateText } from 'ai';
 import { TokenTrimmerRunCost } from '@tokentrimmer/client/vercel';
 
 const gateway = openai.provider({ baseURL: 'https://api.tokentrimmer.com/v1', apiKey: 'tt_live_...' });
-const run = new TokenTrimmerRunCost({ maxCostUsd: 0.5 }); // optional per-run budget
+const run = new TokenTrimmerRunCost({ postResponseBudgetUsd: 0.5 });
 
 const result = await generateText({
   model: gateway('claude-haiku-4-5'),
@@ -271,10 +286,12 @@ await run.record(result); // reads TT headers, records span attrs, accumulates t
 console.log(`run cost $${run.totalCostUsd} · saved $${run.totalSavedUsd}`);
 ```
 
-A run whose accumulated cost exceeds `maxCostUsd` throws `BudgetExceededError`
-(a framework-level stop). For one-off recording use `recordTokenTrimmerCost(result, { span })`.
-A non-gateway response (no `x-tokentrimmer-*` headers) degrades quietly: nothing
-is recorded and nothing is thrown.
+When observed accumulated cost exceeds `postResponseBudgetUsd`, `record` throws
+`BudgetExceededError` after that call completes, allowing the caller to stop
+before its next step. This is not pre-dispatch enforcement; use the agent
+runner's `maxCostUsd` for the Gateway-enforced run admission guard. For one-off
+recording use `recordTokenTrimmerCost(result, { span })`. A non-gateway response
+(no `x-tokentrimmer-*` headers) degrades quietly: nothing is recorded or thrown.
 
 `ai` and `@opentelemetry/api` are **optional** peer dependencies — install them
 only if you use this adapter. The base `import { TokenTrimmer } from '@tokentrimmer/client'`

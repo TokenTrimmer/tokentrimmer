@@ -57,6 +57,9 @@ use super::{sidecar_client, DocDistillGate, SpanFidelity};
 pub(crate) struct DistillHarness {
     pub client: reqwest::Client,
     pub sidecar_url: Option<String>,
+    /// Immutable sidecar build/config revision. `None` disables cache reuse but
+    /// does not disable extraction.
+    pub cache_revision: Option<String>,
     pub gate: DocDistillGate,
 }
 
@@ -71,6 +74,7 @@ impl DistillHarness {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             sidecar_url: sidecar_client::sidecar_url_from_env(),
+            cache_revision: sidecar_client::sidecar_revision_from_env(),
             // Default-closed: `should_distill` always returns false until the
             // operator opts in (D4c v1 keeps the gate closed for lossy spans;
             // lossless PDF-text-layer extractions substitute unconditionally
@@ -91,9 +95,14 @@ pub(crate) enum DistillOutcome {
     /// verbatim. Carries no error string (fail-open: we do not surface sidecar
     /// errors to the request path; they're logged at debug level).
     ExtractFailed,
-    /// The part was distilled to text. `lossless` governs whether the gate (the
-    /// judge) was required (Lossless skips it; Lossy requires the gate).
-    Distilled { text: String, lossless: bool },
+    /// Extracted text plus provenance. `lossless` governs whether the gate was
+    /// required; `engine` and `pages` are persisted with cache entries.
+    Distilled {
+        text: String,
+        lossless: bool,
+        engine: String,
+        pages: u32,
+    },
 }
 
 /// The bookkeeping a completed [`distill_request_parts`] call accrues so the
@@ -208,6 +217,8 @@ pub(crate) async fn distill_part(
     DistillOutcome::Distilled {
         text: extraction.text,
         lossless,
+        engine: extraction.engine,
+        pages: extraction.pages,
     }
 }
 
@@ -398,18 +409,17 @@ fn image_dims_from_decoded_b64(b64: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
-    // Parallel workspace-test exec races env reads/writes across these
-    // env-touching tests (they set/remove TT_DOC_SIDECAR_URL). The lock
-    // serializes them so each sees a consistent env across the `await` that
-    // reads it (mirrors the ml-scoring ENV_LOCK fix from #302, but async-aware
-    // so the guard may legitimately span the mocked-sidecar round-trip).
-    // stdlib `serial_test` would do this too; a local Mutex avoids the dep.
+    // Parallel workspace-test execution races environment reads and writes.
+    // Serialize TT_DOC_SIDECAR_URL and TT_DOC_SIDECAR_REVISION mutations across
+    // these async tests so each harness observes one coherent configuration.
+    // A local mutex avoids adding `serial_test`.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn test_harness(sidecar_url: Option<String>) -> DistillHarness {
         DistillHarness {
             client: reqwest::Client::new(),
             sidecar_url,
+            cache_revision: Some("sidecar-test".to_string()),
             gate: DocDistillGate::default(),
         }
     }
@@ -467,8 +477,10 @@ mod tests {
         // default-CLOSED (lossy substitution never fires unless opted in).
         let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("TT_DOC_SIDECAR_URL");
+        std::env::remove_var("TT_DOC_SIDECAR_REVISION");
         let h = DistillHarness::from_env();
         assert!(h.sidecar_url.is_none());
+        assert!(h.cache_revision.is_none());
         assert!(!h.gate.lossy_opt_in());
     }
 
@@ -476,6 +488,7 @@ mod tests {
     async fn distill_part_returns_disabled_without_sidecar_url() {
         let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("TT_DOC_SIDECAR_URL");
+        std::env::remove_var("TT_DOC_SIDECAR_REVISION");
         let h = DistillHarness::from_env();
         // Disabled path early-returns BEFORE any network — safe to await here.
         assert_eq!(
@@ -527,6 +540,7 @@ mod tests {
                     serde_json::json!({
                         "text": "redacted-text",
                         "pages": 1,
+                        "engine": "pdf-text-layer",
                         "spans": [{ "kind": "lossless", "page": 0, "chars": 13 }]
                     })
                     .to_string(),
@@ -658,6 +672,7 @@ mod tests {
                     serde_json::json!({
                         "text": "first document text",
                         "pages": 1,
+                        "engine": "pdf-text-layer",
                         "spans": [{ "kind": "lossless", "page": 0, "chars": 19 }]
                     })
                     .to_string(),

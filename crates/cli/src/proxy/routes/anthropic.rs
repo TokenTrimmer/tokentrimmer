@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
-use crate::proxy::config::{Config, Mode};
+use crate::proxy::config::{Config, ForwardTarget, Mode};
 use crate::proxy::forward;
 use crate::proxy::preview;
 use crate::proxy::session::{gateway_accounting_from_headers, LogLine, SessionLog};
@@ -33,18 +33,17 @@ pub async fn post_messages(
     body: Bytes,
 ) -> Response {
     let upstream = upstream_url(&state.config, "/v1/messages");
-    // In Gateway mode the request goes to the gateway, so inject the
-    // TokenTrimmer key (same as the OpenAI-wire route). In Hybrid mode the
-    // request also goes to the gateway but the client's own credentials pass
-    // through untouched. In Bypass mode the request goes direct to Anthropic,
-    // where we must NEVER inject the TokenTrimmer key — it would leak to
-    // Anthropic and clobber the client's OAuth/API key.
-    let mut headers = headers;
-    if state.config.mode == Mode::Gateway {
-        if let Some(k) = &state.config.tt_api_key {
-            headers.insert("authorization", format!("Bearer {k}").parse().unwrap());
+    let headers = match forward::prepare_forward_headers(
+        state.config.mode,
+        headers,
+        state.config.tt_api_key.as_deref(),
+    ) {
+        Ok(headers) => headers,
+        Err(error) => {
+            tracing::error!(%error, "proxy credential contract failed closed");
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
+    };
     // Best-effort cost preview. Bounded by PREVIEW_TIMEOUT_MS (500 ms) so we
     // never delay the user request by more than that even when the gateway
     // is slow. Failure → None → no header injection.
@@ -117,9 +116,9 @@ pub async fn post_messages(
 /// that runs the full routing/cache/failover pipeline); only Bypass forwards
 /// direct to the Anthropic upstream.
 fn upstream_url(cfg: &Config, path: &str) -> String {
-    match cfg.mode {
-        Mode::Gateway | Mode::Hybrid => format!("{}{}", cfg.gateway_base_url, path),
-        Mode::Bypass => format!("{}{}", cfg.upstream_anthropic, path),
+    match cfg.mode.contract().target {
+        ForwardTarget::Gateway => format!("{}{}", cfg.gateway_base_url, path),
+        ForwardTarget::Provider => format!("{}{}", cfg.upstream_anthropic, path),
     }
 }
 

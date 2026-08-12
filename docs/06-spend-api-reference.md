@@ -15,16 +15,19 @@ The caller-org's spend summary. `503` until a `SpendSource` is wired
 (`AppState::with_spend_source`); an org with no in-window traffic answers an
 honest all-zero body, NOT `404`.
 
-**Response (`SpendSummary`):** spend-today, MTD, + budget-remaining (the
-`monthly_cap_usd` minus MTD spend). Assembled from the raw in-window spend via
-`SpendSummary::assemble(org, raw)`.
+**Response (`SpendSummary`):** observed spend today, observed MTD spend, and
+`monthly_cap_usd - spend_mtd_usd`. This reporting view is assembled from
+settled request telemetry. It does not include active provider-attempt
+reservations, so `remaining_usd` can exceed immediately admissible headroom
+while calls are in flight; request admission remains authoritative.
 
 ## `POST /v1/spend/limit` — set or clear the monthly spend cap
 
 Set (or clear) the caller-org's monthly spend cap, OR a per-key cap
-(key-ownership-gated). The gateway already READS these caps for enforcement
-(`crate::tier_resolver`); this is the matching tenant-self-serve write on the
-same auth seam.
+(key-ownership-gated). Capped provider attempts use the durable Postgres
+reservation/settlement ledger in `crate::budget_reservation`: admission is
+atomic across replicas, stable `Idempotency-Key` retries cannot duplicate an
+attempt, and unknown pricing fails closed.
 
 **Request body (`SetSpendLimitRequest`):**
 
@@ -74,6 +77,6 @@ curl https://api.tokentrimmer.com/v1/spend -H "Authorization: Bearer $TT_LIVE_KE
 
 - `crates/core/src/routes/spend_api.rs` — the source of truth.
 - `crates/core/src/spend.rs` — `SpendSource` + `SpendSummary::assemble`.
-- `crates/core/src/tier_resolver.rs` — the enforcement side (the gateway READS these caps on dispatch).
+- `crates/core/src/budget_reservation.rs` — durable per-attempt enforcement and settlement.
 - The MCP `get_spend_today` / `check_budget_remaining` / `set_cost_limit` tools — `tt mcp install` exposes these to your agent client.
 - `docs/coding-agents.md` — the coding-agent wedge (where the runtime `$` cap lives).

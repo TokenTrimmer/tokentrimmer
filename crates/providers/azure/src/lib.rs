@@ -266,6 +266,7 @@ mod tests {
 
     fn ctx_with(base_url: Option<&str>, key: &str) -> RequestContext {
         RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
             trace_id: Uuid::now_v7(),
             org_id: Uuid::nil(),
             api_key_id: Uuid::nil(),

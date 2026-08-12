@@ -120,6 +120,7 @@ impl EmbeddingProvider for OpenAIEmbedder {
         use uuid::Uuid;
 
         let ctx = RequestContext {
+            budget_dispatch: tt_shared::context::BudgetDispatchState::default(),
             trace_id: Uuid::new_v4(),
             org_id: Uuid::nil(),
             api_key_id: Uuid::nil(),

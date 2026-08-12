@@ -428,8 +428,10 @@ enum Command {
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
-        #[arg(long, default_value = "gateway")]
-        mode: String,
+        /// Select the upstream and credential contract. Use `--help` for the
+        /// generated per-mode identity and feature reference.
+        #[arg(long, value_enum, default_value_t = tt_cli::proxy::config::Mode::Gateway)]
+        mode: tt_cli::proxy::config::Mode,
         #[arg(long)]
         tt_api_key: Option<String>,
         #[arg(long)]
@@ -964,14 +966,15 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Command::Audit {
-            action: AuditAction::CreateCheckpoint {
-                chain,
-                org,
-                key,
-                key_hex,
-                customer_key,
-                output,
-            },
+            action:
+                AuditAction::CreateCheckpoint {
+                    chain,
+                    org,
+                    key,
+                    key_hex,
+                    customer_key,
+                    output,
+                },
         } => {
             audit::run_audit_create_checkpoint(
                 chain.as_deref(),
@@ -983,13 +986,14 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Command::Audit {
-            action: AuditAction::VerifyCheckpoint {
-                checkpoint,
-                chain,
-                customer_key,
-                customer_key_hex,
-                org,
-            },
+            action:
+                AuditAction::VerifyCheckpoint {
+                    checkpoint,
+                    chain,
+                    customer_key,
+                    customer_key_hex,
+                    org,
+                },
         } => {
             audit::run_audit_verify_checkpoint(
                 &checkpoint,
@@ -1552,14 +1556,15 @@ async fn main() -> anyhow::Result<()> {
             session_log,
         } => {
             use tt_cli::proxy::{
-                config::{Config, Mode},
+                config::{Config, CredentialPolicy},
                 listener::run as run_listener,
             };
             let bind_addr: std::net::IpAddr = bind.parse().context("invalid --bind address")?;
-            let mode = Mode::parse(&mode).context("invalid --mode (gateway|bypass|hybrid)")?;
             let ctx = tt_cli::context::ResolvedContext::load(tt_api_key, tt_api_base)?;
             let api_key = ctx.api_key_string();
-            if mode == Mode::Gateway && api_key.is_none() {
+            if mode.contract().credential_policy == CredentialPolicy::TokenTrimmer
+                && api_key.is_none()
+            {
                 anyhow::bail!(
                     "--mode gateway requires a key — run `tt login --token <KEY>`, \
                      pass --tt-api-key, or set TT_API_KEY"
@@ -1575,6 +1580,8 @@ async fn main() -> anyhow::Result<()> {
                 session_log.map(std::path::PathBuf::from),
             );
             cfg.gateway_base_url = ctx.base_url;
+            cfg.validate_identity_boundary()
+                .map_err(anyhow::Error::msg)?;
             run_listener(cfg).await.context("tt proxy listener")?;
         }
         Command::Context {
@@ -2039,6 +2046,22 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // `not_configured`, the honest state).
     if let Some(pool) = db_pool.as_ref() {
         state = state.with_db_pool(pool.clone());
+    }
+    if let Some(pool) = db_pool.as_ref() {
+        match tt_core::PostgresBudgetReservationStore::detect(pool.clone())
+            .await
+            .context("detect durable budget reservation schema")?
+        {
+            Some(store) => {
+                state = state.with_budget_reservation_store(Arc::new(store));
+                tracing::info!(
+                    "durable cross-replica USD budget reservations enabled for capped callers"
+                );
+            }
+            None => tracing::warn!(
+                "cloud budget-cap tables are absent; durable USD reservations are disabled"
+            ),
+        }
     }
 
     // Surface a stale embedded pricing catalog (the dormant freshness signal).
@@ -2827,7 +2850,11 @@ where
     S: AsRef<str>,
 {
     let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
-    let non_flag: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
+    let non_flag: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
     let is_audit_verify = matches!(non_flag.as_slice(), [sub, verify, ..] if sub.as_str() == "audit" && verify.as_str() == "verify");
     is_audit_verify
         && args
@@ -3713,6 +3740,8 @@ mod inspect_format_tests {
             "audit verify chain.jsonl --key k.hex"
         )));
         assert!(!audit_verify_emits_merkle_to_stdout(argv("audit verify")));
-        assert!(!audit_verify_emits_merkle_to_stdout(argv("inspect . --format json")));
+        assert!(!audit_verify_emits_merkle_to_stdout(argv(
+            "inspect . --format json"
+        )));
     }
 }

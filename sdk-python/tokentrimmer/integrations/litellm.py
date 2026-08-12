@@ -10,8 +10,8 @@ and:
    (:mod:`tokentrimmer.semconv`) — the same ``gen_ai.*`` / ``tokentrimmer.*``
    attributes the gateway stamps on its own span and the LangChain callback
    emits; and
-2. accumulates a per-run cost / savings total, optionally enforcing a
-   ``max_cost_usd`` budget.
+2. accumulates a per-run cost / savings total and optionally checks a
+   ``post_response_budget_usd`` after each completed call.
 
 How the logger gets the headers
 -------------------------------
@@ -35,7 +35,7 @@ Wire it up like::
     import litellm
     from tokentrimmer.integrations.litellm import TokenTrimmerLiteLLMLogger
 
-    logger = TokenTrimmerLiteLLMLogger.install(max_cost_usd=0.50)
+    logger = TokenTrimmerLiteLLMLogger.install(post_response_budget_usd=0.50)
 
     resp = litellm.completion(
         model="openai/claude-haiku-4-5",
@@ -56,16 +56,13 @@ Budget stop — how it differs from LangChain
 -------------------------------------------
 
 LiteLLM's callbacks are post-hoc **logging** events: LiteLLM catches (and merely
-logs) any exception raised inside ``log_success_event`` / ``log_pre_api_call``,
-so — unlike the LangChain callback's ``raise_error = True`` inline stop — a raise
-from here **cannot** abort the in-flight ``completion`` call. So the budget stop
-is a *checkpoint*: when the accumulated cost crosses ``max_cost_usd`` the logger
-records the breach (:attr:`budget_exceeded` flips to ``True``) and the caller
-enforces it by calling :meth:`raise_if_exceeded` between calls — the natural
-place to cap a multi-call agent loop. This is a faithful adaptation of #268's
-budget primitive to LiteLLM's callback contract, not a weaker one: the same
-:class:`~tokentrimmer.integrations._budget.BudgetExceeded` carries the same
-offending total + limit.
+logs) any exception raised inside ``log_success_event`` / ``log_pre_api_call``.
+The configured ``post_response_budget_usd`` is therefore a checkpoint, not
+pre-dispatch enforcement. When observed accumulated cost crosses it, the logger
+records the breach (:attr:`budget_exceeded` flips to ``True``); the caller then
+calls :meth:`raise_if_exceeded` between calls. The completed call is already
+spent. The shared :class:`~tokentrimmer.integrations._budget.BudgetExceeded`
+carries the offending total and limit.
 
 If ``return_response_headers`` is not set (or a response carries no gateway
 headers, e.g. a self-hosted gateway without pricing), the logger degrades
@@ -107,12 +104,11 @@ __all__ = [
 class TokenTrimmerLiteLLMLogger(CustomLogger):
     """A LiteLLM :class:`CustomLogger` that records TokenTrimmer cost/savings.
 
-    :param max_cost_usd: optional per-run budget (USD). When the accumulated
-        served cost across this logger's calls exceeds it, the logger records a
-        breach — :attr:`budget_exceeded` flips to ``True`` — and
-        :meth:`raise_if_exceeded` raises :class:`BudgetExceeded`. ``None``
-        (default) disables the budget. (See the module docstring for why the stop
-        is a checkpoint rather than an inline raise under LiteLLM.)
+    :param post_response_budget_usd: optional observed-cost budget (USD). After
+        a completed call takes the accumulated served cost over it, the logger
+        records a breach and :meth:`raise_if_exceeded` raises
+        :class:`BudgetExceeded` at the caller's next checkpoint. It cannot
+        prevent the completed call. ``None`` (default) disables the check.
     :param record_spans: when ``True`` (default) the cost attributes are recorded
         onto the current OpenTelemetry span (if OpenTelemetry is installed and a
         span is recording). When OpenTelemetry is absent the logger still
@@ -130,12 +126,12 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
     def __init__(
         self,
         *,
-        max_cost_usd: Optional[float] = None,
+        post_response_budget_usd: Optional[float] = None,
         record_spans: bool = True,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__()
-        self.max_cost_usd = max_cost_usd
+        self.post_response_budget_usd = post_response_budget_usd
         self.record_spans = record_spans
         self._logger = logger or _logger
         #: Accumulated served cost (USD) across this logger's calls.
@@ -146,7 +142,7 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
         self.total_baseline_usd: float = 0.0
         #: Number of calls that carried TokenTrimmer cost headers.
         self.attributed_calls: int = 0
-        #: ``True`` once the accumulated cost has crossed ``max_cost_usd``.
+        #: ``True`` once observed cost has crossed ``post_response_budget_usd``.
         self.budget_exceeded: bool = False
         self._budget_error: Optional[BudgetExceeded] = None
         # LiteLLM runs sync success callbacks on a background executor. The
@@ -168,11 +164,11 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
             self._recorded_call_ids.clear()
 
     def raise_if_exceeded(self) -> None:
-        """Raise :class:`BudgetExceeded` if the run has crossed its budget.
+        """Raise :class:`BudgetExceeded` after observed cost crosses the budget.
 
         Call this at your loop checkpoint (typically right after each
-        ``litellm.completion`` / ``acompletion``) to enforce ``max_cost_usd``.
-        A no-op when no budget is set or the budget has not been breached.
+        ``litellm.completion`` / ``acompletion``) to stop before the next call.
+        A no-op when no post-response budget is set or it has not been breached.
         """
         if self._budget_error is not None:
             raise self._budget_error
@@ -269,14 +265,14 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
                 self.attributed_calls += 1
 
                 if (
-                    self.max_cost_usd is not None
-                    and self.total_cost_usd > self.max_cost_usd
+                    self.post_response_budget_usd is not None
+                    and self.total_cost_usd > self.post_response_budget_usd
                 ):
                     # LiteLLM swallows exceptions raised from this callback, so
                     # record the breach for the caller's checkpoint instead.
                     self.budget_exceeded = True
                     self._budget_error = BudgetExceeded(
-                        self.total_cost_usd, self.max_cost_usd
+                        self.total_cost_usd, self.post_response_budget_usd
                     )
 
         if first_attribution:
@@ -295,7 +291,7 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
     def install(
         cls,
         *,
-        max_cost_usd: Optional[float] = None,
+        post_response_budget_usd: Optional[float] = None,
         record_spans: bool = True,
         logger: Optional[logging.Logger] = None,
     ) -> "TokenTrimmerLiteLLMLogger":
@@ -311,7 +307,9 @@ class TokenTrimmerLiteLLMLogger(CustomLogger):
 
         _litellm.return_response_headers = True
         handler = cls(
-            max_cost_usd=max_cost_usd, record_spans=record_spans, logger=logger
+            post_response_budget_usd=post_response_budget_usd,
+            record_spans=record_spans,
+            logger=logger,
         )
         callbacks = getattr(_litellm, "callbacks", None)
         if not isinstance(callbacks, list):  # pragma: no cover - defensive

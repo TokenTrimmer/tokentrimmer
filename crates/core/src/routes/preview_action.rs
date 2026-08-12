@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn projection_serializes_with_formula_identity_and_labels() {
         let projection = CounterfactualProjection::project(POSITIVE);
-        let value = serde_json::to_value(&projection).expect("projection must serialize");
+        let value = serde_json::to_value(projection).expect("projection must serialize");
         assert_eq!(
             value["formula_version"],
             json!("tt.request-delta-estimate.v1")

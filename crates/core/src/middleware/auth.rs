@@ -6,31 +6,36 @@
 //! handler then reads that extension to look up the per-org upstream
 //! credentials it needs to authenticate to the provider.
 //!
-//! ## What this middleware deliberately does NOT do
+//! A configured key store is the mode boundary: tenant/model paths then accept
+//! only verified `tt_live_*` principals or `tt_test_*` on the four isolated,
+//! no-provider inference endpoints. Arbitrary provider bearer tokens, missing
+//! bearer tokens, and sandbox tokens on every other protected route are rejected.
+//! Without a key store, BYOK passthrough remains available for the
+//! loopback-guarded local/self-hosted mode.
 //!
-//! * It does **not** require a Bearer token. Requests without one pass
-//!   through so `/health` and `/v1/models` keep working without auth, and so
-//!   the chat handler retains the option to construct a synthetic context
-//!   for tests that don't wire auth.
-//! * It does **not** verify `tt_test_*` sandbox keys against the key store —
-//!   the chat handler short-circuits sandbox traffic to a deterministic
-//!   synthetic response before touching any provider, so verification would
-//!   be wasted work. The sandbox path is still subject to the per-IP rate cap
-//!   ([`crate::middleware::argon2_cap`]) so an unauthenticated flood of
-//!   `tt_test_*` requests cannot pin slots unthrottled (SEC-9).
-//! * It does **not** look up provider credentials. The chat handler does
-//!   that, because credential lookup is per-provider and the provider isn't
-//!   resolved until the model is parsed from the request body.
+//! Public probes and the model catalog (`/health`, `/ready`, `/metrics`, and
+//! `/v1/models`) remain unauthenticated in both modes.
 //!
-//! Behaviour matrix:
+//! `tt_test_*` keys intentionally skip store verification only for `POST`
+//! `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and `/v1/embeddings`.
+//! Those handlers short-circuit to deterministic synthetic responses before
+//! provider dispatch. The sandbox path is still subject to the per-IP rate cap
+//! ([`crate::middleware::argon2_cap`]).
 //!
-//! | Header value                | Outcome                                          |
-//! | --------------------------- | ------------------------------------------------ |
-//! | (none)                      | pass through                                     |
-//! | `Bearer tt_test_…`          | per-IP cap → pass through (sandbox downstream) or 429 |
-//! | `Bearer tt_live_…` + valid  | `ApiKeyContext` attached as extension; continue  |
-//! | `Bearer tt_live_…` + invalid| **401 Unauthorized**                             |
-//! | `Bearer <other format>`     | pass through (forward-compat with future schemes)|
+//! Provider credential lookup remains in the chat handler because the provider
+//! is not resolved until the request body is parsed.
+//!
+//! Behaviour matrix for protected paths:
+//!
+//! | Mode / header                  | Outcome                                      |
+//! | ------------------------------ | -------------------------------------------- |
+//! | key store + no bearer          | **401 Unauthorized**                         |
+//! | key store + sandbox request    | capped sandbox; never provider dispatch      |
+//! | key store + sandbox elsewhere  | **401 Unauthorized**                         |
+//! | key store + valid `tt_live_…`  | verified `ApiKeyContext`; continue           |
+//! | key store + invalid `tt_live_…`| **401 Unauthorized**                         |
+//! | key store + any other bearer   | **401 Unauthorized**                         |
+//! | no key store                   | local BYOK passthrough (boot is loopback-safe)|
 
 use axum::{
     extract::{Request, State},
@@ -74,6 +79,24 @@ fn warn_dogfood_non_loopback_once(state: &AppState) {
     });
 }
 
+/// Probe/catalog paths that deliberately remain public when the gateway has a
+/// key store. Every other routed path requires a verified TokenTrimmer
+/// principal, except the isolated no-provider sandbox.
+fn is_public_path(path: &str) -> bool {
+    matches!(path, "/health" | "/ready" | "/metrics" | "/v1/models")
+}
+
+/// The complete unauthenticated sandbox surface. Keeping this allowlist next to
+/// the public-path allowlist prevents a `tt_test_*` token from becoming a
+/// generic hosted identity for workflow, agent, spend, or admin routes.
+fn is_sandbox_request(req: &Request) -> bool {
+    req.method() == axum::http::Method::POST
+        && matches!(
+            req.uri().path(),
+            "/v1/chat/completions" | "/v1/messages" | "/v1/responses" | "/v1/embeddings"
+        )
+}
+
 /// Axum `from_fn_with_state`-compatible middleware function.
 pub async fn middleware(
     State(state): State<AppState>,
@@ -86,17 +109,18 @@ pub async fn middleware(
     // (P2) against the per-`(org, key)` accumulator.
     let mut org_id: Option<Uuid> = None;
     let mut api_key_id: Option<Uuid> = None;
+    let verified_identity_required = state.key_store.is_some() && !is_public_path(req.uri().path());
 
     if let Some(token) = extract_bearer(req.headers()) {
-        // tt_test_* short-circuits to a synthetic sandbox response in the chat
-        // handler — no key-store verify and no provider/credential dispatch. It
-        // must NOT, however, bypass the per-IP rate cap: an unauthenticated
-        // flood of distinct tt_test_* tokens would otherwise pin gateway slots
-        // unthrottled (SEC-9). Charge the same per-IP cap used to guard the
-        // argon2 cold path BEFORE letting the request through; over the cap we
-        // shed with 429 + Retry-After. The synthetic-response behaviour is
-        // unchanged for traffic under the cap.
+        // tt_test_* short-circuits to a synthetic response only on the explicit
+        // inference sandbox allowlist. On every other protected hosted route it
+        // is not an identity and must fail closed before reaching the handler.
+        // Allowed sandbox requests still pay the per-IP pre-auth cap: a flood
+        // of distinct tokens would otherwise pin gateway slots unthrottled.
         if token.starts_with("tt_test_") {
+            if verified_identity_required && !is_sandbox_request(&req) {
+                return Err(ApiError::Unauthorized);
+            }
             let client_ip = crate::middleware::argon2_cap::client_ip(req.headers());
             if let crate::middleware::argon2_cap::CapDecision::Reject { retry_after_secs } =
                 state.argon2_cap.check(client_ip)
@@ -225,7 +249,15 @@ pub async fn middleware(
                 req.extensions_mut().insert(ctx);
             }
         }
-        // Any other token format passes through unchallenged — forward-compat.
+        // Any other token format is BYOK only in local mode. Once a key store
+        // is wired, accepting an upstream provider bearer here would let an
+        // anonymous caller reach hosted model dispatch without a TokenTrimmer
+        // principal.
+        else if verified_identity_required {
+            return Err(ApiError::Unauthorized);
+        }
+    } else if verified_identity_required {
+        return Err(ApiError::Unauthorized);
     } else if state.dogfood_enabled {
         // No bearer token + dogfood mode: stamp the fixed dogfood org id so the
         // routing engine can match the pre-seeded dogfood route. This is
@@ -503,7 +535,7 @@ mod tests {
         body::Body,
         http::{Request as HttpRequest, StatusCode},
         middleware,
-        routing::get,
+        routing::{get, post},
         Router,
     };
     use chrono::{DateTime, Utc};
@@ -652,18 +684,23 @@ mod tests {
         key
     }
 
-    /// Build a minimal `AppState` with a counting store and a FRESH verify cache.
+    /// Build a minimal hosted-mode `AppState` with a counting store and a fresh
+    /// verify cache.
     fn state_with_store(store: Arc<CountingKeyStore>) -> AppState {
-        let mut app = AppState::new(crate::registry::ProviderRegistry::new());
-        app.verify_cache = Arc::new(KeyVerifyCache::new());
-        app.key_store = Some(store);
-        app
+        AppState::new(crate::registry::ProviderRegistry::new()).with_key_store(store)
     }
 
-    /// Build a trivial router that runs the auth middleware and returns 200 on pass.
+    /// Build a trivial router that runs the auth middleware and returns 200 on
+    /// protected and public paths when the middleware allows the request.
     fn build_router(state: AppState) -> Router {
         Router::new()
             .route("/", get(|| async { "ok" }))
+            .route("/health", get(|| async { "ok" }))
+            .route("/v1/models", get(|| async { "ok" }))
+            .route("/v1/chat/completions", post(|| async { "ok" }))
+            .route("/v1/messages", post(|| async { "ok" }))
+            .route("/v1/responses", post(|| async { "ok" }))
+            .route("/v1/embeddings", post(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
                 super::middleware,
@@ -690,6 +727,16 @@ mod tests {
             .expect("request")
     }
 
+    fn sandbox_bearer_from_ip(token: &str, ip: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("x-forwarded-for", ip)
+            .body(Body::empty())
+            .expect("sandbox request")
+    }
+
     /// `AppState` with a counting store, fresh verify cache, and a per-IP
     /// argon2 cap set to `verify_per_min` (deterministic: burst == per_min, so
     /// the `(verify_per_min + 1)`-th cold-path verify from one IP is shed).
@@ -698,6 +745,77 @@ mod tests {
         let mut app = state_with_store(store);
         app.argon2_cap = Argon2VerifyCap::new(Argon2CapConfig { verify_per_min });
         app
+    }
+
+    #[tokio::test]
+    async fn hosted_mode_rejects_non_principals_and_limits_sandbox_surface() {
+        let state = state_with_store(CountingKeyStore::new());
+        let router = build_router(state);
+
+        let missing = HttpRequest::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("missing bearer request");
+        assert_eq!(
+            router.clone().oneshot(missing).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        for token in ["provider_bearer_not_a_tt_key", "tt_test_not_an_identity"] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(live_bearer(token))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "{token} must not authorize a protected non-sandbox route"
+            );
+        }
+
+        for path in [
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/responses",
+            "/v1/embeddings",
+        ] {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri(path)
+                .header("Authorization", "Bearer tt_test_sandbox")
+                .body(Body::empty())
+                .expect("sandbox request");
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK,
+                "{path} must retain the no-provider sandbox"
+            );
+        }
+
+        for path in ["/health", "/v1/models"] {
+            let request = HttpRequest::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("public request");
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK,
+                "{path} must remain public"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn db_less_local_mode_retains_explicit_byok_passthrough() {
+        let state = AppState::new(crate::registry::ProviderRegistry::new());
+        let router = build_router(state);
+
+        let request = live_bearer("provider_bearer_not_a_tt_key");
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1236,7 +1354,7 @@ mod tests {
             let token = format!("tt_test_sandbox{n:04}");
             let r = router
                 .clone()
-                .oneshot(live_bearer_from_ip(&token, ip))
+                .oneshot(sandbox_bearer_from_ip(&token, ip))
                 .await
                 .expect("under-cap sandbox resp");
             assert_eq!(
@@ -1250,7 +1368,7 @@ mod tests {
         // with 429 + Retry-After.
         let r3 = router
             .clone()
-            .oneshot(live_bearer_from_ip("tt_test_sandbox9999", ip))
+            .oneshot(sandbox_bearer_from_ip("tt_test_sandbox9999", ip))
             .await
             .expect("over-cap sandbox resp");
         assert_eq!(
@@ -1364,13 +1482,13 @@ mod tests {
         // IP A burns its single cell, then is shed.
         let a1 = router
             .clone()
-            .oneshot(live_bearer_from_ip("tt_test_aaaa0000", "198.51.100.1"))
+            .oneshot(sandbox_bearer_from_ip("tt_test_aaaa0000", "198.51.100.1"))
             .await
             .expect("a1");
         assert_eq!(a1.status(), StatusCode::OK);
         let a2 = router
             .clone()
-            .oneshot(live_bearer_from_ip("tt_test_aaaa1111", "198.51.100.1"))
+            .oneshot(sandbox_bearer_from_ip("tt_test_aaaa1111", "198.51.100.1"))
             .await
             .expect("a2");
         assert_eq!(a2.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1378,7 +1496,7 @@ mod tests {
         // A DIFFERENT IP still has its own budget → passes.
         let b1 = router
             .clone()
-            .oneshot(live_bearer_from_ip("tt_test_bbbb0000", "198.51.100.2"))
+            .oneshot(sandbox_bearer_from_ip("tt_test_bbbb0000", "198.51.100.2"))
             .await
             .expect("b1");
         assert_eq!(

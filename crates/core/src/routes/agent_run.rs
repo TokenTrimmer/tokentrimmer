@@ -813,6 +813,8 @@ pub struct DurableRunView {
     pub turns: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
     pub cost_usd: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
@@ -895,6 +897,7 @@ pub async fn list_runs(
             model: r.model,
             turns: r.turns,
             max_turns: r.max_turns,
+            max_cost_usd: r.max_cost_usd,
             cost_usd: r.cost_usd,
             stop_reason: r.stop_reason,
             tag: r.tag,
@@ -959,7 +962,11 @@ impl RunIdentity {
     /// the chat handler's post-auth setup (`chat::handler` §2 / §2b). The
     /// sandbox `tt_test_*` short-circuit is intentionally NOT replicated here —
     /// an agent run always drives the real per-turn completion pipeline.
-    fn from_request(auth_ctx: Option<&ApiKeyContext>, trace: &str, headers: &HeaderMap) -> Self {
+    fn from_request(
+        auth_ctx: Option<&ApiKeyContext>,
+        trace: &str,
+        headers: &HeaderMap,
+    ) -> ApiResult<Self> {
         let raw_bearer = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
@@ -983,17 +990,13 @@ impl RunIdentity {
                 .unwrap_or_else(Uuid::now_v7)
         };
 
-        let idempotency_key = headers
-            .get("x-idempotency-key")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if trace_id != Uuid::nil() {
-                    trace_id.to_string()
-                } else {
-                    Uuid::now_v7().to_string()
-                }
-            });
+        let idempotency_key = super::idempotency_key_from_headers(headers)?.unwrap_or_else(|| {
+            if trace_id != Uuid::nil() {
+                trace_id.to_string()
+            } else {
+                Uuid::now_v7().to_string()
+            }
+        });
 
         let (org_id, api_key_id, caller_tier, skip_shadow) = match auth_ctx {
             Some(c) => (c.org_id, c.key_id, c.tier, c.skip_shadow),
@@ -1015,7 +1018,7 @@ impl RunIdentity {
         let mut headers = headers.clone();
         headers.remove("x-tokentrimmer-cache");
 
-        Self {
+        Ok(Self {
             org_id,
             api_key_id,
             caller_tier,
@@ -1036,7 +1039,7 @@ impl RunIdentity {
             // Set to nil here; the handler overwrites it with the real run id
             // after `Uuid::new_v4()` (create) or `stored.id` (resume).
             run_id: Uuid::nil(),
-        }
+        })
     }
 }
 
@@ -1112,6 +1115,11 @@ impl TurnCompleter for GatewayCompleter<'_> {
         // base identity (not a prior turn's rebound `ctx`) guarantees a
         // cross-provider credential rebind inside `prepare` never leaks forward.
         let mut ctx = RequestContext {
+            budget_dispatch: crate::budget_reservation::dispatch_state_for_idempotency(
+                self.identity.org_id,
+                self.identity.api_key_id,
+                &self.identity.idempotency_key,
+            ),
             trace_id: self.identity.trace_id,
             org_id: self.identity.org_id,
             api_key_id: self.identity.api_key_id,
@@ -1469,7 +1477,7 @@ pub async fn create_run(
     headers: HeaderMap,
     Json(req): Json<CreateRunRequest>,
 ) -> ApiResult<Response> {
-    let mut identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
+    let mut identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers)?;
     // Capture the org + non-secret routing config BEFORE `identity` is moved
     // into the completer — a paused run persists these (never any credential).
     let org_id = identity.org_id;
@@ -1860,7 +1868,7 @@ pub async fn submit_tool_outputs(
 
     // Rebuild the completer from the RESUME request's auth/headers (re-auth; org
     // verified == stored.org_id above) + the stored, non-secret routing config.
-    let mut identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
+    let mut identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers)?;
     identity.provider_pin = stored.routing.provider_pin.clone();
     identity.forced_route = stored.routing.forced_route.clone();
     identity.tag = stored.routing.tag.clone();
@@ -2298,6 +2306,11 @@ fn summarizer_model(state: &AppState) -> String {
 /// unused — and a wrong-vendor footgun).
 fn base_request_context(identity: &RunIdentity) -> RequestContext {
     RequestContext {
+        budget_dispatch: crate::budget_reservation::dispatch_state_for_idempotency(
+            identity.org_id,
+            identity.api_key_id,
+            &identity.idempotency_key,
+        ),
         trace_id: identity.trace_id,
         org_id: identity.org_id,
         api_key_id: identity.api_key_id,
@@ -2498,6 +2511,24 @@ mod tests {
     }
 
     // ----- Task 6: durable_record_to_run mapping (written first, TDD) -----
+
+    #[test]
+    fn durable_run_view_serializes_run_cost_cap() {
+        let view = DurableRunView {
+            id: Uuid::nil(),
+            status: "incomplete".into(),
+            model: "gpt-4o-mini".into(),
+            turns: 2,
+            max_turns: Some(8),
+            max_cost_usd: Some(0.05),
+            cost_usd: 0.04,
+            stop_reason: Some("budget_exhausted".into()),
+            tag: None,
+        };
+
+        let value = serde_json::to_value(view).expect("durable run view serializes");
+        assert_eq!(value["max_cost_usd"], serde_json::json!(0.05));
+    }
 
     #[test]
     fn durable_record_to_run_maps_status_and_stop_reason() {
@@ -2818,9 +2849,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-tokentrimmer-cache", "force-write".parse().unwrap());
         headers.insert("x-tokentrimmer-tag", "proj-x".parse().unwrap());
-        let id = RunIdentity::from_request(None, "", &headers);
+        headers.insert("idempotency-key", "logical-run-1".parse().unwrap());
+        let id = RunIdentity::from_request(None, "", &headers).unwrap();
         assert!(!id.headers.contains_key("x-tokentrimmer-cache"));
         assert_eq!(id.tag.as_deref(), Some("proj-x"));
+        assert_eq!(id.idempotency_key, "logical-run-1");
         // Anonymous caller → nil org/key, no L2 entitlement.
         assert_eq!(id.org_id, Uuid::nil());
         assert!(!id.l2_allowed);
@@ -2834,7 +2867,7 @@ mod tests {
             tier: Some(tt_shared::CallerTier::Pro),
             skip_shadow: false,
         };
-        let id = RunIdentity::from_request(Some(&ctx), "", &HeaderMap::new());
+        let id = RunIdentity::from_request(Some(&ctx), "", &HeaderMap::new()).unwrap();
         assert_eq!(id.org_id, Uuid::from_u128(2));
         assert_eq!(id.api_key_id, Uuid::from_u128(1));
         assert!(id.l2_allowed);
@@ -2846,7 +2879,7 @@ mod tests {
     /// complete_once/request_logs level).
     #[test]
     fn run_identity_run_id_initialized_to_nil() {
-        let id = RunIdentity::from_request(None, "", &HeaderMap::new());
+        let id = RunIdentity::from_request(None, "", &HeaderMap::new()).unwrap();
         assert_eq!(
             id.run_id,
             Uuid::nil(),
@@ -3633,7 +3666,10 @@ mod tests {
             Some(crate::routes::agent_run_budget::StopReason::BudgetBreach)
         );
         assert_eq!(run.turns, 1);
-        assert_eq!(run.usage.cost_usd, 1.20, "real settle is preserved, never clamped");
+        assert_eq!(
+            run.usage.cost_usd, 1.20,
+            "real settle is preserved, never clamped"
+        );
         assert!(run
             .note
             .as_deref()

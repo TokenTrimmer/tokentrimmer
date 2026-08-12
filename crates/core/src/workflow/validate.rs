@@ -1797,19 +1797,19 @@ mod tests {
     #[test]
     fn document_node_rejects_unsafe_url_sources() {
         for url in [
-            "http://example.com/doc.pdf",                 // not https
-            "https://user:pass@example.com/doc.pdf",      // credentials in URL
-            "https://127.0.0.1/doc.pdf",                  // loopback
-            "https://10.0.0.5/doc.pdf",                   // private RFC1918
-            "https://192.168.1.1/doc.pdf",                // private RFC1918
-            "https://169.254.169.254/latest/meta-data/",  // cloud metadata
-            "https://localhost/doc.pdf",                  // localhost hostname
-            "https://metadata.google.internal/doc.pdf",   // internal hostname
-            "https://myhost.local/doc.pdf",               // mDNS `.local` hostname
-            "ftp://example.com/doc.pdf",                  // non-http scheme
+            "http://example.com/doc.pdf",                   // not https
+            "https://user:pass@example.com/doc.pdf",        // credentials in URL
+            "https://127.0.0.1/doc.pdf",                    // loopback
+            "https://10.0.0.5/doc.pdf",                     // private RFC1918
+            "https://192.168.1.1/doc.pdf",                  // private RFC1918
+            "https://169.254.169.254/latest/meta-data/",    // cloud metadata
+            "https://localhost/doc.pdf",                    // localhost hostname
+            "https://metadata.google.internal/doc.pdf",     // internal hostname
+            "https://myhost.local/doc.pdf",                 // mDNS `.local` hostname
+            "ftp://example.com/doc.pdf",                    // non-http scheme
             "https://example.com/{{trigger.input_id}}.pdf", // templated target
-            "not a url",                                  // unparseable
-            "   ",                                        // blank
+            "not a url",                                    // unparseable
+            "   ",                                          // blank
         ] {
             let def = doc_def(tt_shared::messages::DocumentSource::Url {
                 url: url.to_string(),

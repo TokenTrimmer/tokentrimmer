@@ -41,6 +41,9 @@ pub enum ApiError {
     #[error("no upstream credential for provider {provider}")]
     MissingProviderCredential { provider: String },
 
+    #[error("pricing is unavailable for model {model}; cannot enforce the requested cost ceiling")]
+    PriceUnknown { model: String },
+
     #[error(
         "estimated cost ${estimated_usd:.4} exceeds the ${ceiling_usd:.4} per-request ceiling"
     )]
@@ -102,9 +105,7 @@ pub enum ApiError {
     /// satisfy the request's required capabilities before any fan-out. This
     /// is distinct from [`ApiError::ModelNotFound`]: the model IS cataloged,
     /// it just cannot serve the requested modality (vision/tools/json-mode).
-    #[error(
-        "panel {role} model {model} cannot satisfy required capabilities: {reasons:?}"
-    )]
+    #[error("panel {role} model {model} cannot satisfy required capabilities: {reasons:?}")]
     PanelModelCapabilityUnavailable {
         /// `"member"` or `"arbiter"`.
         role: &'static str,
@@ -191,6 +192,16 @@ impl IntoResponse for ApiError {
                     "No upstream credential configured for provider '{provider}'. Add your org's '{provider}' API key in the TokenTrimmer dashboard (Credentials) before sending, routing, or pinning requests to this provider."
                 ),
                 None,
+                None,
+            ),
+            ApiError::PriceUnknown { model } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+                "price_unknown",
+                format!(
+                    "Pricing is unavailable for model '{model}', so the requested USD cost ceiling cannot be enforced."
+                ),
+                Some("model".into()),
                 None,
             ),
             ApiError::CostLimitExceeded {
@@ -333,6 +344,24 @@ impl IntoResponse for ApiError {
 
 fn map_provider_error(err: &ProviderError) -> (StatusCode, &'static str, &'static str, String) {
     match err {
+        ProviderError::BudgetExceeded { .. } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "budget_exceeded",
+            err.to_string(),
+        ),
+        ProviderError::BudgetPriceUnknown { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request_error",
+            "price_unknown",
+            err.to_string(),
+        ),
+        ProviderError::BudgetUnavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "budget_unavailable",
+            err.to_string(),
+        ),
         ProviderError::Unauthorized(_) => (
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -387,5 +416,25 @@ fn map_provider_error(err: &ProviderError) -> (StatusCode, &'static str, &'stati
             "unsupported_operation",
             err.to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn price_unknown_has_a_typed_unprocessable_entity_envelope() {
+        let response = ApiError::PriceUnknown {
+            model: "unpriced-model".into(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "price_unknown");
+        assert_eq!(body["error"]["param"], "model");
     }
 }

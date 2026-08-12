@@ -910,6 +910,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_cost_limit_is_rejected_instead_of_disabling_the_cap() {
+        for invalid in ["0", "-1", "NaN", "inf", "not-a-number"] {
+            let response = app_with_mock()
+                .oneshot(chat_request_with("mock-model-1", 1000, Some(invalid)))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{invalid:?} must not become an uncapped request"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "invalid_request", "got {body}");
+        }
+    }
+
+    #[tokio::test]
     async fn cost_limit_counts_full_prompt_not_just_last_message() {
         // A large system prompt + a tiny trailing user message. The limit is set
         // so the 402 trips ONLY when the FULL prompt is counted — estimating from

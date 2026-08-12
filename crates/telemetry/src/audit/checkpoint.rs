@@ -75,7 +75,9 @@ struct CheckpointArtifact {
 }
 
 fn is_canonical_hex(value: &str, length: usize) -> bool {
-    value.len() == length && value.bytes().all(|b| b.is_ascii_hexdigit()) && value == value.to_lowercase()
+    value.len() == length
+        && value.bytes().all(|b| b.is_ascii_hexdigit())
+        && value == value.to_lowercase()
 }
 
 /// SHA-256 identity of an Ed25519 public key (hex), as bound by the payload.
@@ -120,13 +122,17 @@ fn validate_payload(payload: &CheckpointPayload) -> Result<(), CheckpointError> 
         return Err(CheckpointError::BadSequence);
     }
     if !is_canonical_hex(&payload.verifying_key_hex, 64) {
-        return Err(CheckpointError::BadCanonicalHex { field: "verifying_key_hex" });
+        return Err(CheckpointError::BadCanonicalHex {
+            field: "verifying_key_hex",
+        });
     }
     if !is_canonical_hex(&payload.tip_hash, 64) {
         return Err(CheckpointError::BadCanonicalHex { field: "tip_hash" });
     }
     if !is_canonical_hex(&payload.customer_key_identity, 64) {
-        return Err(CheckpointError::BadCanonicalHex { field: "customer_key_identity" });
+        return Err(CheckpointError::BadCanonicalHex {
+            field: "customer_key_identity",
+        });
     }
     // Whole-second UTC instant only: exactly `YYYY-MM-DDTHH:MM:SSZ` with
     // canonical zero-padding (no sub-second, no offset).
@@ -237,7 +243,13 @@ mod tests {
         );
 
         let bad_seq = sample_payload(&identity);
-        let bad_seq = CheckpointPayload { sequence: -1, ..bad_seq };
-        assert_eq!(build_checkpoint(&bad_seq, &customer), Err(CheckpointError::BadSequence));
+        let bad_seq = CheckpointPayload {
+            sequence: -1,
+            ..bad_seq
+        };
+        assert_eq!(
+            build_checkpoint(&bad_seq, &customer),
+            Err(CheckpointError::BadSequence)
+        );
     }
 }

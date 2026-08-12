@@ -125,6 +125,7 @@ docker run --rm -p 8080:8080 \
 > `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` opt-in (see the table below). For
 > verified `tt_live_*` keys and per-org provider credentials, set
 > `DATABASE_URL` (and `TT_MASTER_KEY`).
+> Anonymous exact-cache entries are scoped by a one-way digest of the caller's provider Bearer, never the shared nil organization; anonymous callers are not eligible for the semantic cache. The plaintext provider credential is never part of a cache key.
 
 Smoke-test it:
 
@@ -132,16 +133,16 @@ Smoke-test it:
 curl http://localhost:8080/health
 ```
 
-### What the Gateway uses (all optional, all best-effort at boot)
+### Gateway dependency and identity behavior
 
-Every external dependency is best-effort: if it's missing or unreachable, the Gateway logs a warning and continues in a degraded mode rather than crash-looping.
+A configured `DATABASE_URL` is a hard dependency: connection, migration, or exact-ledger verification failure aborts before the listener binds. With no database configured, the Gateway enters a loopback-first local BYOK mode. Redis and observability integrations remain optional.
 
 | Env var | Purpose | If unset |
 |---|---|---|
 | `PORT` | Bind port | Defaults to `8080` |
 | `TT_BIND_ADDR` | Bind IP | Defaults to `0.0.0.0` with `DATABASE_URL`, `127.0.0.1` without (fail-closed) |
 | `TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND` | Set to `1` to allow a non-loopback bind **without** a key store (unauthenticated BYO-key passthrough) | A non-loopback `TT_BIND_ADDR` without `DATABASE_URL` refuses to start |
-| `DATABASE_URL` | Postgres: API-key verification, request logs, routing rules, provider-credential store | Runs without persistence; `tt_live_*` keys pass through **unverified** (dev mode), binds loopback by default, and env provider keys are never served |
+| `DATABASE_URL` | Postgres: API-key verification, request logs, routing rules, provider-credential store | Enters local BYOK mode: binds loopback by default, treats every non-sandbox bearer solely as the caller's upstream provider credential (never as a TokenTrimmer principal), and never serves operator env provider keys |
 | `REDIS_URL` | L1 exact-match cache (use `rediss://` native, **not** an HTTP REST URL) | L1 cache disabled |
 | `TT_MASTER_KEY` | XChaCha20-Poly1305 root key for the Postgres provider-credential store. Generate with `openssl rand -hex 32` | Postgres credential store disabled; **no** provider credentials are served unless `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` restores the env-only dogfood mode |
 | `TT_ALLOW_ENV_CREDENTIAL_FALLBACK` | Set to `1` to serve the operator's env provider keys (below) to orgs with no stored credential — **single-tenant self-host / dogfood only**. On a multi-tenant gateway this lets every org spend on the operator's keys (provider-ToS / resale exposure) | **BYO-only (default):** with `DATABASE_URL` + `TT_MASTER_KEY` configured, an org with no stored credential for the requested provider gets an actionable `missing_provider_credential` error — never the operator's env keys |
@@ -312,7 +313,7 @@ Tools (always available): `preview_cost` (estimate cost before sending), `find_r
 
 ### 6. `tt proxy` — local listener for coding agents
 
-A local OpenAI/Anthropic-compatible listener (default **port 31415**) that routes OpenAI-wire traffic through the hosted Gateway and writes per-session cost rollups. Handy for tools like Claude Code, Codex, or anything that reads `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`. Note: Anthropic-wire requests (`/v1/messages`) forward directly to the Anthropic upstream in every mode, with your client's own credentials passed through — the Gateway has no Anthropic ingress yet.
+A local OpenAI/Anthropic-compatible listener (default **port 31415**) that forwards model traffic according to an explicit identity mode and writes per-session cost rollups. It supports Claude Code and OpenAI-style clients that use Chat Completions. It does **not** expose `/v1/responses`, so current Codex CLI is not compatible; run Codex directly instead.
 
 ```bash
 tt proxy --mode gateway --tt-api-key tt_live_...
@@ -323,11 +324,11 @@ export ANTHROPIC_BASE_URL=http://localhost:31415
 export OPENAI_BASE_URL=http://localhost:31415
 ```
 
-Modes: `gateway` (default; OpenAI-wire endpoints forward to hosted TT with your TokenTrimmer key injected, requires a key), `bypass` (forward straight to the upstream, logging only), `hybrid` (OpenAI-wire endpoints to the gateway, but your client's own credentials pass through). In all three modes `/v1/messages` goes directly to the Anthropic upstream. Flags: `--port`, `--bind` (default `127.0.0.1`), `--no-tui`, `--no-preview`, `--session-log <path>`.
+Modes: `gateway` (default; all model endpoints forward to hosted TT with your verified TokenTrimmer key injected), `bypass` (forward straight to the upstream providers, logging only), and `hybrid` (all model endpoints forward to an explicitly configured **loopback self-hosted gateway**, preserving your client's provider credential). Hybrid refuses remote `--tt-api-base` values so a provider bearer can never stand in for a hosted TokenTrimmer principal. Flags: `--port`, `--bind` (default `127.0.0.1`), `--tt-api-base`, `--no-tui`, `--no-preview`, `--session-log <path>`.
 
 Session log is JSONL at `~/.tokentrimmer/sessions/YYYY-MM-DD.jsonl`; on Ctrl-C the proxy prints a session summary.
 
-**Requires:** for `gateway`/`hybrid` modes, a `tt_live_…` key via `--tt-api-key` or `TT_API_KEY`. `bypass` needs no key.
+**Requires:** `gateway` needs a `tt_live_…` key via `--tt-api-key` or `TT_API_KEY`. `hybrid` needs a local gateway target such as `--tt-api-base http://127.0.0.1:8080`. `bypass` needs no TokenTrimmer key.
 
 ### 7. Retrieval (RAG / context compression) — `tt retrieval`
 
@@ -421,7 +422,7 @@ tt audit verify path/to/chain.jsonl --key-hex <64-hex-chars>
 These are two different things, easy to confuse:
 
 - **`http://localhost:8080`** — your **self-hosted Gateway** (`tt gateway`). Point your app's `base_url` here when you run TokenTrimmer yourself.
-- **`http://localhost:31415`** — the **`tt proxy`** that forwards OpenAI-wire traffic to the *hosted* Gateway (`/v1/messages` goes directly to the Anthropic upstream — no gateway Anthropic ingress yet) and tracks per-session cost. Point coding agents (`ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL`) here.
+- **`http://localhost:31415`** — the **`tt proxy`** coding-agent listener. In `gateway` mode it forwards model traffic to hosted TokenTrimmer with a verified `tt_live_*` key; in `hybrid` it may target only a loopback self-hosted Gateway and preserves the client's provider credential; in `bypass` it calls providers directly.
 
 ---
 

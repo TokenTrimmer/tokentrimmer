@@ -16,6 +16,26 @@ pub enum ProviderError {
 
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// A durable pre-dispatch reservation could not fit within the caller's
+    /// configured monthly USD cap. Core maps this to the gateway's typed 429
+    /// budget response; adapters never construct it themselves.
+    #[error(
+        "monthly spend cap cannot admit estimated cost ${estimated_usd:.6}; remaining ${remaining_usd:.6}"
+    )]
+    BudgetExceeded {
+        estimated_usd: f64,
+        remaining_usd: f64,
+    },
+
+    /// A USD-capped call has no catalog price and/or bounded output size, so a
+    /// safe reservation cannot be computed.
+    #[error("a capped request has no enforceable cost bound for model {model}")]
+    BudgetPriceUnknown { model: String },
+
+    /// The durable reservation backend failed before provider dispatch. Failing
+    /// closed here protects a configured hard cap during database degradation.
+    #[error("durable budget reservation unavailable: {0}")]
+    BudgetUnavailable(String),
 
     #[error("upstream provider error (status {status}): {message}")]
     ProviderUpstream { status: u16, message: String },

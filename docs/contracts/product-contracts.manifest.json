@@ -110,11 +110,11 @@
     },
     {
       "path": "docs/workflow-contract/workflow-definition.schema.json",
-      "sha256": "385615922b7dd35057b3acf72f61ad1f2bea1da7794e2415a613f18443d7074e"
+      "sha256": "ca8eefd5f3a2c92705f915a6b0560085af9d006d024f26178fc4e04c281cb6a6"
     },
     {
       "path": "docs/workflow-contract/workflow-write.schema.json",
-      "sha256": "411dd9deae0591ff7b80d48cefb875e7208e01ec594a368402d3ba79f8c8016e"
+      "sha256": "4a681f0f498b930873a3be21e8af2054c24dceb3b96bddcc4e239c480e8a9fbf"
     },
     {
       "path": "sdk-python/tokentrimmer/product_contracts_generated.py",

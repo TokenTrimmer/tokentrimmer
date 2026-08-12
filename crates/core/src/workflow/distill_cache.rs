@@ -1,22 +1,15 @@
-//! D6 Slice 3 — the per-org content-hash distillation reuse cache.
+//! Per-organization document-distillation reuse cache.
 //!
-//! The workflow `Document` node ([`crate::workflow::types::NodeKind::Document`])
-//! distills a document's text layer via the `document_lane` seam on every run.
-//! A cache keyed by `blake3(content_bytes)` (+ an optional caller-supplied key)
-//! makes the second+ run of the SAME document a free lookup (no sidecar call).
-//! Content-addressed: the same bytes hit across runs.
+//! A cached extraction is reusable only when every semantic input matches:
+//! decoded source bytes, normalized media type, caller key, extractor revision,
+//! and TokenTrimmer cache-policy revision. This prevents identical bytes from
+//! being interpreted under a different MIME type or stale extraction behavior
+//! from surviving a sidecar/policy upgrade.
 //!
-//! **Per-org isolation is the store impl's responsibility** — a concrete
-//! [`DistillCacheStore`] is constructed per-run WITH the org_id (the cloud's
-//! `FlowDocDistillCache { org_id, pool }`), so the [`DistillCacheKey`] carries
-//! only `content_hash` + `caller_key` + the store's `get`/`upsert` scope to its
-//! org. One org's distillation never leaks to another (the SQL `WHERE org_id =
-//! $1` is the impl's contract).
-//!
-//! The trait is the seam the engine holds; the cloud provides the concrete impl
-//! backed by `flow_doc_distill_cache`. The engine defaults to [`NoCache`] (a ZST
-//! no-op) when no store is threaded — the node distills fresh on every run (the
-//! v1 posture, `public #313`).
+//! Per-org isolation remains the store implementation's responsibility. The
+//! cloud-backed [`FlowDocDistillCache`] binds every lookup/write to its
+//! configured organization; [`NoCache`] remains the fail-open default when no
+//! store is configured.
 //!
 //! # Fail-open
 //! A cache error (unreachable DB, decode failure) → `None` on get (the node
@@ -38,15 +31,55 @@ pub struct CachedDistill {
     pub engine: String,
 }
 
-/// The cache key — `blake3(content_bytes)` + an optional caller-supplied key.
-/// Constructed by the engine's Document node from the source bytes + the node's
-/// optional `cache_key` template. `caller_key` lets a flow pin a stable logical
-/// key (e.g. `"{{trigger.input_id}}"`) for reuse control independent of the
-/// content hash. Per-org scoping is the store impl's responsibility.
+/// Revision for TokenTrimmer-side extraction/cache semantics. Bump whenever
+/// normalization, extraction admission, or cached-output interpretation changes.
+pub const DISTILL_CACHE_POLICY_REVISION: &str = "workflow-document-cache-v2";
+
+/// Complete semantic identity of one cached document extraction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DistillCacheKey {
+    /// Blake3 digest of the decoded source bytes.
     pub content_hash: String,
     pub caller_key: Option<String>,
+    /// Lowercase MIME essence, without parameters.
+    pub media_type: String,
+    /// Immutable sidecar build/config revision supplied by the operator.
+    pub extractor_revision: String,
+    /// TokenTrimmer-side extraction/cache policy revision.
+    pub policy_revision: String,
+}
+
+impl DistillCacheKey {
+    #[must_use]
+    pub fn new(
+        content_hash: String,
+        caller_key: Option<String>,
+        media_type: &str,
+        extractor_revision: &str,
+    ) -> Self {
+        Self {
+            content_hash,
+            caller_key,
+            media_type: normalize_media_type(media_type),
+            extractor_revision: extractor_revision.to_string(),
+            policy_revision: DISTILL_CACHE_POLICY_REVISION.to_string(),
+        }
+    }
+}
+
+#[must_use]
+pub fn normalize_media_type(value: &str) -> String {
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if essence.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        essence
+    }
 }
 
 /// The per-org distillation reuse cache. The engine holds `&dyn` of this; the
@@ -77,15 +110,14 @@ impl DistillCacheStore for NoCache {
 }
 
 /// The concrete per-org distillation reuse cache backed by the
-/// `flow_doc_distill_cache` table (cloud migration `0044`). Constructed per-run
-/// with the org_id + the gateway's Postgres pool; the `get`/`upsert` scope to
-/// that org (`WHERE org_id = $1` — one org's distillation never served to
-/// another). The cache fails OPEN: any DB error → `None` on get (the node
-/// distills fresh) + a no-op on upsert (the next run re-tries + re-stores).
+/// `flow_doc_distill_cache` table (cloud migrations `0044` and `0118`).
+/// Constructed per-run with the org_id + the gateway's Postgres pool; the
+/// `get`/`upsert` scope to that org (`WHERE org_id = $1` — one org's
+/// distillation is never served to another). The cache fails open: any DB error
+/// yields `None` on get (the node distills fresh) and a no-op on upsert.
 ///
-/// Rows expire after 30 days (the table has a normal `distilled_at` index for
-/// the expiry sweep); a re-distillation after expiry is byte-identical (the
-/// extraction is a deterministic function of the source bytes).
+/// Rows expire after 30 days. Re-distillation uses the same explicitly
+/// versioned extractor and policy semantics represented by the key.
 pub struct FlowDocDistillCache<'a> {
     pub org_id: Uuid,
     pub pool: &'a sqlx::PgPool,
@@ -93,19 +125,26 @@ pub struct FlowDocDistillCache<'a> {
 
 const GET_SQL: &str = r#"
     SELECT distilled_text, pages, engine
-      FROM flow_doc_distill_cache
+      FROM public.flow_doc_distill_cache
      WHERE org_id = $1
        AND content_hash = $2
        AND COALESCE(caller_key, '') = COALESCE($3, '')
+       AND media_type = $4
+       AND extractor_revision = $5
+       AND policy_revision = $6
        AND distilled_at >= now() - INTERVAL '30 days'
      LIMIT 1
 "#;
 
 const UPSERT_SQL: &str = r#"
-    INSERT INTO flow_doc_distill_cache
-        (org_id, content_hash, caller_key, distilled_text, pages, engine)
-    VALUES ($1, $2, $3, $4, $5, $6)
-    ON CONFLICT (org_id, content_hash, COALESCE(caller_key, ''))
+    INSERT INTO public.flow_doc_distill_cache
+        (org_id, content_hash, caller_key, media_type, extractor_revision,
+         policy_revision, distilled_text, pages, engine)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    ON CONFLICT (
+        org_id, content_hash, COALESCE(caller_key, ''), media_type,
+        extractor_revision, policy_revision
+    )
     DO UPDATE SET
         distilled_text = EXCLUDED.distilled_text,
         pages          = EXCLUDED.pages,
@@ -121,6 +160,9 @@ impl<'a> DistillCacheStore for FlowDocDistillCache<'a> {
             .bind(self.org_id)
             .bind(&key.content_hash)
             .bind(&key.caller_key)
+            .bind(&key.media_type)
+            .bind(&key.extractor_revision)
+            .bind(&key.policy_revision)
             .fetch_optional(self.pool)
             .await
             .ok()
@@ -134,6 +176,9 @@ impl<'a> DistillCacheStore for FlowDocDistillCache<'a> {
             .bind(self.org_id)
             .bind(&key.content_hash)
             .bind(&key.caller_key)
+            .bind(&key.media_type)
+            .bind(&key.extractor_revision)
+            .bind(&key.policy_revision)
             .bind(&doc.text)
             .bind(doc.pages as i32)
             .bind(&doc.engine)
@@ -165,19 +210,13 @@ mod tests {
 
     #[tokio::test]
     async fn no_cache_get_always_misses() {
-        let key = DistillCacheKey {
-            content_hash: "abc".into(),
-            caller_key: None,
-        };
+        let key = DistillCacheKey::new("abc".into(), None, "application/pdf", "extractor-test");
         assert!(NoCache.get(&key).await.is_none());
     }
 
     #[tokio::test]
     async fn no_cache_upsert_is_a_noop() {
-        let key = DistillCacheKey {
-            content_hash: "abc".into(),
-            caller_key: None,
-        };
+        let key = DistillCacheKey::new("abc".into(), None, "application/pdf", "extractor-test");
         let doc = CachedDistill {
             text: "hi".into(),
             pages: 1,
@@ -185,5 +224,14 @@ mod tests {
         };
         NoCache.upsert(&key, &doc).await; // must not panic / error.
         assert!(NoCache.get(&key).await.is_none());
+    }
+
+    #[test]
+    fn media_type_normalization_uses_mime_essence() {
+        assert_eq!(
+            normalize_media_type(" Application/PDF ; charset=binary "),
+            "application/pdf"
+        );
+        assert_eq!(normalize_media_type("  "), "application/octet-stream");
     }
 }

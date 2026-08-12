@@ -5,7 +5,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
-use crate::proxy::config::Mode;
+use crate::proxy::config::{ForwardTarget, Mode};
 use crate::proxy::forward;
 use crate::proxy::preview;
 use crate::proxy::routes::anthropic::AppState;
@@ -16,18 +16,25 @@ pub async fn post_chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let upstream = match state.config.mode {
-        Mode::Gateway | Mode::Hybrid => {
+    let upstream = match state.config.mode.contract().target {
+        ForwardTarget::Gateway => {
             format!("{}/v1/chat/completions", state.config.gateway_base_url)
         }
-        Mode::Bypass => format!("{}/v1/chat/completions", state.config.upstream_openai),
-    };
-    let mut h = headers.clone();
-    if state.config.mode == Mode::Gateway {
-        if let Some(k) = &state.config.tt_api_key {
-            h.insert("authorization", format!("Bearer {k}").parse().unwrap());
+        ForwardTarget::Provider => {
+            format!("{}/v1/chat/completions", state.config.upstream_openai)
         }
-    }
+    };
+    let h = match forward::prepare_forward_headers(
+        state.config.mode,
+        headers,
+        state.config.tt_api_key.as_deref(),
+    ) {
+        Ok(headers) => headers,
+        Err(error) => {
+            tracing::error!(%error, "proxy credential contract failed closed");
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     // Best-effort cost preview (bounded by PREVIEW_TIMEOUT_MS). On failure
     // the proxy forwards unannotated — never block the user request.
     let preview_headers = preview::fetch(&state.http, &state.config, &body).await;

@@ -148,14 +148,16 @@ describe('recordTokenTrimmerCost', () => {
     expect(rec!.meta.costUsd).toBe(0.0034);
   });
 
-  it('throws BudgetExceededError when a single call exceeds maxCostUsd', async () => {
+  it('throws after a call exceeds postResponseBudgetUsd', async () => {
     await expect(
-      recordTokenTrimmerCost(generateTextResult(), { maxCostUsd: 0.001 }),
+      recordTokenTrimmerCost(generateTextResult(), { postResponseBudgetUsd: 0.001 }),
     ).rejects.toBeInstanceOf(BudgetExceededError);
   });
 
-  it('does not throw when the single call is within maxCostUsd', async () => {
-    const rec = await recordTokenTrimmerCost(generateTextResult(), { maxCostUsd: 1.0 });
+  it('does not throw when observed call cost is within postResponseBudgetUsd', async () => {
+    const rec = await recordTokenTrimmerCost(generateTextResult(), {
+      postResponseBudgetUsd: 1.0,
+    });
     expect(rec!.meta.costUsd).toBe(0.0034);
   });
 });
@@ -181,8 +183,8 @@ describe('TokenTrimmerRunCost', () => {
     expect(run.totalCostUsd).toBe(0);
   });
 
-  it('throws BudgetExceededError on the record that tips the run over budget', async () => {
-    const run = new TokenTrimmerRunCost({ maxCostUsd: 0.005 });
+  it('throws after the record that tips observed run cost over budget', async () => {
+    const run = new TokenTrimmerRunCost({ postResponseBudgetUsd: 0.005 });
     // First record: 0.0034 <= 0.005, OK.
     await run.record(generateTextResult());
     expect(run.totalCostUsd).toBeCloseTo(0.0034, 10);
