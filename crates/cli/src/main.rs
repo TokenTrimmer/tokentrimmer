@@ -1960,11 +1960,17 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         }
     };
 
-    // L1 Redis best-effort. Same timeout budget — a HTTP-REST URL passed
-    // where a `rediss://` URL belongs will hang `ConnectionManager::new`.
-    let l1_cache: Option<Arc<dyn tt_cache::L1Cache>> = match config.redis_url.as_deref() {
+    // Hosted auth requires one atomic Redis counter shared across replicas and
+    // restarts. Local mode may still run without Redis; its in-process limiter
+    // remains deterministic and bounded per process.
+    let require_shared_rate_limit =
+        std::env::var("TT_REQUIRE_SHARED_RATE_LIMIT").as_deref() == Ok("true");
+    let (l1_cache, shared_rate_limiter): (
+        Option<Arc<dyn tt_cache::L1Cache>>,
+        Option<tt_cache::RedisRateLimiter>,
+    ) = match config.redis_url.as_deref() {
         Some(url) => {
-            tracing::info!("connecting to redis (L1 cache)");
+            tracing::info!("connecting to redis (L1 cache + shared abuse limiter)");
             match tokio::time::timeout(
                 boot_timeout,
                 tt_cache::redis_impl::RedisL1Cache::connect(url, "tt:l1"),
@@ -1972,11 +1978,11 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
             .await
             {
                 Ok(Ok(c)) => {
-                    // SEC-2: encrypt L1 (Redis) response payloads at rest when
-                    // `TT_MASTER_KEY` is set. Unset → plaintext (back-compat); a
-                    // malformed key disables L1 rather than serve plaintext under
-                    // a misconfigured key.
-                    match tt_cache::ResponseCodec::from_env() {
+                    let limiter = tt_cache::RedisRateLimiter::from_connection_manager(
+                        c.connection_manager(),
+                        "tt:rate-limit",
+                    );
+                    let cache = match tt_cache::ResponseCodec::from_env() {
                         Ok(Some(codec)) => {
                             tracing::info!(
                                 "L1 cache enabled (response encryption on — TT_MASTER_KEY)"
@@ -1992,24 +1998,41 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                             tracing::error!(error = %e, "TT_MASTER_KEY invalid — L1 cache disabled (refusing to serve plaintext under a misconfigured key)");
                             None
                         }
-                    }
+                    };
+                    (cache, Some(limiter))
                 }
-                Ok(Err(e)) => {
-                    tracing::error!(error = %e, "redis connect failed; L1 cache disabled");
-                    None
+                Ok(Err(error)) => {
+                    if require_shared_rate_limit {
+                        return Err(anyhow::anyhow!(
+                            "required shared rate limiter Redis connection failed: {error}"
+                        ));
+                    }
+                    tracing::error!(%error, "redis connect failed; L1 cache disabled");
+                    (None, None)
                 }
                 Err(_) => {
+                    if require_shared_rate_limit {
+                        return Err(anyhow::anyhow!(
+                            "required shared rate limiter Redis connection timed out after {}s",
+                            boot_timeout.as_secs()
+                        ));
+                    }
                     tracing::error!(
                         timeout_secs = boot_timeout.as_secs(),
                         "redis connect timed out; L1 cache disabled (check URL format — needs rediss:// native, not https:// REST)"
                     );
-                    None
+                    (None, None)
                 }
             }
         }
         None => {
+            if require_shared_rate_limit {
+                return Err(anyhow::anyhow!(
+                    "TT_REQUIRE_SHARED_RATE_LIMIT=true requires REDIS_URL"
+                ));
+            }
             tracing::warn!("REDIS_URL not set; L1 cache disabled");
-            None
+            (None, None)
         }
     };
 
@@ -2022,6 +2045,12 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         .with_telemetry_tracker(telemetry_tracker.clone());
     if let Some(l1) = l1_cache {
         state = state.with_l1(l1, None);
+    }
+    if let Some(limiter) = shared_rate_limiter {
+        state.argon2_cap = tt_core::middleware::argon2_cap::Argon2VerifyCap::with_shared(
+            tt_core::middleware::argon2_cap::Argon2CapConfig::from_env(),
+            limiter,
+        );
     }
     match tt_core::GatewayPurgeAuthorizer::from_env() {
         Ok(Some(authorizer)) => {

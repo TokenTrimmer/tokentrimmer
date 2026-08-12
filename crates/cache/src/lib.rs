@@ -42,6 +42,7 @@ pub mod l1_entry;
 pub mod l2;
 pub mod lexical;
 pub mod memory;
+pub mod rate_limit;
 pub mod redis_impl;
 pub mod response_codec;
 
@@ -64,6 +65,7 @@ pub use lexical::{
     lexical_agreement, lexical_sig, lexical_verify_decision, LexicalVerifyConfig,
     LexicalVerifyDecision, DEFAULT_LEXICAL_MIN_AGREEMENT, DEFAULT_VERIFY_EPSILON,
 };
+pub use rate_limit::{RateLimitDecision, RedisRateLimiter};
 pub use response_codec::{org_from_l1_key, L1Open, L2Open, ResponseCodec, ResponseCodecError};
 
 use async_trait::async_trait;

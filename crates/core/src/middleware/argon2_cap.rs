@@ -19,22 +19,14 @@
 //! non-`tt_live_*` traffic bypass it entirely, so legitimate authenticated
 //! traffic is never throttled by this path.
 //!
-//! Backed by a [`governor`] GCRA keyed limiter (the same crate the cloud
-//! `tt-api` abuse-control limiter uses), keyed by client IP.
-//!
-//! ## Caveat: in-memory, per-instance
-//!
-//! The limiter state lives in this process's memory. With more than one gateway
-//! instance behind a load balancer the effective cap is
-//! `N_instances × threshold`, and a restart resets the counters. That is an
-//! accepted trade-off (it still removes the amplification on each instance).
-//! **Move the limiter state to a shared store (Redis) before scaling
-//! horizontally** so the cap is global across instances — mirroring the same
-//! "move to Redis before scaling" caveat noted on the cloud side.
+//! Production can attach a [`RedisRateLimiter`] so every replica and restart
+//! shares one atomic fixed-window counter. Tests and DB-less local mode retain
+//! the deterministic in-memory GCRA backend.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::HeaderMap;
 use governor::{
@@ -43,6 +35,7 @@ use governor::{
     state::keyed::DefaultKeyedStateStore,
     Quota, RateLimiter,
 };
+use tt_cache::{RateLimitDecision, RedisRateLimiter};
 
 /// A keyed GCRA limiter over client IPs, generic over the clock `C`. The no-op
 /// accounting middleware is pinned to the clock's instant type so a
@@ -115,6 +108,9 @@ pub enum CapDecision {
     /// Over the cap — shed with 429; `retry_after_secs` is the seconds until the
     /// limiter would next admit a cell for this IP (always `>= 1`).
     Reject { retry_after_secs: u64 },
+    /// The required shared backend could not account for the attempt. Hosted
+    /// auth fails closed rather than running unbounded argon2 work.
+    Unavailable,
 }
 
 /// The per-IP argon2-verify cap. Generic over the clock so tests can drive a
@@ -126,6 +122,8 @@ where
 {
     limiter: IpRateLimiter<C>,
     clock: C,
+    shared: Option<RedisRateLimiter>,
+    verify_per_min: u32,
 }
 
 impl Argon2VerifyCap<DefaultClock> {
@@ -139,6 +137,22 @@ impl Argon2VerifyCap<DefaultClock> {
     #[must_use]
     pub fn from_env() -> Arc<Self> {
         Self::new(Argon2CapConfig::from_env())
+    }
+
+    /// Production constructor using an atomic Redis counter shared by every
+    /// gateway replica.
+    #[must_use]
+    pub fn with_shared(cfg: Argon2CapConfig, shared: RedisRateLimiter) -> Arc<Self> {
+        let clock = DefaultClock::default();
+        Arc::new(Self {
+            limiter: RateLimiter::dashmap_with_clock(
+                per_minute_quota(cfg.verify_per_min),
+                clock.clone(),
+            ),
+            clock,
+            shared: Some(shared),
+            verify_per_min: cfg.verify_per_min.max(1),
+        })
     }
 }
 
@@ -156,17 +170,38 @@ where
                 clock.clone(),
             ),
             clock,
+            shared: None,
+            verify_per_min: cfg.verify_per_min.max(1),
         })
     }
 
     /// Consult the cap for one cold-path verify attempt from `ip`. Charges a
     /// cell on [`CapDecision::Allow`]; reports a `Retry-After` on reject.
     ///
-    /// This is the **only** place the cap is consumed, and the caller invokes it
-    /// strictly before the argon2 work, so a rejected attempt never reaches the
-    /// hash.
-    #[must_use]
-    pub fn check(&self, ip: IpAddr) -> CapDecision {
+    /// Hosted instances use the atomic Redis window. Local/test instances use
+    /// the deterministic in-process GCRA limiter.
+    pub async fn check(&self, ip: IpAddr) -> CapDecision {
+        if let Some(shared) = self.shared.as_ref() {
+            return match shared
+                .check(
+                    "argon2-verify",
+                    &ip.to_string(),
+                    self.verify_per_min,
+                    Duration::from_secs(60),
+                )
+                .await
+            {
+                Ok(RateLimitDecision::Allow) => CapDecision::Allow,
+                Ok(RateLimitDecision::Reject { retry_after_secs }) => {
+                    CapDecision::Reject { retry_after_secs }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "shared argon2 verification limiter unavailable");
+                    CapDecision::Unavailable
+                }
+            };
+        }
+
         match self.limiter.check_key(&ip) {
             Ok(()) => CapDecision::Allow,
             Err(not_until) => {
@@ -230,45 +265,45 @@ mod tests {
         std::env::remove_var("TT_ARGON2_CAP_TEST_ZERO");
     }
 
-    #[test]
-    fn allows_up_to_threshold_then_rejects() {
+    #[tokio::test]
+    async fn allows_up_to_threshold_then_rejects() {
         let clock = FakeRelativeClock::default();
         let cap = Argon2VerifyCap::with_clock(Argon2CapConfig { verify_per_min: 3 }, clock.clone());
         let a = ip("1.2.3.4");
-        // Burst == per_min: first 3 allowed.
-        assert_eq!(cap.check(a), CapDecision::Allow);
-        assert_eq!(cap.check(a), CapDecision::Allow);
-        assert_eq!(cap.check(a), CapDecision::Allow);
-        // 4th rejected with a Retry-After.
-        match cap.check(a) {
+        assert_eq!(cap.check(a).await, CapDecision::Allow);
+        assert_eq!(cap.check(a).await, CapDecision::Allow);
+        assert_eq!(cap.check(a).await, CapDecision::Allow);
+        match cap.check(a).await {
             CapDecision::Reject { retry_after_secs } => assert!(retry_after_secs >= 1),
-            CapDecision::Allow => panic!("4th attempt should be rejected"),
+            other => panic!("4th attempt should be rejected, got {other:?}"),
         }
     }
 
-    #[test]
-    fn distinct_ips_are_independent() {
+    #[tokio::test]
+    async fn distinct_ips_are_independent() {
         let clock = FakeRelativeClock::default();
         let cap = Argon2VerifyCap::with_clock(Argon2CapConfig { verify_per_min: 1 }, clock.clone());
-        // a exhausts its single cell...
-        assert_eq!(cap.check(ip("1.1.1.1")), CapDecision::Allow);
+        assert_eq!(cap.check(ip("1.1.1.1")).await, CapDecision::Allow);
         assert!(matches!(
-            cap.check(ip("1.1.1.1")),
+            cap.check(ip("1.1.1.1")).await,
             CapDecision::Reject { .. }
         ));
-        // ...but a different IP still has its own full budget.
-        assert_eq!(cap.check(ip("2.2.2.2")), CapDecision::Allow);
+        assert_eq!(cap.check(ip("2.2.2.2")).await, CapDecision::Allow);
     }
 
-    #[test]
-    fn bucket_refills_after_a_minute() {
+    #[tokio::test]
+    async fn bucket_refills_after_a_minute() {
         let clock = FakeRelativeClock::default();
         let cap = Argon2VerifyCap::with_clock(Argon2CapConfig { verify_per_min: 1 }, clock.clone());
         let a = ip("3.3.3.3");
-        assert_eq!(cap.check(a), CapDecision::Allow);
-        assert!(matches!(cap.check(a), CapDecision::Reject { .. }));
+        assert_eq!(cap.check(a).await, CapDecision::Allow);
+        assert!(matches!(cap.check(a).await, CapDecision::Reject { .. }));
         clock.advance(Duration::from_secs(61));
-        assert_eq!(cap.check(a), CapDecision::Allow, "bucket should refill");
+        assert_eq!(
+            cap.check(a).await,
+            CapDecision::Allow,
+            "bucket should refill"
+        );
     }
 
     #[test]
