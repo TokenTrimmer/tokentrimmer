@@ -175,6 +175,19 @@ pub(crate) fn generate_product_schemas() -> Result<Vec<ContractSchema>> {
     strengthen_request_preflight_batch(&mut request_preflight_batch)?;
     reuse_request_preflight_contract(&mut request_preflight_batch, &request_preflight)?;
 
+    let mut agent_cost = root_value(schemars::schema_for!(tt_shared::AgentRunCostEvidence))?;
+    prepare_product_root(
+        &mut agent_cost,
+        "urn:tokentrimmer:agent-cost-evidence:schema:v1",
+        "TokenTrimmer agent run cost evidence",
+        "Structural multi-basis agent cost contract generated from the exact tt_shared::AgentRunCostEvidence wire type. API cash, subscription allocation and counterfactuals, self-hosted TCO, and unmeasured evidence remain separate.",
+    )?;
+    set_const(
+        &mut agent_cost,
+        "schema_version",
+        json!(tt_shared::AGENT_COST_SCHEMA_VERSION),
+    )?;
+
     Ok(vec![
         ContractSchema {
             relative_path: "docs/route-contract/route-write.schema.json",
@@ -210,6 +223,11 @@ pub(crate) fn generate_product_schemas() -> Result<Vec<ContractSchema>> {
             relative_path: "docs/capability-contract/request-preflight-batch-response.schema.json",
             ts_name: "RequestPreflightBatchResponse",
             value: request_preflight_batch,
+        },
+        ContractSchema {
+            relative_path: "docs/agent-contract/agent-cost-evidence.schema.json",
+            ts_name: "AgentRunCostEvidence",
+            value: agent_cost,
         },
     ])
 }
@@ -891,12 +909,13 @@ pub(crate) fn render_gateway_python(schemas: &[ContractSchema]) -> Result<String
                     | "GatewayCapabilitiesDocument"
                     | "RequestPreflightResponse"
                     | "RequestPreflightBatchResponse"
+                    | "AgentRunCostEvidence"
             )
         })
         .collect::<Vec<_>>();
-    if selected.len() != 4 {
+    if selected.len() != 5 {
         return Err(anyhow!(
-            "gateway Python generation requires model, capability, preflight, and preflight-batch schemas"
+            "gateway Python generation requires model, capability, preflight, preflight-batch, and agent-cost schemas"
         ));
     }
     let root_names = selected
@@ -933,7 +952,11 @@ pub(crate) fn render_gateway_python(schemas: &[ContractSchema]) -> Result<String
         if definition.get("type") != Some(&Value::String("object".into()))
             && definition.get("properties").is_none()
         {
-            output.push_str(&format!("{name} = {}\n\n\n", python_type(definition)?));
+            if let Some(rendered) = python_inline_object_union(name, definition)? {
+                output.push_str(&rendered);
+            } else {
+                output.push_str(&format!("{name} = {}\n\n\n", python_type(definition)?));
+            }
         }
     }
     for (name, definition) in &definitions {
@@ -991,6 +1014,63 @@ fn python_dataclass(name: &str, schema: &Value) -> Result<String> {
     }
     output.push_str("\n\n");
     Ok(output)
+}
+
+fn python_inline_object_union(name: &str, schema: &Value) -> Result<Option<String>> {
+    let Some(items) = ["oneOf", "anyOf"]
+        .into_iter()
+        .find_map(|keyword| schema.get(keyword).and_then(Value::as_array))
+    else {
+        return Ok(None);
+    };
+    if items.is_empty()
+        || items
+            .iter()
+            .any(|item| item.get("properties").and_then(Value::as_object).is_none())
+    {
+        return Ok(None);
+    }
+
+    let mut output = String::new();
+    let mut variant_names = Vec::with_capacity(items.len());
+    for item in items {
+        let properties = item
+            .get("properties")
+            .and_then(Value::as_object)
+            .context("inline union variant is missing properties")?;
+        let discriminant = ["basis", "state", "type"]
+            .into_iter()
+            .find_map(|field| {
+                let property = properties.get(field)?;
+                property.get("const").and_then(Value::as_str).or_else(|| {
+                    let values = property.get("enum")?.as_array()?;
+                    (values.len() == 1).then(|| values[0].as_str()).flatten()
+                })
+            })
+            .with_context(|| format!("inline Python union {name} has no stable discriminant"))?;
+        let variant_name = format!("{name}{}", python_pascal_case(discriminant));
+        output.push_str(&python_dataclass(&variant_name, item)?);
+        variant_names.push(variant_name);
+    }
+    output.push_str(&format!(
+        "{name} = Union[{}]\n\n\n",
+        variant_names.join(", ")
+    ));
+    Ok(Some(output))
+}
+
+fn python_pascal_case(value: &str) -> String {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let Some(first) = characters.next() else {
+                return String::new();
+            };
+            first.to_ascii_uppercase().to_string() + characters.as_str()
+        })
+        .collect()
 }
 
 fn python_type(schema: &Value) -> Result<String> {

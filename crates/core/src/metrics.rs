@@ -30,6 +30,7 @@ pub fn install() {
                 "failed to install Prometheus recorder: a global metrics recorder was already set",
             );
         metrics::gauge!("tt_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+        record_pricing_catalog_snapshot();
         handle
     });
 }
@@ -45,6 +46,64 @@ pub fn uptime_seconds() -> f64 {
         .get()
         .map(|s| s.elapsed().as_secs_f64())
         .unwrap_or(0.0)
+}
+/// Publish one bounded process gauge for the embedded pricing snapshot.
+///
+/// The newest effective date is encoded as a Unix timestamp so production
+/// monitoring can alert on catalog age without parsing application logs.
+fn record_pricing_catalog_snapshot() {
+    let newest = tt_shared::pricing::catalog().catalog_max_effective_at();
+    let effective_at = newest
+        .map(|datetime| datetime.timestamp() as f64)
+        .unwrap_or(0.0);
+    metrics::gauge!("tt_pricing_catalog_newest_effective_at_seconds").set(effective_at);
+    metrics::gauge!("tt_pricing_catalog_entries_total")
+        .set(tt_shared::pricing::catalog().len() as f64);
+}
+/// Count one completed provider dispatch by its request-delta evidence state.
+///
+/// Both labels are closed sets: `path` is a call-site literal and `state` comes
+/// from [`tt_shared::RequestDeltaEvidenceState`]. Cache hits are excluded
+/// because they reuse the originating dispatch's evidence.
+pub fn record_request_measurement(path: &'static str, state: tt_shared::RequestDeltaEvidenceState) {
+    metrics::counter!(
+        "tt_request_measurement_total",
+        "path" => path,
+        "state" => state.as_str(),
+    )
+    .increment(1);
+}
+
+/// Record one dynamic provider-model catalog refresh.
+///
+/// A successful refresh updates both the last-good timestamp and model count;
+/// failures leave those gauges untouched so their age remains alertable.
+pub fn record_model_catalog_refresh(
+    provider: &'static str,
+    result: &'static str,
+    model_count: Option<usize>,
+) {
+    metrics::counter!(
+        "tt_model_catalog_refresh_total",
+        "provider" => provider,
+        "result" => result,
+    )
+    .increment(1);
+    if let Some(model_count) = model_count {
+        let refreshed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |duration| duration.as_secs_f64());
+        metrics::gauge!(
+            "tt_model_catalog_last_success_timestamp_seconds",
+            "provider" => provider
+        )
+        .set(refreshed_at);
+        metrics::gauge!(
+            "tt_model_catalog_models",
+            "provider" => provider
+        )
+        .set(model_count as f64);
+    }
 }
 
 /// Count one SERVED, billable response — incremented IN-BAND (synchronously, on

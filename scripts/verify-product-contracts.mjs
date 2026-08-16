@@ -22,6 +22,7 @@ for (const family of [
   'models',
   'gateway_capabilities',
   'request_preflight',
+  'agent_cost_evidence',
 ]) {
   assert(families.has(family), `missing product contract family: ${family}`);
 }
@@ -170,6 +171,29 @@ assert(
   'preflight batch limitation count drift',
 );
 
+const agentCost = load(families.get('agent_cost_evidence').schema);
+assert(agentCost.properties.schema_version.const === 1, 'agent cost version drift');
+assert(agentCost.additionalProperties === false, 'agent cost root must reject unknown fields');
+assert(
+  agentCost.properties.components.minItems === 1 &&
+    agentCost.properties.components.maxItems === 512,
+  'agent cost component bounds drift',
+);
+assert(
+  agentCost.$defs.AgentCostBasis.oneOf
+    .map((variant) => variant.properties.basis.enum[0])
+    .join(',') === 'api_metered,subscription,self_hosted,unmeasured',
+  'agent cost basis set drift',
+);
+assert(
+  agentCost.$defs.AgentCostBasis.oneOf[1].properties.marginal_cash_micros.minimum === 0,
+  'subscription marginal cash must preserve measured zero',
+);
+assert(
+  !('amount_micros' in agentCost.$defs.AgentCostBasis.oneOf[3].properties),
+  'unmeasured cost must not carry a fabricated numeric amount',
+);
+
 const typescript = readText(manifest.typescript);
 const sdkTypescript = readText(manifest.typescript_sdk);
 const sdkPython = readText(manifest.python_sdk);
@@ -182,6 +206,7 @@ for (const typeName of [
   'GatewayCapabilitiesDocument',
   'RequestPreflightResponse',
   'RequestPreflightBatchResponse',
+  'AgentRunCostEvidence',
 ]) {
   assert(typescript.includes(`export type ${typeName} =`), `missing generated ${typeName}`);
 }
@@ -194,6 +219,10 @@ for (const className of [
   'CapabilityReason',
   'RequestPreflightResponse',
   'RequestPreflightBatchResponse',
+  'AgentRunCostEvidence',
+  'AgentCostComponent',
+  'AgentCostBasisSubscription',
+  'AgentCostBasisUnmeasured',
 ]) {
   assert(sdkPython.includes(`class ${className}:`), `missing generated Python ${className}`);
 }

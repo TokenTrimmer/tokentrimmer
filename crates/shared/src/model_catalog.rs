@@ -167,14 +167,14 @@ mod tests {
     #[test]
     fn embedded_catalog_parses_all_providers() {
         let c = model_catalog();
-        assert_eq!(c.len(), 34, "native (16) + compat (18)");
-        assert_eq!(c.for_provider("openai").len(), 9); // + gpt-5.4-mini
-        assert_eq!(c.for_provider("anthropic").len(), 4); // + claude-opus-4-8
-        assert_eq!(c.for_provider("gemini").len(), 3);
+        assert_eq!(c.len(), 61, "native (26) + compat (35)");
+        assert_eq!(c.for_provider("openai").len(), 14); // + gpt-5.6 family, gpt-4.1 family
+        assert_eq!(c.for_provider("anthropic").len(), 6); // + claude-5 family
+        assert_eq!(c.for_provider("gemini").len(), 6); // + gemini-3.6/3.7
         assert_eq!(c.for_provider("mistral").len(), 5);
         assert_eq!(c.for_provider("groq").len(), 4);
         assert_eq!(c.for_provider("together").len(), 4);
-        assert_eq!(c.for_provider("openrouter").len(), 5);
+        assert_eq!(c.for_provider("openrouter").len(), 22);
         assert!(c.for_provider("nonesuch").is_empty());
         assert!(!c.is_empty());
     }
@@ -240,7 +240,7 @@ mod tests {
         assert_eq!(o3.max_output_tokens, 100_000);
         assert!(o3.capabilities.contains(&Capability::Reasoning));
         let pro = c.model_info("gemini", "gemini-3.1-pro").unwrap();
-        assert_eq!(pro.max_input_tokens, 2_000_000);
+        assert_eq!(pro.max_input_tokens, 1_048_576);
         assert!(c.model_info("openai", "nope").is_none());
     }
 

@@ -7,6 +7,43 @@ export type AccessEvidence = {
   state: "available" | "unavailable";
 };
 
+export type AgentCostBasis = {
+  amount_micros: number;
+  basis: "api_metered";
+  evidence: ApiMeteredEvidence;
+  model: string;
+  provider: string;
+} | {
+  allocated_plan_micros?: number | null;
+  api_equivalent_micros?: number | null;
+  basis: "subscription";
+  marginal_cash_micros: number;
+  plan_reference: string;
+  quota?: SubscriptionQuotaEvidence | null;
+  vendor: string;
+} | {
+  basis: "self_hosted";
+  energy_micros?: number | null;
+  hardware_amortization_micros?: number | null;
+  hosting_micros?: number | null;
+  operator_micros?: number | null;
+  profile_id: string;
+  profile_revision: string;
+} | {
+  basis: "unmeasured";
+  expected_basis: ExpectedAgentCostBasis;
+  reasons: Array<UnmeasuredCostReason>;
+};
+
+export type AgentCostComponent = {
+  attempt: number;
+  component_id: string;
+  cost: AgentCostBasis;
+  purpose: AgentCostPurpose;
+};
+
+export type AgentCostPurpose = "primary_turn" | "summarizer" | "judge" | "retry" | "shadow" | "validation" | "embedding" | "routing" | "other";
+
 export type AgenticBudget = {
   cache_prefix?: boolean;
   clear_at_least_tokens?: number;
@@ -14,6 +51,19 @@ export type AgenticBudget = {
   keep_recent_pairs?: number;
   route_mechanical_to?: string | null;
   semantic_substep_cache?: boolean;
+};
+
+export type ApiMeteredEvidence = {
+  pricing_revision: string;
+  provider_usage_reference?: string | null;
+  state: "billed";
+} | {
+  price_observed_at: string;
+  pricing_revision: string;
+  state: "estimated";
+} | {
+  invoice_reference: string;
+  state: "invoice_reconciled";
 };
 
 export type BudgetPolicy = {
@@ -48,6 +98,8 @@ export type EnabledEvidence = {
   source: "gateway_runtime";
   state: "enabled" | "disabled";
 };
+
+export type ExpectedAgentCostBasis = "api_metered" | "subscription" | "self_hosted";
 
 export type FusionCapability = {
   access: AccessEvidence;
@@ -310,6 +362,16 @@ export type SchemaVersions = {
   fusion_request: SchemaVersionEvidence;
 };
 
+export type SubscriptionQuotaEvidence = {
+  limit?: number | null;
+  source: string;
+  unit: SubscriptionQuotaUnit;
+  used: number;
+  window_ends_at?: string | null;
+};
+
+export type SubscriptionQuotaUnit = "requests" | "tokens" | "tool_calls" | "vendor_units";
+
 export type TierEvidence = {
   reason: CapabilityReason;
   source: "authenticated_api_key" | "gateway_free_default" | "gateway_runtime";
@@ -333,6 +395,13 @@ export type UnknownEvidence = {
   source: "not_negotiated";
   state: "unknown";
 };
+
+export type UnmeasuredCostReason = {
+  code: UnmeasuredCostReasonCode;
+  detail?: string | null;
+};
+
+export type UnmeasuredCostReasonCode = "price_unknown" | "provider_usage_missing" | "invoice_unavailable" | "subscription_quota_unavailable" | "subscription_allocation_unconfigured" | "local_tco_profile_missing" | "local_telemetry_missing" | "vendor_signal_unavailable" | "other";
 
 export type WorkflowTrigger = {
   environment?: WorkflowTriggerEnvironment | null;
@@ -425,4 +494,10 @@ export type RequestPreflightBatchResponse = {
   schema_version: 1;
   scope: "request_preflight_batch";
   snapshot_scope: "responding_process";
+};
+
+export type AgentRunCostEvidence = {
+  components: Array<AgentCostComponent>;
+  run_id: string;
+  schema_version: 1;
 };

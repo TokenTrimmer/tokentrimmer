@@ -4,6 +4,8 @@
 pub mod account;
 pub mod advise;
 pub mod agent;
+pub mod agent_policy;
+pub mod api_runner;
 pub mod batch;
 pub mod budgets;
 pub mod bundle;
@@ -17,7 +19,9 @@ pub mod docprep;
 pub mod doctor;
 pub mod embed;
 pub mod eval_shadow;
+pub mod execution_broker;
 pub mod init;
+pub mod local_agent;
 pub mod local_audit;
 pub mod mcp_install;
 pub mod plan_apply;

@@ -255,6 +255,10 @@ pub struct AgentBuilder<'a> {
     /// `X-TokenTrimmer-Cost-Limit-Usd`).
     max_cost_usd: Option<f64>,
     tag: Option<String>,
+    /// `X-TokenTrimmer-Provider` pin. The gateway still applies routing to the
+    /// model, but every dispatch must remain on this exact provider and
+    /// cross-provider failover is disabled.
+    provider: Option<String>,
     cost_limit: Option<f64>,
     interactive: bool,
     /// Client-side cap on resume (`tool_outputs`) round-trips before the driver
@@ -273,6 +277,7 @@ impl<'a> AgentBuilder<'a> {
             max_turns: None,
             max_cost_usd: None,
             tag: None,
+            provider: None,
             cost_limit: None,
             interactive: false,
             max_resume_rounds: 8,
@@ -316,6 +321,13 @@ impl<'a> AgentBuilder<'a> {
     #[must_use]
     pub fn max_cost_usd(mut self, usd: f64) -> Self {
         self.max_cost_usd = Some(usd);
+        self
+    }
+    /// Pin every turn to one upstream provider. Forwarded on both create and
+    /// resume requests so a resumed run cannot silently change provider.
+    #[must_use]
+    pub fn provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
         self
     }
     /// `X-TokenTrimmer-Tag` — free-form cost-attribution tag, forwarded on the
@@ -434,8 +446,11 @@ impl<'a> AgentBuilder<'a> {
             .post(url)
             .bearer_auth(&self.client.key)
             .json(&body);
-        let req =
+        let mut req =
             crate::apply_tt_headers(req, self.tag.as_deref(), self.cost_limit, self.interactive)?;
+        if let Some(provider) = self.provider.as_deref() {
+            req = req.header("X-TokenTrimmer-Provider", provider);
+        }
         let resp = req.send().await.map_err(Error::Request)?;
         let cost = crate::parse_cost(resp.headers());
         let status = resp.status();
@@ -626,6 +641,7 @@ mod tests {
         let resume = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/agent/runs/11111111-1111-1111-1111-111111111111/tool_outputs")
+                .header("x-tokentrimmer-provider", "openai")
                 .body_includes("did the thing")
                 .body_includes("call_1");
             then.status(200)
@@ -634,7 +650,9 @@ mod tests {
         });
         // Create endpoint → paused requires_action run.
         let create = server.mock(|when, then| {
-            when.method(POST).path("/v1/agent/runs");
+            when.method(POST)
+                .path("/v1/agent/runs")
+                .header("x-tokentrimmer-provider", "openai");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(requires_action_run());
@@ -644,6 +662,7 @@ mod tests {
         let out = client
             .agent()
             .model("gpt-4o-mini")
+            .provider("openai")
             .message(system("be helpful"))
             .message(user("do it"))
             .tools(vec![tool("do_thing", "does", json!({"type":"object"}))])

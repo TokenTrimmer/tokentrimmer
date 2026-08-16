@@ -5,4 +5,6 @@
 .claude/STOP-CHAIN
 .claude/sessions/
 .tt-init.lock
-.tokentrimmer/
+!.tokentrimmer/
+.tokentrimmer/*
+!.tokentrimmer/agent.toml

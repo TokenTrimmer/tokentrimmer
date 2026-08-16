@@ -1,0 +1,64 @@
+# TokenTrimmer local coding-agent policy, schema v1.
+# This committed file starts inert. Explicitly authorize runners, models,
+# commands, destinations, and nonzero limits before using `tt code`.
+schema_version = 1
+
+[filesystem]
+readable_roots = ["."]
+writable_roots = []
+max_files = 0
+max_file_bytes = 0
+max_total_read_bytes = 0
+max_total_write_bytes = 0
+allow_symlinks = false
+excluded_paths = [
+  ".env",
+  ".env.*",
+  ".git/**",
+  ".tokentrimmer/**",
+  "**/*.pem",
+  "**/*.key",
+]
+
+[process]
+allowed_commands = []
+max_subprocesses = 0
+max_duration_seconds = 0
+max_output_bytes = 0
+allow_shell = false
+
+[network]
+default = "deny"
+allowed_destinations = []
+allow_redirects = false
+inherit_proxy_env = false
+
+[inference]
+allowed_runners = []
+allowed_providers = []
+allowed_models = []
+allowed_cost_bases = []
+
+[limits]
+max_api_calls = 0
+max_model_turns = 0
+max_retries = 0
+max_wall_time_seconds = 0
+max_diff_bytes = 0
+max_changed_files = 0
+
+[budgets]
+max_api_cash_micros = 0
+max_subscription_marginal_cash_micros = 0
+max_subscription_allocated_micros = 0
+max_self_hosted_tco_micros = 0
+subscription_quota_caps = []
+allow_unmeasured = false
+
+[approvals]
+destructive_operations = "deny"
+rollback = "deny"
+
+[validation]
+required_commands = []
+stop_on_regression = true

@@ -140,3 +140,55 @@ fn pricing_is_zero_for_any_local_model() {
     assert_eq!(pr.input_per_million, 0.0);
     assert_eq!(pr.output_per_million, 0.0);
 }
+
+#[tokio::test]
+async fn local_embeddings_forward_to_inner_and_strip_prefix() {
+    let server = MockServer::start();
+    let embedding_response = serde_json::json!({
+        "object": "list",
+        "data": [{
+            "object": "embedding",
+            "index": 0,
+            "embedding": [0.1, 0.2, 0.3]
+        }],
+        "model": "nomic-embed-text",
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 0,
+            "total_tokens": 5
+        }
+    })
+    .to_string();
+
+    let mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/embeddings")
+            .json_body_includes(r#"{"model":"nomic-embed-text"}"#);
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .body(embedding_response);
+    });
+
+    let provider = LocalProvider::with_base_url(
+        LocalBackend::Ollama,
+        server.base_url(),
+        ClientConfig::default(),
+    );
+
+    let req = tt_shared::messages::EmbeddingsRequest {
+        model: "ollama/nomic-embed-text".to_string(),
+        input: tt_shared::messages::EmbeddingInput::Single("test string".to_string()),
+        dimensions: None,
+        encoding_format: None,
+    };
+
+    let resp = provider
+        .embeddings(req, &ctx())
+        .await
+        .expect("local embeddings should succeed");
+
+    assert_eq!(resp.data.len(), 1);
+    assert_eq!(resp.data[0].index, 0);
+    assert_eq!(resp.data[0].embedding.len(), 3);
+    mock.assert();
+}

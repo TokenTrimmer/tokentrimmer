@@ -44,7 +44,7 @@ impl Mode {
                 target: ForwardTarget::Gateway,
                 credential_policy: CredentialPolicy::TokenTrimmer,
                 requires_loopback_gateway: false,
-                help: "hosted TokenTrimmer gateway; strips client provider credentials and injects the configured TokenTrimmer key",
+                help: "hosted TokenTrimmer gateway; requires --tt-api-key or TT_API_KEY, strips client provider credentials, and injects only that TokenTrimmer principal",
             },
             Self::Bypass => ModeContract {
                 name: "bypass",
@@ -58,7 +58,7 @@ impl Mode {
                 target: ForwardTarget::Gateway,
                 credential_policy: CredentialPolicy::ClientProvider,
                 requires_loopback_gateway: true,
-                help: "loopback self-hosted TokenTrimmer gateway; preserves the client's provider credential for BYOK and rejects remote targets",
+                help: "loopback self-hosted TokenTrimmer gateway; requires a loopback --tt-api-base, preserves the client's provider credential for BYOK, and rejects remote targets",
             },
         }
     }

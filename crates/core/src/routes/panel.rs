@@ -458,7 +458,6 @@ pub fn panel_from_header(headers: &HeaderMap) -> Option<ArbiterStrategyKind> {
 
 /// Whether a dispatched leg is a panel member or the arbiter synthesis call.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by Tasks 4–7 (not yet wired)
 pub enum LegRole {
     /// A regular panel member leg (fan-out dispatch).
     Leg,
@@ -472,7 +471,6 @@ pub enum LegRole {
 
 /// Terminal status of a single dispatched leg.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by Tasks 4–7 (not yet wired)
 pub enum LegStatus {
     /// Leg completed successfully.
     Ok,
@@ -486,7 +484,6 @@ pub enum LegStatus {
 
 impl LegStatus {
     /// Wire-format string for metrics / log attributes.
-    #[allow(dead_code)] // used by Tasks 4–7 (not yet wired)
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -503,7 +500,6 @@ impl LegStatus {
 
 /// Full result record for one dispatched leg (member or arbiter).
 #[derive(Debug)]
-#[allow(dead_code)] // fields consumed by Tasks 4–7 (not yet wired)
 pub struct LegResult {
     /// Internal zero-based index into [`PanelConfig::members`]; `usize::MAX`
     /// is used only internally for the arbiter (which has no member index).
@@ -2427,6 +2423,7 @@ pub(crate) async fn complete_panel(
     } else {
         cost_breakdown.request_delta_evidence_state(true, true)
     };
+    crate::metrics::record_request_measurement("chat", request_delta_evidence_state);
 
     // ── Record realized spend EXACTLY ONCE (mirrors complete_once's dispatched
     //    tail: `spend_sink().record(...)` then `settle(..., cached=false, ...)`).

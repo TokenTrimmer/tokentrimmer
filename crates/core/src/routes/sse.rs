@@ -1274,6 +1274,7 @@ pub fn stream_response(
                         priced_state
                     }
                 };
+                crate::metrics::record_request_measurement("sse", request_delta_evidence_state);
 
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, api_key_id, cost_usd, Utc::now());

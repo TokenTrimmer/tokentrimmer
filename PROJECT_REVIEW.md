@@ -1,5 +1,7 @@
 # TokenTrimmer — Senior Review
 
+> **Archived:** This 2026-05-30 review is retained only as historical evidence. It is not a current backlog, launch decision, or source of readiness claims. Current authority is the repository-root `PROJECT_REVIEW_2026-08-11.md`, source, migrations, generated contracts, and active CI/release gates.
+
 _Date: 2026-05-30 · Reviewer: comprehensive multi-agent audit (12 area finders + adversarial verification) with maintainer spot-checks._
 
 **Scope:** both repos — `public/` (Gateway, Inspect, Plan, CLI, MCP, retrieval, SDKs) and the sibling `cloud/` (hosted API, worker, dashboard, marketing, docs).

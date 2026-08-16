@@ -9,7 +9,10 @@ use tt_provider_anthropic::{AnthropicProvider, ClientConfig as AnthropicClientCo
 use tt_provider_azure::AzureProvider;
 use tt_provider_gemini::{ClientConfig as GeminiClientConfig, GeminiProvider};
 use tt_provider_groq::GroqProvider;
-use tt_provider_local::{LocalBackend, LocalProvider};
+use tt_provider_local::{
+    parse_endpoint_profiles_json, EndpointProfileConfig, LocalBackend, LocalProvider,
+    ProfiledLocalProvider,
+};
 use tt_provider_mistral::MistralProvider;
 use tt_provider_openai::{ClientConfig as OpenAiClientConfig, OpenAiProvider};
 use tt_provider_openrouter::OpenRouterProvider;
@@ -164,11 +167,17 @@ pub fn spawn_openrouter_catalog_refresh(registry: &ProviderRegistry) {
         loop {
             ticker.tick().await;
             match openrouter.refresh_models().await {
-                Ok(n) => tracing::info!(models = n, "refreshed OpenRouter /models catalogue"),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "OpenRouter /models refresh failed; serving last-good catalogue"
-                ),
+                Ok(n) => {
+                    crate::metrics::record_model_catalog_refresh("openrouter", "success", Some(n));
+                    tracing::info!(models = n, "refreshed OpenRouter /models catalogue");
+                }
+                Err(e) => {
+                    crate::metrics::record_model_catalog_refresh("openrouter", "error", None);
+                    tracing::warn!(
+                        error = %e,
+                        "OpenRouter /models refresh failed; serving last-good catalogue"
+                    );
+                }
             }
         }
     });
@@ -331,16 +340,38 @@ pub struct LocalProviders {
     pub ollama: Option<String>,
     pub vllm: Option<String>,
     pub lmstudio: Option<String>,
+    pub llamacpp: Option<String>,
+    pub mlx: Option<String>,
+    pub tgi: Option<String>,
+    pub sglang: Option<String>,
+    pub endpoint_profiles: Vec<EndpointProfileConfig>,
+    pub endpoint_profiles_error: Option<String>,
 }
 
 impl LocalProviders {
-    /// Read the three base-URL env vars; an unset/empty var leaves that backend off.
+    /// Read legacy base-URL vars plus strict generic endpoint profiles from
+    /// `TT_LOCAL_ENDPOINT_PROFILES_JSON`. Invalid profile JSON registers no
+    /// generic endpoint and is retained for an explicit startup error log.
     pub fn from_env() -> Self {
-        let v = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+        let value = |key: &str| std::env::var(key).ok().filter(|s| !s.trim().is_empty());
+        let (endpoint_profiles, endpoint_profiles_error) =
+            match value("TT_LOCAL_ENDPOINT_PROFILES_JSON") {
+                Some(raw) => match parse_endpoint_profiles_json(&raw) {
+                    Ok(profiles) => (profiles, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                },
+                None => (Vec::new(), None),
+            };
         Self {
-            ollama: v("TT_LOCAL_OLLAMA_URL"),
-            vllm: v("TT_LOCAL_VLLM_URL"),
-            lmstudio: v("TT_LOCAL_LMSTUDIO_URL"),
+            ollama: value("TT_LOCAL_OLLAMA_URL"),
+            vllm: value("TT_LOCAL_VLLM_URL"),
+            lmstudio: value("TT_LOCAL_LMSTUDIO_URL"),
+            llamacpp: value("TT_LOCAL_LLAMACPP_URL"),
+            mlx: value("TT_LOCAL_MLX_URL"),
+            tgi: value("TT_LOCAL_TGI_URL"),
+            sglang: value("TT_LOCAL_SGLANG_URL"),
+            endpoint_profiles,
+            endpoint_profiles_error,
         }
     }
 }
@@ -349,6 +380,23 @@ impl LocalProviders {
 /// timeout for cold-start latency).
 pub fn register_local_providers(registry: &mut ProviderRegistry, cfg: &LocalProviders) {
     let cc = LocalProvider::suggested_client_config();
+    if let Some(error) = &cfg.endpoint_profiles_error {
+        tracing::error!(
+            error,
+            "generic local endpoint profiles are invalid and disabled"
+        );
+    } else if !cfg.endpoint_profiles.is_empty() {
+        match ProfiledLocalProvider::from_configs(
+            cfg.endpoint_profiles.clone(),
+            cc.clone(),
+            |name| std::env::var(name).ok(),
+        ) {
+            Ok(provider) => registry.register(Arc::new(provider)),
+            Err(error) => {
+                tracing::error!(error = %error, "generic local endpoint profiles are disabled")
+            }
+        }
+    }
     if let Some(url) = &cfg.ollama {
         registry.register(Arc::new(LocalProvider::with_base_url(
             LocalBackend::Ollama,
@@ -366,6 +414,34 @@ pub fn register_local_providers(registry: &mut ProviderRegistry, cfg: &LocalProv
     if let Some(url) = &cfg.lmstudio {
         registry.register(Arc::new(LocalProvider::with_base_url(
             LocalBackend::LmStudio,
+            url.clone(),
+            cc.clone(),
+        )));
+    }
+    if let Some(url) = &cfg.llamacpp {
+        registry.register(Arc::new(LocalProvider::with_base_url(
+            LocalBackend::LlamaCpp,
+            url.clone(),
+            cc.clone(),
+        )));
+    }
+    if let Some(url) = &cfg.mlx {
+        registry.register(Arc::new(LocalProvider::with_base_url(
+            LocalBackend::Mlx,
+            url.clone(),
+            cc.clone(),
+        )));
+    }
+    if let Some(url) = &cfg.tgi {
+        registry.register(Arc::new(LocalProvider::with_base_url(
+            LocalBackend::Tgi,
+            url.clone(),
+            cc.clone(),
+        )));
+    }
+    if let Some(url) = &cfg.sglang {
+        registry.register(Arc::new(LocalProvider::with_base_url(
+            LocalBackend::Sglang,
             url.clone(),
             cc.clone(),
         )));
@@ -511,11 +587,36 @@ mod config_tests {
             &mut reg,
             &LocalProviders {
                 ollama: Some("http://localhost:11434/v1".into()),
-                vllm: None,
-                lmstudio: None,
+                ..LocalProviders::default()
             },
         );
         assert!(reg.by_id("ollama").is_some());
         assert!(reg.by_id("vllm").is_none());
+    }
+
+    #[test]
+    fn registers_generic_endpoint_profiles_and_resolves_profile_models() {
+        let mut reg = ProviderRegistry::new();
+        register_local_providers(
+            &mut reg,
+            &LocalProviders {
+                endpoint_profiles: vec![EndpointProfileConfig {
+                    name: "gpu-a".into(),
+                    preset: tt_provider_local::EndpointPreset::OpenAiCompatible,
+                    base_url: Some("http://127.0.0.1:18080/v1".into()),
+                    auth: tt_provider_local::EndpointAuth::None,
+                    discovery: tt_provider_local::EndpointDiscoveryConfig::default(),
+                    capacity: tt_provider_local::CapacityConfig::default(),
+                    privacy: tt_provider_local::EndpointPrivacyConfig::default(),
+                    tco: None,
+                    require_provenance: false,
+                    models: std::collections::BTreeMap::new(),
+                }],
+                ..LocalProviders::default()
+            },
+        );
+        assert!(reg.by_id("local").is_some());
+        assert!(reg.resolve("local/gpu-a/Qwen/Qwen3-8B").is_some());
+        assert!(reg.resolve("local/missing/model").is_some());
     }
 }

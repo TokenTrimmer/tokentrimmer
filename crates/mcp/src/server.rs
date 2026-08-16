@@ -158,9 +158,12 @@ impl Server {
         let id = req.id.clone();
         let result = match req.method.as_str() {
             methods::INITIALIZE => Ok(json!({
-                "protocolVersion": "0.1",
+                "protocolVersion": "2025-06-18",
                 "serverInfo": { "name": "tt-mcp", "version": env!("CARGO_PKG_VERSION") },
-                "capabilities": { "tools": {}, "resources": {} }
+                "capabilities": {
+                    "tools": { "listChanged": false },
+                    "resources": { "subscribe": false, "listChanged": false }
+                }
             })),
             methods::TOOLS_LIST => Ok(json!({ "tools": self.tools.list() })),
             methods::TOOLS_CALL => match self.authenticate().await {

@@ -1,0 +1,453 @@
+{
+  "$comment": "Structural multi-basis agent cost contract generated from the exact tt_shared::AgentRunCostEvidence wire type. API cash, subscription allocation and counterfactuals, self-hosted TCO, and unmeasured evidence remain separate. Runtime semantic validation, authorization, readiness, and execution remain separate gates.",
+  "$defs": {
+    "AgentCostBasis": {
+      "description": "Mutually exclusive accounting bases.\n\nAll cash fields are integer micro-USD. Counterfactual and allocated amounts are named explicitly and must never be added to realized cash totals.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A provider API call with catalog/provider/invoice evidence.",
+          "properties": {
+            "amount_micros": {
+              "format": "int64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "basis": {
+              "enum": [
+                "api_metered"
+              ],
+              "type": "string"
+            },
+            "evidence": {
+              "$ref": "#/$defs/ApiMeteredEvidence"
+            },
+            "model": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "provider": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "amount_micros",
+            "basis",
+            "evidence",
+            "model",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A local vendor runtime using an already-paid subscription entitlement.",
+          "properties": {
+            "allocated_plan_micros": {
+              "description": "Optional user-configured allocation; never presented as marginal cash.",
+              "format": "int64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "api_equivalent_micros": {
+              "description": "Optional API-price counterfactual; never presented as realized cost.",
+              "format": "int64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "basis": {
+              "enum": [
+                "subscription"
+              ],
+              "type": "string"
+            },
+            "marginal_cash_micros": {
+              "description": "Incremental cash charged for this component. Zero is valid evidence.",
+              "format": "int64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "plan_reference": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "quota": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SubscriptionQuotaEvidence"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "vendor": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "basis",
+            "marginal_cash_micros",
+            "plan_reference",
+            "vendor"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Customer-owned inference costed from an explicit versioned TCO profile.",
+          "properties": {
+            "basis": {
+              "enum": [
+                "self_hosted"
+              ],
+              "type": "string"
+            },
+            "energy_micros": {
+              "format": "int64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hardware_amortization_micros": {
+              "format": "int64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hosting_micros": {
+              "format": "int64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "operator_micros": {
+              "format": "int64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "profile_id": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "profile_revision": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "basis",
+            "profile_id",
+            "profile_revision"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Evidence was unavailable. Never coerce this state to numeric zero.",
+          "properties": {
+            "basis": {
+              "enum": [
+                "unmeasured"
+              ],
+              "type": "string"
+            },
+            "expected_basis": {
+              "$ref": "#/$defs/ExpectedAgentCostBasis"
+            },
+            "reasons": {
+              "items": {
+                "$ref": "#/$defs/UnmeasuredCostReason"
+              },
+              "maxItems": 16,
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "basis",
+            "expected_basis",
+            "reasons"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AgentCostComponent": {
+      "additionalProperties": false,
+      "description": "One independently attributable call or local execution cost.",
+      "properties": {
+        "attempt": {
+          "description": "One-indexed attempt number. Retries are separate components.",
+          "format": "uint32",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "component_id": {
+          "description": "Stable run-local id used for deduplication and receipt references.",
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "cost": {
+          "$ref": "#/$defs/AgentCostBasis"
+        },
+        "purpose": {
+          "$ref": "#/$defs/AgentCostPurpose"
+        }
+      },
+      "required": [
+        "attempt",
+        "component_id",
+        "cost",
+        "purpose"
+      ],
+      "type": "object"
+    },
+    "AgentCostPurpose": {
+      "description": "Why a cost-bearing operation ran.",
+      "enum": [
+        "primary_turn",
+        "summarizer",
+        "judge",
+        "retry",
+        "shadow",
+        "validation",
+        "embedding",
+        "routing",
+        "other"
+      ],
+      "type": "string"
+    },
+    "ApiMeteredEvidence": {
+      "description": "Strength of evidence for a measured API amount.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Provider usage settled against a versioned price; not invoice proof.",
+          "properties": {
+            "pricing_revision": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "provider_usage_reference": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "enum": [
+                "billed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "pricing_revision",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Catalog estimate only; must remain visibly estimated.",
+          "properties": {
+            "price_observed_at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "pricing_revision": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "estimated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "price_observed_at",
+            "pricing_revision",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Amount matched to a retained provider invoice artifact.",
+          "properties": {
+            "invoice_reference": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "invoice_reconciled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "invoice_reference",
+            "state"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ExpectedAgentCostBasis": {
+      "enum": [
+        "api_metered",
+        "subscription",
+        "self_hosted"
+      ],
+      "type": "string"
+    },
+    "SubscriptionQuotaEvidence": {
+      "additionalProperties": false,
+      "description": "Optional quota/window evidence exposed by a subscription runtime.",
+      "properties": {
+        "limit": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "unit": {
+          "$ref": "#/$defs/SubscriptionQuotaUnit"
+        },
+        "used": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_ends_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source",
+        "unit",
+        "used"
+      ],
+      "type": "object"
+    },
+    "SubscriptionQuotaUnit": {
+      "enum": [
+        "requests",
+        "tokens",
+        "tool_calls",
+        "vendor_units"
+      ],
+      "type": "string"
+    },
+    "UnmeasuredCostReason": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/UnmeasuredCostReasonCode"
+        },
+        "detail": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "UnmeasuredCostReasonCode": {
+      "enum": [
+        "price_unknown",
+        "provider_usage_missing",
+        "invoice_unavailable",
+        "subscription_quota_unavailable",
+        "subscription_allocation_unconfigured",
+        "local_tco_profile_missing",
+        "local_telemetry_missing",
+        "vendor_signal_unavailable",
+        "other"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "urn:tokentrimmer:agent-cost-evidence:schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Complete cost evidence emitted for one agent run.\n\nEvery model, summarizer, judge, retry, shadow, and other chargeable call is represented by one component. Missing evidence is a first-class component; absence and numeric zero are never interchangeable.",
+  "properties": {
+    "components": {
+      "items": {
+        "$ref": "#/$defs/AgentCostComponent"
+      },
+      "maxItems": 512,
+      "minItems": 1,
+      "type": "array"
+    },
+    "run_id": {
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "components",
+    "run_id",
+    "schema_version"
+  ],
+  "title": "TokenTrimmer agent run cost evidence",
+  "type": "object"
+}

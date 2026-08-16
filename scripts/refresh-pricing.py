@@ -42,26 +42,33 @@ TOLERANCE_USD_PER_M = 0.005
 # authoritatively prices. Anthropic/Gemini version separators differ (dash vs
 # dot). Rows absent here are reported "manual".
 SLUG = {
+    ("openai", "gpt-5.6-sol"): "openai/gpt-5.6-sol",
+    ("openai", "gpt-5.6-terra"): "openai/gpt-5.6-terra",
+    ("openai", "gpt-5.6-luna"): "openai/gpt-5.6-luna",
     ("openai", "gpt-5.5"): "openai/gpt-5.5",
     ("openai", "gpt-5.4"): "openai/gpt-5.4",
     ("openai", "gpt-5.5-pro"): "openai/gpt-5.5-pro",
     ("openai", "gpt-5.4-mini"): "openai/gpt-5.4-mini",
     ("openai", "gpt-5.4-pro"): "openai/gpt-5.4-pro",
+    ("openai", "gpt-4.1"): "openai/gpt-4.1",
+    ("openai", "gpt-4.1-mini"): "openai/gpt-4.1-mini",
     ("openai", "gpt-4o"): "openai/gpt-4o",
     ("openai", "gpt-4o-mini"): "openai/gpt-4o-mini",
     ("openai", "o3"): "openai/o3",
     ("openai", "o4-mini"): "openai/o4-mini",
+    ("anthropic", "claude-sonnet-5"): "anthropic/claude-sonnet-5",
+    ("anthropic", "claude-opus-5"): "anthropic/claude-opus-5",
     ("anthropic", "claude-haiku-4-5"): "anthropic/claude-haiku-4.5",
     ("anthropic", "claude-sonnet-4-6"): "anthropic/claude-sonnet-4.6",
     ("anthropic", "claude-opus-4-7"): "anthropic/claude-opus-4.7",
     ("anthropic", "claude-opus-4-8"): "anthropic/claude-opus-4.8",
+    ("gemini", "gemini-3.7-flash"): "google/gemini-3.7-flash",
+    ("gemini", "gemini-3.6-flash"): "google/gemini-3.6-flash",
+    ("gemini", "gemini-3.5-flash-lite"): "google/gemini-3.5-flash-lite",
     ("gemini", "gemini-3.5-flash"): "google/gemini-3.5-flash",
     ("gemini", "gemini-3.1-pro"): "google/gemini-3.1-pro-preview",  # no stable slug yet
     ("gemini", "gemini-3.1-flash-lite"): "google/gemini-3.1-flash-lite",
     ("mistral", "mistral-large-latest"): "mistralai/mistral-large",
-    # mistral-medium/small/codestral are only on OpenRouter as version-pinned
-    # slugs (mistral-medium-3.1, codestral-2508, …) that rotate — mapping the
-    # "-latest" alias to one would rot, so they're left to manual verification.
 }
 
 # Host-specific resale rates (Groq/Together) aren't in /models. OpenRouter's

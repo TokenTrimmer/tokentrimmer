@@ -1,17 +1,15 @@
-# Backlog
+# Archived backlog — public repository
 
-Single source of truth for actionable work. Entries are checkboxes; flip to `[x]` when done. Sync to GitHub Issues with `autopilot` label via `./scripts/backlog.sh sync`.
+**Archived 2026-08-12.** This file is a frozen historical catalog derived from
+the 2026-05-30 review. Its checkboxes, priorities, branch names, estimates, and
+launch gates are not current work or release authority.
 
-**Format**: `- [ ] [PRIORITY] [task-id] subagent: brief description (§review-ref) (est: $X.XX)`
+Current work is tracked in workspace-root `../../PROJECT_REVIEW_2026-08-11.md`.
+Current behavior comes from source, migrations, generated contracts, focused
+tests, and active CI/release gates. Do not add items here or synchronize this
+file to issue trackers.
 
-- `PRIORITY` ∈ {P0 (blocker), P1 (next), P2 (soon), P3 (whenever)}
-- `task-id` is short kebab-case, used in branch names: `autopilot/<task-id>`
-- `subagent` ∈ `rust-crate-builder`, `provider-adapter-author`, `inspect-rule-author`, `astro-page-builder`, `plan-replay-validator`
-- `§ref` points to the section in `PROJECT_REVIEW.md` (2026-05-30 senior review) the item came from.
-
-> **History:** all completed pre-2026-05-30 items live in `.claude/BACKLOG_ARCHIVE.md` (frozen snapshot). Cloud-side items live in `../cloud/.claude/BACKLOG.md`.
->
-> **Note on prior review:** the 2026-05-29 follow-ups shipped, but the 2026-05-30 audit found several were *incomplete*. Items below tagged "(extends …)" supersede a previously-closed item rather than duplicating it.
+Completed pre-2026-05-30 entries remain in `.claude/BACKLOG_ARCHIVE.md`.
 
 ---
 

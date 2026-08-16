@@ -587,7 +587,7 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
         .collect::<Vec<_>>();
     let manifest = json!({
         "contract": "tokentrimmer.product-contracts.v1",
-        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, and request-preflight response types",
+        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, request-preflight response types, and multi-basis agent cost evidence type",
         "typescript": PRODUCT_TS_PATH,
         "typescript_sdk": SDK_PRODUCT_TS_PATH,
         "python_sdk": SDK_PRODUCT_PY_PATH,
@@ -646,6 +646,12 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
                 "batch_schema": "docs/capability-contract/request-preflight-batch-response.schema.json",
                 "write": "POST /v1/capabilities/preflight",
                 "batch_write": "POST /v1/capabilities/preflight/batch"
+            },
+            {
+                "family": "agent_cost_evidence",
+                "id": tt_shared::AGENT_COST_SCHEMA_ID,
+                "versions": [tt_shared::AGENT_COST_SCHEMA_VERSION],
+                "schema": "docs/agent-contract/agent-cost-evidence.schema.json"
             }
         ],
         "files": files

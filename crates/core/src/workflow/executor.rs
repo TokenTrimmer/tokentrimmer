@@ -87,7 +87,6 @@ pub(crate) trait NodeExecutor: Send + Sync {
     /// same org as this executor.  Returns [`ApiError::NotFound`] if no
     /// workflow with that id exists for the org, or
     /// [`ApiError::ServiceUnavailable`] if the backing store is unavailable.
-    #[allow(dead_code)]
     async fn load_subworkflow(&self, id: uuid::Uuid) -> Result<WorkflowDefinition, ApiError>;
 
     /// Load a bounded set of latest child definitions. The default preserves

@@ -295,6 +295,11 @@ pub async fn handler(
         baseline_pricing.as_ref(),
         provider.fee_multiplier(),
     );
+    crate::metrics::record_request_measurement(
+        "embeddings",
+        breakdown
+            .request_delta_evidence_state(routed_pricing.is_some(), baseline_pricing.is_some()),
+    );
     state
         .spend_sink()
         .record(org_id, api_key_id, breakdown.cost_usd, Utc::now());

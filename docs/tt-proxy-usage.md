@@ -24,13 +24,12 @@ export OPENAI_BASE_URL=http://localhost:31415
 
 Current Codex CLI requires streamed `/v1/responses`; this listener does not expose that endpoint. Run Codex directly rather than pointing it at `tt proxy`.
 
-## Modes
+## Mode and credential contract
 
-- `gateway` (default) — all endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/models`) forward to the hosted TT Gateway. The proxy removes client provider credentials and injects only your TokenTrimmer key. Requires `--tt-api-key` or `TT_API_KEY`.
-- `bypass` — forward directly to the upstream provider (OpenAI for OpenAI-wire, Anthropic for `/v1/messages`) with the client's provider credential. Logging only, no TokenTrimmer features.
-- `hybrid` — all endpoints forward only to an explicitly configured loopback self-hosted Gateway. The proxy preserves the client's provider credential and never injects a TokenTrimmer key. Remote targets are rejected.
-
-In `gateway` and `hybrid` mode `/v1/messages` routes through the selected Gateway; only `bypass` forwards it directly to the Anthropic upstream.
+Run `tt proxy --help` for the authoritative mode reference. Clap renders each
+mode directly from the same `ModeContract` used by startup validation, upstream
+selection, and request credential handling; prose copies are intentionally not
+maintained here.
 
 ## Session log
 
