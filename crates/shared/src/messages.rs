@@ -33,6 +33,22 @@ pub enum CacheMode {
     #[serde(rename = "read-only")]
     ReadOnly,
 }
+/// Policy for smart pre-request cache pruning and context optimization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CachePrunePolicy {
+    /// No extra pruning beyond standard normalization.
+    #[default]
+    None,
+    /// Auto prune volatile metadata, repetitive whitespace, and empty padding.
+    Auto,
+    /// Strip and compact tool payloads and historical tool result dumps.
+    Tools,
+    /// Collapse runs of whitespace and format padding.
+    Whitespace,
+    /// Elide tool outputs superseded by later identical calls.
+    Superseded,
+}
 
 /// Typed cache-control extracted from `tt_extras`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -43,6 +59,9 @@ pub struct CacheControlConfig {
     /// Override TTL for cache inserts. `None` = use the gateway default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<u64>,
+    /// Smart cache pruning policy.
+    #[serde(default)]
+    pub prune: CachePrunePolicy,
 }
 
 /// Parse [`CacheControlConfig`] from a request's `tt_extras` map.
@@ -176,6 +195,12 @@ mod cache_control_tests {
     fn malformed_value_falls_back_to_default() {
         let cfg = parse_cache_control(&extras(r#"{"cache":"not-an-object"}"#)).unwrap();
         assert_eq!(cfg.mode, CacheMode::Normal);
+    }
+    #[test]
+    fn prune_policy_parsed() {
+        let cfg = parse_cache_control(&extras(r#"{"cache":{"mode":"normal","prune":"auto"}}"#)).unwrap();
+        assert_eq!(cfg.mode, CacheMode::Normal);
+        assert_eq!(cfg.prune, CachePrunePolicy::Auto);
     }
 }
 

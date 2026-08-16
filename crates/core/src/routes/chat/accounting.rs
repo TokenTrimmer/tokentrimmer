@@ -458,18 +458,18 @@ pub(crate) fn compute_cost_full(
     // opt-in ever reaches a model with no flex rate (no phantom saving).
     let (cost_usd, flex_cost_basis) = match (flex_applied, pricing.flex_rates_per_million()) {
         (true, Some((flex_in, flex_out))) => {
-            let flex_cost = (usage.prompt_tokens as f64) * flex_in / 1_000_000.0
+            // Respect prompt cache discounts under flex execution
+            let flex_cost = (fresh_input as f64) * flex_in / 1_000_000.0
+                + (cache_read as f64) * cached_rate / 1_000_000.0
+                + (cache_write as f64) * write_rate / 1_000_000.0
                 + (usage.completion_tokens as f64) * flex_out / 1_000_000.0;
             (flex_cost, Some(flex_cost))
         }
         _ => (standard_cost_usd, None),
     };
-    // Standard cost at the served model on the SAME basis the flex cost uses
-    // (full prompt + completion, no cache discount) — the comparison point for
-    // the flex saving so the delta is exactly standard − flex.
-    let standard_full_cost_usd = (usage.prompt_tokens as f64) * pricing.input_per_million
-        / 1_000_000.0
-        + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
+    // Standard cost at the served model on the SAME basis the flex cost uses —
+    // the comparison point for the flex saving so the delta is exactly standard − flex.
+    let standard_full_cost_usd = standard_cost_usd;
     let flex_saved_usd = match flex_cost_basis {
         Some(flex_cost) => (standard_full_cost_usd - flex_cost).max(0.0),
         None => 0.0,

@@ -10,10 +10,11 @@ use crate::CacheError;
 
 const INCREMENT_WINDOW_SCRIPT: &str = r#"
 local count = redis.call('INCR', KEYS[1])
-if count == 1 then
-  redis.call('PEXPIRE', KEYS[1], ARGV[1])
-end
 local ttl = redis.call('PTTL', KEYS[1])
+if count == 1 or ttl == -1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
 return {count, ttl}
 "#;
 

@@ -167,8 +167,8 @@ mod tests {
     #[test]
     fn embedded_catalog_parses_all_providers() {
         let c = model_catalog();
-        assert_eq!(c.len(), 61, "native (26) + compat (35)");
-        assert_eq!(c.for_provider("openai").len(), 14); // + gpt-5.6 family, gpt-4.1 family
+        assert_eq!(c.len(), 63, "native (28) + compat (35)");
+        assert_eq!(c.for_provider("openai").len(), 16); // + gpt-5.6 family, gpt-4.1 family, pro variants
         assert_eq!(c.for_provider("anthropic").len(), 6); // + claude-5 family
         assert_eq!(c.for_provider("gemini").len(), 6); // + gemini-3.6/3.7
         assert_eq!(c.for_provider("mistral").len(), 5);

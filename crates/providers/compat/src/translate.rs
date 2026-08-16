@@ -22,7 +22,7 @@ use tt_shared::{
 /// This is part of the OpenAI wire request shape, so it lives in the compat
 /// translation layer rather than in any provider's pricing table.
 pub fn is_reasoning_model(model: &str) -> bool {
-    matches!(model, "o3" | "o4-mini")
+    model.starts_with("o3") || model.starts_with("o4") || model.starts_with("o1")
 }
 
 /// Params the compat layer silently drops for `req`. Reasoning models

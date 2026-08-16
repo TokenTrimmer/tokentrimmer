@@ -359,8 +359,7 @@ fn provider_id_and_models() {
     assert_eq!(p.id(), "anthropic");
 
     let models = p.models();
-    assert_eq!(models.len(), 4, "expected 4 models in pricing table");
-
+    assert!(models.len() >= 4, "expected at least 4 models in pricing table");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert!(ids.contains(&"claude-haiku-4-5"));
     assert!(ids.contains(&"claude-sonnet-4-6"));

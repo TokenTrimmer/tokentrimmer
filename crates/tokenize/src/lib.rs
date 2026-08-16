@@ -104,7 +104,11 @@ fn o200k() -> Option<&'static CoreBPE> {
 /// conservative direction for a savings delta is handled by the gate itself
 /// (same encoding both sides), so the residual risk is only estimate skew.
 fn openai_model_uses_o200k(model: &str) -> bool {
-    let m = model.strip_prefix("openai/").unwrap_or(model);
+    let lower = model.to_ascii_lowercase();
+    let m = lower
+        .strip_prefix("openai/")
+        .or_else(|| lower.strip_prefix("azure/"))
+        .unwrap_or(&lower);
     m.starts_with("gpt-4o")
         || m.starts_with("gpt-4.1")
         || m.starts_with("gpt-5")

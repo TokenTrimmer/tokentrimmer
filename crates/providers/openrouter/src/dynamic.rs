@@ -79,8 +79,9 @@ pub struct RawPricing {
     pub completion: Option<PriceValue>,
     #[serde(default)]
     pub input_cache_read: Option<PriceValue>,
+    #[serde(default)]
+    pub input_cache_write: Option<PriceValue>,
 }
-
 /// A price that may arrive as a JSON string (`"0.000003"`, the documented
 /// `BigNumberUnion`) or a bare JSON number (`0.000003`, what the live endpoint
 /// serialises today). Parsed into a per-token `f64`.
@@ -176,7 +177,11 @@ impl DynamicCatalog {
                                 .as_ref()
                                 .and_then(PriceValue::per_token)
                                 .map(per_million),
-                            cache_write_per_million: None,
+                            cache_write_per_million: pr
+                                .input_cache_write
+                                .as_ref()
+                                .and_then(PriceValue::per_token)
+                                .map(per_million),
                             batch_input_per_million: None,
                             batch_output_per_million: None,
                             prompt_cache_min_tokens: None,

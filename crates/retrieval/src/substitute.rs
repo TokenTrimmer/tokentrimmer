@@ -90,8 +90,18 @@ pub async fn substitute_in_messages(
         }
         without_tags.push_str(&text[last..]);
 
-        let query_emb = embedder.embed(&without_tags).await?;
+        let query_text = without_tags.trim();
+        let fallback_query = if query_text.is_empty() {
+            tags.first().map(|t| &text[t.span.0..t.span.1]).unwrap_or("")
+        } else {
+            query_text
+        };
 
+        if fallback_query.trim().is_empty() {
+            continue;
+        }
+
+        let query_emb = embedder.embed(fallback_query).await?;
         // One embedding request was made for this message — deduct its token
         // cost from the gross savings.
         let query_tokens = estimate_tokens(EMBEDDING_PROVIDER, &without_tags) as i64;

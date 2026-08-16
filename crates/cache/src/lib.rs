@@ -52,7 +52,8 @@ pub use embed::{
     DEFAULT_EMBED_CACHE_CAPACITY,
 };
 pub use key::{
-    cache_key, cache_key_with, AliasMapCanonicalizer, IdentityCanonicalizer, ModelCanonicalizer,
+    cache_key, cache_key_with, cache_key_with_policy, AliasMapCanonicalizer, IdentityCanonicalizer,
+    ModelCanonicalizer,
 };
 pub use l1_entry::L1Entry;
 pub use l2::{

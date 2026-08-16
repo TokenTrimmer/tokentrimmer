@@ -138,8 +138,21 @@ pub fn cache_key_with(
     req: &ChatCompletionRequest,
     canonicalizer: &dyn ModelCanonicalizer,
 ) -> String {
+    cache_key_with_policy(req, canonicalizer, tt_shared::messages::CachePrunePolicy::None)
+}
+
+/// Derive a cache key with explicit [`ModelCanonicalizer`] and [`tt_shared::messages::CachePrunePolicy`].
+///
+/// When a prune policy like [`CachePrunePolicy::Whitespace`] or [`CachePrunePolicy::Tools`] is active,
+/// extra non-semantic noise (multiline empty pads, volatile tool whitespace) is pruned before hashing,
+/// increasing cache hit rates across equivalent conversations.
+pub fn cache_key_with_policy(
+    req: &ChatCompletionRequest,
+    canonicalizer: &dyn ModelCanonicalizer,
+    policy: tt_shared::messages::CachePrunePolicy,
+) -> String {
     let canonical_model = canonicalizer.canonicalize(&req.model);
-    let canonical = build_canonical(req, &canonical_model);
+    let canonical = build_canonical_with_policy(req, &canonical_model, policy);
     // serde_json::to_vec with sorted keys is not built-in; we serialize our
     // carefully constructed Value whose keys are already in a defined order.
     let bytes = serde_json::to_vec(&canonical).expect("canonical Value is always serializable");
@@ -161,15 +174,22 @@ fn round6(v: f32) -> f64 {
 fn normalize_message_content(
     content: &tt_shared::messages::MessageContent,
 ) -> tt_shared::messages::MessageContent {
+    normalize_message_content_with_policy(content, tt_shared::messages::CachePrunePolicy::None)
+}
+
+fn normalize_message_content_with_policy(
+    content: &tt_shared::messages::MessageContent,
+    policy: tt_shared::messages::CachePrunePolicy,
+) -> tt_shared::messages::MessageContent {
     use tt_shared::messages::{ContentPart, MessageContent};
     match content {
-        MessageContent::Text(s) => MessageContent::Text(normalize_text_for_key(s)),
+        MessageContent::Text(s) => MessageContent::Text(normalize_text_for_key_with_policy(s, policy)),
         MessageContent::Parts(parts) => MessageContent::Parts(
             parts
                 .iter()
                 .map(|p| match p {
                     ContentPart::Text { text } => ContentPart::Text {
-                        text: normalize_text_for_key(text),
+                        text: normalize_text_for_key_with_policy(text, policy),
                     },
                     other => other.clone(),
                 })
@@ -192,37 +212,63 @@ fn normalize_message_content(
 /// Leading whitespace and mid-content whitespace are intentionally preserved —
 /// a space at the start or inside a message can be semantically meaningful.
 fn normalize_text_for_key(s: &str) -> String {
-    // 1. Apply Unicode NFC: iterator yields NFC code points, collect to String.
-    let nfc: String = s.nfc().collect();
-    // 2. Trim trailing ASCII whitespace characters.
-    nfc.trim_end_matches([' ', '\t', '\n', '\r']).to_owned()
+    normalize_text_for_key_with_policy(s, tt_shared::messages::CachePrunePolicy::None)
 }
 
-/// Build the canonical [`serde_json::Value`] used for key derivation.
-///
-/// Keys are emitted in a fixed, alphabetically-sorted order so that the JSON
-/// bytes are deterministic regardless of field insertion order.
-///
-/// Text segments in messages are normalized via [`normalize_text_for_key`]
-/// (NFC + trailing-whitespace trim) before hashing.  The upstream request is
-/// never modified — normalization applies only to the bytes used for hashing.
-fn build_canonical(req: &ChatCompletionRequest, model: &str) -> serde_json::Value {
+fn normalize_text_for_key_with_policy(s: &str, policy: tt_shared::messages::CachePrunePolicy) -> String {
+    use tt_shared::messages::CachePrunePolicy;
+    let nfc: String = s.nfc().collect();
+    let trimmed = nfc.trim_end_matches([' ', '\t', '\n', '\r']);
+    match policy {
+        CachePrunePolicy::None => trimmed.to_owned(),
+        CachePrunePolicy::Auto | CachePrunePolicy::Whitespace => {
+            // Standardize CRLF to LF then collapse 3+ consecutive newlines into 2
+            let standardized = trimmed.replace("\r\n", "\n").replace('\r', "\n");
+            let mut out = String::with_capacity(standardized.len());
+            let mut newline_count = 0;
+            for c in standardized.chars() {
+                if c == '\n' {
+                    newline_count += 1;
+                    if newline_count <= 2 {
+                        out.push(c);
+                    }
+                } else {
+                    newline_count = 0;
+                    out.push(c);
+                }
+            }
+            out
+        }
+        CachePrunePolicy::Tools => {
+            // Minify JSON if valid JSON payload in tool output/arguments
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                serde_json::to_string(&v).unwrap_or_else(|_| trimmed.to_owned())
+            } else {
+                trimmed.to_owned()
+            }
+        }
+        _ => trimmed.to_owned(),
+    }
+}
+
+fn build_canonical_with_policy(
+    req: &ChatCompletionRequest,
+    model: &str,
+    policy: tt_shared::messages::CachePrunePolicy,
+) -> serde_json::Value {
     use serde_json::{json, Value};
     use tt_shared::messages::Message;
 
-    // Normalize text segments in messages for key derivation, then serialize.
-    // We clone+patch the messages vec rather than the full request so that only
-    // the hashed representation is affected; the original `req` is untouched.
     let normalized_messages: Vec<Message> = req
         .messages
         .iter()
         .map(|msg| match msg {
             Message::User { content, name } => Message::User {
                 name: name.clone(),
-                content: normalize_message_content(content),
+                content: normalize_message_content_with_policy(content, policy),
             },
             Message::System { content } => Message::System {
-                content: normalize_message_content(content),
+                content: normalize_message_content_with_policy(content, policy),
             },
             Message::Assistant {
                 content,
@@ -231,18 +277,17 @@ fn build_canonical(req: &ChatCompletionRequest, model: &str) -> serde_json::Valu
             } => Message::Assistant {
                 name: name.clone(),
                 tool_calls: tool_calls.clone(),
-                content: content.as_ref().map(normalize_message_content),
+                content: content.as_ref().map(|c| normalize_message_content_with_policy(c, policy)),
             },
             Message::Tool {
                 content,
                 tool_call_id,
             } => Message::Tool {
                 tool_call_id: tool_call_id.clone(),
-                content: normalize_message_content(content),
+                content: normalize_message_content_with_policy(content, policy),
             },
         })
         .collect();
-
     // Serialize normalized messages via serde so complex enum variants are
     // handled correctly.
     let messages: Value =

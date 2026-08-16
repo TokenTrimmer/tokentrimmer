@@ -207,11 +207,36 @@ fn check_mcp_config() {
         if let Some(path) = config_path_for(c, os, home_ref, appdata.as_deref()) {
             any = true;
             if path.exists() {
-                ui::ok(&format!(
-                    "mcp:     {} config present ({})",
-                    c.display_name(),
-                    path.display()
-                ));
+                let configured = if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        val.get("mcpServers")
+                            .and_then(|s| s.get("tokentrimmer"))
+                            .is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if configured {
+                    ui::ok(&format!(
+                        "mcp:     {} configured with tokentrimmer ({})",
+                        c.display_name(),
+                        path.display()
+                    ));
+                } else {
+                    ui::note(&format!(
+                        "mcp:     {} config found at {} but tokentrimmer server missing — run `tt mcp install --client {}`",
+                        c.display_name(),
+                        path.display(),
+                        match c {
+                            McpClient::ClaudeCode => "claude-code",
+                            McpClient::Cursor => "cursor",
+                            McpClient::ClaudeDesktop => "claude-desktop",
+                        }
+                    ));
+                }
             } else {
                 ui::note(&format!(
                     "mcp:     {} config not found at {} — run `tt mcp install --client {}`",

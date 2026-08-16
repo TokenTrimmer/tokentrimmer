@@ -419,12 +419,19 @@ pub fn translate_request(
                         );
                         tool_call_id.clone()
                     });
+                let part = GeminiPart::FunctionResponse(GeminiFunctionResponse {
+                    name: fn_name,
+                    response: GeminiFunctionResponseContent { content: text },
+                });
+                if let Some(last) = contents.last_mut() {
+                    if last.role == "function" {
+                        last.parts.push(part);
+                        continue;
+                    }
+                }
                 contents.push(GeminiContent {
                     role: "function".to_string(),
-                    parts: vec![GeminiPart::FunctionResponse(GeminiFunctionResponse {
-                        name: fn_name,
-                        response: GeminiFunctionResponseContent { content: text },
-                    })],
+                    parts: vec![part],
                 });
             }
         }

@@ -47,9 +47,10 @@ pub use gateway_capabilities::{
     CAPABILITIES_SNAPSHOT_SCOPE,
 };
 pub use messages::{
-    parse_cache_control, parse_panel_extras, CacheControlConfig, CacheMode, ChatCompletionChunk,
-    ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart, EmbeddingsRequest,
-    EmbeddingsResponse, Message, MessageContent, PanelExtras, Tool, ToolCall, ToolChoice,
+    parse_cache_control, parse_panel_extras, CacheControlConfig, CacheMode, CachePrunePolicy,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart,
+    EmbeddingsRequest, EmbeddingsResponse, Message, MessageContent, PanelExtras, Tool, ToolCall,
+    ToolChoice,
 };
 pub use model_catalog::{
     model_catalog, ModelCatalog, ModelCatalogLimitations, ModelEntry, ModelTokenTrimmerMeta,

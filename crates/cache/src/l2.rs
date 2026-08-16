@@ -785,20 +785,20 @@ fn embedding_is_finite(v: &[f32]) -> bool {
 /// This function is `pub` so the test suite can verify it directly; callers
 /// inside `crates/core` should import it from `tt_cache`.
 pub fn l2_context_text(req: &ChatCompletionRequest) -> Option<String> {
-    fn message_text(content: &MessageContent) -> &str {
+    fn message_text(content: &MessageContent) -> String {
         match content {
-            MessageContent::Text(s) => s.as_str(),
+            MessageContent::Text(s) => s.clone(),
             MessageContent::Parts(parts) => {
+                let mut text_parts = Vec::new();
                 for p in parts {
                     if let ContentPart::Text { text } = p {
-                        return text.as_str();
+                        text_parts.push(text.as_str());
                     }
                 }
-                ""
+                text_parts.join(" ")
             }
         }
     }
-
     let mut parts: Vec<String> = Vec::new();
 
     for msg in &req.messages {
@@ -858,20 +858,20 @@ pub fn l2_context_text(req: &ChatCompletionRequest) -> Option<String> {
 /// `pub` so the test suite can verify it directly; callers inside `crates/core`
 /// import it from `tt_cache`.
 pub fn l2_tool_context_text(req: &ChatCompletionRequest) -> Option<String> {
-    fn message_text(content: &MessageContent) -> &str {
+    fn message_text(content: &MessageContent) -> String {
         match content {
-            MessageContent::Text(s) => s.as_str(),
+            MessageContent::Text(s) => s.clone(),
             MessageContent::Parts(parts) => {
+                let mut text_parts = Vec::new();
                 for p in parts {
                     if let ContentPart::Text { text } = p {
-                        return text.as_str();
+                        text_parts.push(text.as_str());
                     }
                 }
-                ""
+                text_parts.join(" ")
             }
         }
     }
-
     let mut parts: Vec<String> = Vec::new();
 
     for msg in &req.messages {

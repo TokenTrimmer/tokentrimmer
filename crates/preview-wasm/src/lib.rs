@@ -37,6 +37,7 @@ const DOWNROUTES: &[(&str, &str)] = &[
     ("claude-sonnet-4-6", "claude-haiku-4-5"),
     ("gemini-3.1-pro", "gemini-3.1-flash-lite"),
     ("gemini-3.5-flash", "gemini-3.1-flash-lite"),
+    ("deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"),
 ];
 
 #[derive(Deserialize)]

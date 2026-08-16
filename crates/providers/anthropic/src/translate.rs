@@ -402,13 +402,20 @@ pub fn translate_request(
                 tool_call_id,
             } => {
                 let text = extract_text_from_content(content)?;
+                let block = AnthropicContentBlock::ToolResult {
+                    tool_use_id: tool_call_id,
+                    content: text,
+                    cache_control: None,
+                };
+                if let Some(last) = messages.last_mut() {
+                    if last.role == "user" {
+                        last.content.push(block);
+                        continue;
+                    }
+                }
                 messages.push(AnthropicMessage {
                     role: "user".to_string(),
-                    content: vec![AnthropicContentBlock::ToolResult {
-                        tool_use_id: tool_call_id,
-                        content: text,
-                        cache_control: None,
-                    }],
+                    content: vec![block],
                 });
             }
         }

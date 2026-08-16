@@ -594,9 +594,21 @@ fn parse_sse_event(event_bytes: &[u8]) -> Vec<SseEvent> {
 
             match serde_json::from_str::<RawChunk>(data) {
                 Ok(chunk) => results.push(SseEvent::Chunk(chunk)),
-                Err(e) => results.push(SseEvent::Err(ProviderError::Deserialize(format!(
-                    "failed to parse SSE chunk: {e}"
-                )))),
+                Err(e) => {
+                    if let Ok(err_obj) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(err_val) = err_obj.get("error") {
+                            let msg = err_val.get("message").and_then(|m| m.as_str()).unwrap_or("upstream stream error");
+                            results.push(SseEvent::Err(ProviderError::ProviderUpstream {
+                                status: 500,
+                                message: msg.to_string(),
+                            }));
+                            continue;
+                        }
+                    }
+                    results.push(SseEvent::Err(ProviderError::Deserialize(format!(
+                        "failed to parse SSE chunk: {e}"
+                    ))));
+                }
             }
         }
         // Lines without "data: " prefix in an event are ignored per SSE spec.
