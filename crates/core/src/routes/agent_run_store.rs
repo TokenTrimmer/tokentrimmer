@@ -99,9 +99,8 @@ impl AgentRunRecord {
     /// Build a record for a **terminal** run. Converts `RunStatus` /
     /// `StopReason` to their snake_case wire strings.
     ///
-    /// Used by the unit tests (pure, no DB) and as a helper for
-    /// constructing args to [`finish_agent_run`].
-    #[allow(dead_code)] // used in unit tests; available for future production callers (e.g. Task 6)
+    /// Used by unit tests to verify terminal wire/database mappings.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_terminal(
         id: Uuid,

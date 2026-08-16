@@ -8,13 +8,97 @@ from dataclasses import dataclass
 from typing import Literal, Optional, Tuple, Union
 
 
+@dataclass(frozen=True)
+class AgentCostBasisApiMetered:
+    amount_micros: int
+    basis: Literal["api_metered"]
+    evidence: ApiMeteredEvidence
+    model: str
+    provider: str
+
+
+@dataclass(frozen=True)
+class AgentCostBasisSubscription:
+    basis: Literal["subscription"]
+    marginal_cash_micros: int
+    plan_reference: str
+    vendor: str
+    allocated_plan_micros: Optional[int] = None
+    api_equivalent_micros: Optional[int] = None
+    quota: Optional[SubscriptionQuotaEvidence] = None
+
+
+@dataclass(frozen=True)
+class AgentCostBasisSelfHosted:
+    basis: Literal["self_hosted"]
+    profile_id: str
+    profile_revision: str
+    energy_micros: Optional[int] = None
+    hardware_amortization_micros: Optional[int] = None
+    hosting_micros: Optional[int] = None
+    operator_micros: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class AgentCostBasisUnmeasured:
+    basis: Literal["unmeasured"]
+    expected_basis: ExpectedAgentCostBasis
+    reasons: Tuple[UnmeasuredCostReason, ...]
+
+
+AgentCostBasis = Union[AgentCostBasisApiMetered, AgentCostBasisSubscription, AgentCostBasisSelfHosted, AgentCostBasisUnmeasured]
+
+
+AgentCostPurpose = Literal["primary_turn", "summarizer", "judge", "retry", "shadow", "validation", "embedding", "routing", "other"]
+
+
+@dataclass(frozen=True)
+class ApiMeteredEvidenceBilled:
+    pricing_revision: str
+    state: Literal["billed"]
+    provider_usage_reference: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ApiMeteredEvidenceEstimated:
+    price_observed_at: str
+    pricing_revision: str
+    state: Literal["estimated"]
+
+
+@dataclass(frozen=True)
+class ApiMeteredEvidenceInvoiceReconciled:
+    invoice_reference: str
+    state: Literal["invoice_reconciled"]
+
+
+ApiMeteredEvidence = Union[ApiMeteredEvidenceBilled, ApiMeteredEvidenceEstimated, ApiMeteredEvidenceInvoiceReconciled]
+
+
 Capability = Literal["text", "vision", "audio", "tools", "json_mode", "streaming", "reasoning", "prompt_caching"]
+
+
+ExpectedAgentCostBasis = Literal["api_metered", "subscription", "self_hosted"]
+
+
+SubscriptionQuotaUnit = Literal["requests", "tokens", "tool_calls", "vendor_units"]
+
+
+UnmeasuredCostReasonCode = Literal["price_unknown", "provider_usage_missing", "invoice_unavailable", "subscription_quota_unavailable", "subscription_allocation_unconfigured", "local_tco_profile_missing", "local_telemetry_missing", "vendor_signal_unavailable", "other"]
 
 
 @dataclass(frozen=True)
 class AccessEvidence:
     reason: CapabilityReason
     state: Literal["available", "unavailable"]
+
+
+@dataclass(frozen=True)
+class AgentCostComponent:
+    attempt: int
+    component_id: str
+    cost: AgentCostBasis
+    purpose: AgentCostPurpose
 
 
 @dataclass(frozen=True)
@@ -189,6 +273,15 @@ class SchemaVersions:
 
 
 @dataclass(frozen=True)
+class SubscriptionQuotaEvidence:
+    source: str
+    unit: SubscriptionQuotaUnit
+    used: int
+    limit: Optional[int] = None
+    window_ends_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class TierEvidence:
     reason: CapabilityReason
     source: Literal["authenticated_api_key", "gateway_free_default", "gateway_runtime"]
@@ -201,6 +294,12 @@ class UnknownEvidence:
     reason: CapabilityReason
     source: Literal["not_negotiated"]
     state: Literal["unknown"]
+
+
+@dataclass(frozen=True)
+class UnmeasuredCostReason:
+    code: UnmeasuredCostReasonCode
+    detail: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -250,4 +349,11 @@ class RequestPreflightBatchResponse:
     schema_version: Literal[1]
     scope: Literal["request_preflight_batch"]
     snapshot_scope: Literal["responding_process"]
+
+
+@dataclass(frozen=True)
+class AgentRunCostEvidence:
+    components: Tuple[AgentCostComponent, ...]
+    run_id: str
+    schema_version: Literal[1]
 

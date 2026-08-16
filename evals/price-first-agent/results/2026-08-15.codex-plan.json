@@ -1,0 +1,726 @@
+{
+  "schema_version": 1,
+  "corpus_id": "tokentrimmer-local-agent-corpus-2026-08-15",
+  "corpus_sha256": "9b5f08919d278092d5920bf2012628fe322e69390d88fdd89be5bd3f5e805121",
+  "evaluated_at": "2026-08-15T20:58:00.980Z",
+  "repository_revision": "0bf37b05764c90980a7b3e6865e8c1b729a8b71c",
+  "tt_version": "tt 0.2.0",
+  "authorization": {
+    "comparative_product_claims": false,
+    "reason": "Small local subscription-plan corpus with no provider invoice, no API-metered cash baseline, and no independent human patch review."
+  },
+  "accounting": {
+    "marginal_cash_is_realized": true,
+    "allocated_plan_cost_is_user_configured": true,
+    "token_counts_are_quota_not_cash": true,
+    "api_equivalent_cost_available": false,
+    "human_patch_review_performed": false,
+    "secret_exposure_cases_in_corpus": 0
+  },
+  "strategies": [
+    {
+      "strategy": "cheap_only",
+      "tasks": 3,
+      "accepted_patches": 3,
+      "accepted_patch_rate": 1,
+      "p50_latency_ms": 24951,
+      "p95_latency_ms": 26496,
+      "marginal_cash_micros_per_accepted_patch": 0,
+      "allocated_plan_micros_per_accepted_patch": 1000,
+      "tokens_per_accepted_patch": 69201,
+      "cache_read_fraction": 0.8659271245589066,
+      "failed_runs": 0,
+      "retry_count": 0,
+      "rollback_count": 0,
+      "human_interventions_observed": null,
+      "api_metered_micros_total": 0,
+      "self_hosted_tco_micros_total": 0,
+      "unmeasured_component_rate": 0,
+      "policy_denials": 0,
+      "tool_actions_denied": 0
+    },
+    {
+      "strategy": "fixed_premium",
+      "tasks": 3,
+      "accepted_patches": 3,
+      "accepted_patch_rate": 1,
+      "p50_latency_ms": 26815,
+      "p95_latency_ms": 39142,
+      "marginal_cash_micros_per_accepted_patch": 0,
+      "allocated_plan_micros_per_accepted_patch": 1000,
+      "tokens_per_accepted_patch": 67149,
+      "cache_read_fraction": 0.5621729778400281,
+      "failed_runs": 0,
+      "retry_count": 0,
+      "rollback_count": 0,
+      "human_interventions_observed": null,
+      "api_metered_micros_total": 0,
+      "self_hosted_tco_micros_total": 0,
+      "unmeasured_component_rate": 0,
+      "policy_denials": 0,
+      "tool_actions_denied": 0
+    },
+    {
+      "strategy": "price_first",
+      "tasks": 3,
+      "accepted_patches": 3,
+      "accepted_patch_rate": 1,
+      "p50_latency_ms": 24951,
+      "p95_latency_ms": 26496,
+      "marginal_cash_micros_per_accepted_patch": 0,
+      "allocated_plan_micros_per_accepted_patch": 1000,
+      "tokens_per_accepted_patch": 69201,
+      "cache_read_fraction": 0.8659271245589066,
+      "failed_runs": 0,
+      "retry_count": 0,
+      "rollback_count": 0,
+      "human_interventions_observed": null,
+      "api_metered_micros_total": 0,
+      "self_hosted_tco_micros_total": 0,
+      "unmeasured_component_rate": 0,
+      "policy_denials": 0,
+      "tool_actions_denied": 0,
+      "escalations": 0
+    }
+  ],
+  "runs": [
+    {
+      "task_id": "rust-inclusive-boundary",
+      "strategy": "cheap_only",
+      "model": "openai/gpt-5.4-mini",
+      "accepted": true,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 20469,
+      "input_tokens": 65324,
+      "cached_input_tokens": 58880,
+      "output_tokens": 630,
+      "total_tokens": 65954,
+      "tool_actions_requested": 3,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/lib.rs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "rustc",
+            "args": [
+              "--edition=2021",
+              "--test",
+              "src/lib.rs",
+              "-o",
+              "boundary-test"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 77,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "executable": "./boundary-test",
+            "args": [],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 186,
+            "stdout_sha256": "c515b2de4a8621ba3bd841426852121f0b1b476ea73541dcdaf988ca34953c3c",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "eb5bfb3e061b2d7f7d0783d1c6bbf607db6224e9ad82118579668b724c012b78",
+      "patch_sha256": "a7215bde748a4c75de63683286067cbbcc54f30b460c226c8ea68d4b12ac3458",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    },
+    {
+      "task_id": "rust-inclusive-boundary",
+      "strategy": "fixed_premium",
+      "model": "openai/gpt-5.6-sol",
+      "accepted": true,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 21241,
+      "input_tokens": 66474,
+      "cached_input_tokens": 38144,
+      "output_tokens": 448,
+      "total_tokens": 66922,
+      "tool_actions_requested": 3,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/lib.rs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "rustc",
+            "args": [
+              "--edition=2021",
+              "--test",
+              "src/lib.rs",
+              "-o",
+              "boundary-test"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 79,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "executable": "./boundary-test",
+            "args": [],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 137,
+            "stdout_sha256": "c515b2de4a8621ba3bd841426852121f0b1b476ea73541dcdaf988ca34953c3c",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "fe8704c936f7d5ea15e00d86d01958d1693062c4787c549f2d736ca6ee0640fc",
+      "patch_sha256": "a7215bde748a4c75de63683286067cbbcc54f30b460c226c8ea68d4b12ac3458",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    },
+    {
+      "task_id": "rust-inclusive-boundary",
+      "strategy": "price_first",
+      "model": "openai/gpt-5.4-mini",
+      "accepted": true,
+      "escalated": false,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 20469,
+      "input_tokens": 65324,
+      "cached_input_tokens": 58880,
+      "output_tokens": 630,
+      "total_tokens": 65954,
+      "tool_actions_requested": 3,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/lib.rs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "rustc",
+            "args": [
+              "--edition=2021",
+              "--test",
+              "src/lib.rs",
+              "-o",
+              "boundary-test"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 77,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "executable": "./boundary-test",
+            "args": [],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 186,
+            "stdout_sha256": "c515b2de4a8621ba3bd841426852121f0b1b476ea73541dcdaf988ca34953c3c",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "eb5bfb3e061b2d7f7d0783d1c6bbf607db6224e9ad82118579668b724c012b78",
+      "patch_sha256": "a7215bde748a4c75de63683286067cbbcc54f30b460c226c8ea68d4b12ac3458",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    },
+    {
+      "task_id": "js-strict-port-parser",
+      "strategy": "cheap_only",
+      "model": "openai/gpt-5.4-mini",
+      "accepted": true,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 26496,
+      "input_tokens": 79746,
+      "cached_input_tokens": 72704,
+      "output_tokens": 932,
+      "total_tokens": 80678,
+      "tool_actions_requested": 4,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/parse.mjs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "node",
+            "args": [
+              "--test",
+              "test.mjs"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 73,
+            "stdout_sha256": "6993c4f451afd23ef04aaecec470658056641b65a73044d48556e99467a28957",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "8eb69c2378f3a21870c02a86bf296a56c1513fda6ba181c7e3db5976c1d71865",
+      "patch_sha256": "86053e878ae549e44f016a97f80dd91680d86db58d36ce88ba20b9f842f8d7e8",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    },
+    {
+      "task_id": "js-strict-port-parser",
+      "strategy": "fixed_premium",
+      "model": "openai/gpt-5.6-sol",
+      "accepted": true,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 39142,
+      "input_tokens": 66568,
+      "cached_input_tokens": 37120,
+      "output_tokens": 617,
+      "total_tokens": 67185,
+      "tool_actions_requested": 3,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/parse.mjs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "node",
+            "args": [
+              "--test",
+              "test.mjs"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 78,
+            "stdout_sha256": "304c3ce5389f35ff5da757063a8934a34e67206a59a33aff2d07bdf423c56aab",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "469238696092b191fb8d1bb980c3f333fc1aab3fa94b4edcd5a7132cb2445e72",
+      "patch_sha256": "70dcf292896ba9041e08befcd677082b5c0c773082162ca43d7c3a9858429885",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    },
+    {
+      "task_id": "js-strict-port-parser",
+      "strategy": "price_first",
+      "model": "openai/gpt-5.4-mini",
+      "accepted": true,
+      "escalated": false,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 26496,
+      "input_tokens": 79746,
+      "cached_input_tokens": 72704,
+      "output_tokens": 932,
+      "total_tokens": 80678,
+      "tool_actions_requested": 4,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/parse.mjs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "node",
+            "args": [
+              "--test",
+              "test.mjs"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 73,
+            "stdout_sha256": "6993c4f451afd23ef04aaecec470658056641b65a73044d48556e99467a28957",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "8eb69c2378f3a21870c02a86bf296a56c1513fda6ba181c7e3db5976c1d71865",
+      "patch_sha256": "86053e878ae549e44f016a97f80dd91680d86db58d36ce88ba20b9f842f8d7e8",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    },
+    {
+      "task_id": "js-two-file-api-rename",
+      "strategy": "cheap_only",
+      "model": "openai/gpt-5.4-mini",
+      "accepted": true,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 24951,
+      "input_tokens": 60102,
+      "cached_input_tokens": 46080,
+      "output_tokens": 869,
+      "total_tokens": 60971,
+      "tool_actions_requested": 6,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/client.mjs",
+          "src/options.mjs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "node",
+            "args": [
+              "--test",
+              "test.mjs"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 77,
+            "stdout_sha256": "7aa875d730503c8c286a1b9009ac4746877bb5ee049354fc58c4db53b854903a",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "a54312c861d0b83d70d8baf9105192d8fd6e66bb87a08fe27a644de1e94e0f9c",
+      "patch_sha256": "9e35d46307c8f82eb745d2a2234cfb9dd15482ba9bfa6026b3b3919dd123c9dc",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    },
+    {
+      "task_id": "js-two-file-api-rename",
+      "strategy": "fixed_premium",
+      "model": "openai/gpt-5.6-sol",
+      "accepted": true,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 26815,
+      "input_tokens": 66868,
+      "cached_input_tokens": 37120,
+      "output_tokens": 472,
+      "total_tokens": 67340,
+      "tool_actions_requested": 6,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/client.mjs",
+          "src/options.mjs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "node",
+            "args": [
+              "--test",
+              "test.mjs"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 75,
+            "stdout_sha256": "def673d030d398fb63c292d2e0d12a7f5ff2b801ae2e9502f8438a54e6b57571",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "0858af87e3cdf078ed88a7ce0eb8a16adf22dc8d87361844bbd5ac8ee00391c8",
+      "patch_sha256": "9e35d46307c8f82eb745d2a2234cfb9dd15482ba9bfa6026b3b3919dd123c9dc",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    },
+    {
+      "task_id": "js-two-file-api-rename",
+      "strategy": "price_first",
+      "model": "openai/gpt-5.4-mini",
+      "accepted": true,
+      "escalated": false,
+      "invocation_exit_code": 0,
+      "stop_reason": "completed",
+      "failure": null,
+      "duration_ms": 24951,
+      "input_tokens": 60102,
+      "cached_input_tokens": 46080,
+      "output_tokens": 869,
+      "total_tokens": 60971,
+      "tool_actions_requested": 6,
+      "tool_actions_denied": 0,
+      "policy_denials": 0,
+      "retry_count": 0,
+      "denied_actions": [],
+      "rollback": "not_required_source_never_mutated",
+      "receipt_reasons": [
+        "local_signing_unavailable",
+        "subscription_not_invoice_reconciled"
+      ],
+      "costs": {
+        "marginal_cash_micros": 0,
+        "allocated_plan_micros": 1000,
+        "api_metered_micros": 0,
+        "self_hosted_tco_micros": 0,
+        "measured_components": 1,
+        "unmeasured_components": 0,
+        "total_components": 1
+      },
+      "validation": {
+        "accepted": true,
+        "changed_paths": [
+          "src/client.mjs",
+          "src/options.mjs"
+        ],
+        "unauthorized_paths": [],
+        "patch_applied": true,
+        "patch_apply_error_sha256": null,
+        "checks": [
+          {
+            "executable": "node",
+            "args": [
+              "--test",
+              "test.mjs"
+            ],
+            "passed": true,
+            "exit_code": 0,
+            "signal": null,
+            "duration_ms": 77,
+            "stdout_sha256": "7aa875d730503c8c286a1b9009ac4746877bb5ee049354fc58c4db53b854903a",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "source_checkout_unchanged": true
+      },
+      "receipt_sha256": "a54312c861d0b83d70d8baf9105192d8fd6e66bb87a08fe27a644de1e94e0f9c",
+      "patch_sha256": "9e35d46307c8f82eb745d2a2234cfb9dd15482ba9bfa6026b3b3919dd123c9dc",
+      "runtime": {
+        "sdk_version": "0.147.0",
+        "runtime_version": "0.147.0",
+        "runtime_executable_sha256": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+      }
+    }
+  ],
+  "limitations": [
+    "Three deterministic repair tasks are not representative of production repositories.",
+    "Acceptance is automated by source-controlled behavioral checks; no blinded human review was run.",
+    "Codex ChatGPT-plan usage exposes tokens but no invoice-reconciled per-run cash amount.",
+    "Only one vendor, one hardware platform, and one run per task/model were measured.",
+    "The corpus contains no planted secret-exposure case, so secret exposure remains unmeasured.",
+    "Results authorize no cheaper-or-equal-quality claim."
+  ]
+}

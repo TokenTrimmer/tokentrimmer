@@ -127,4 +127,30 @@ mod tests {
             .unwrap();
         assert_eq!(hook.mode, 0o755);
     }
+
+    #[test]
+    fn installs_committed_agent_policy_without_exposing_runtime_state() {
+        let vars = HashMap::from([
+            ("project_name".into(), "x".into()),
+            ("language".into(), "Rust".into()),
+            ("frameworks_csv".into(), String::new()),
+            ("tt_cli_version".into(), "0".into()),
+            ("initialized_at".into(), "x".into()),
+        ]);
+        let files = render_all(&vars).unwrap();
+        let policy = files
+            .iter()
+            .find(|file| file.dest.ends_with(".tokentrimmer/agent.toml"))
+            .expect("agent policy missing");
+        assert!(policy.content.contains("schema_version = 1"));
+        assert!(policy.content.contains("allowed_runners = []"));
+
+        let ignore = files
+            .iter()
+            .find(|file| file.dest.ends_with(".gitignore.append"))
+            .expect("gitignore append missing");
+        assert!(ignore.content.contains("!.tokentrimmer/\n"));
+        assert!(ignore.content.contains(".tokentrimmer/*\n"));
+        assert!(ignore.content.contains("!.tokentrimmer/agent.toml\n"));
+    }
 }

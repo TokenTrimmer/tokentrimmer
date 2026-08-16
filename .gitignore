@@ -26,9 +26,11 @@ dist/
 .env
 .env.*
 !.env.example
-# tt CLI credential/config store (~/.tokentrimmer is in $HOME, but guard against
-# a stray repo-local copy, e.g. a session_log path pointed inside a repo).
-.tokentrimmer/
+# tt CLI runtime state remains ignored if a store is accidentally pointed into
+# the repo. The reviewed agent policy is the sole committed exception.
+!.tokentrimmer/
+.tokentrimmer/*
+!.tokentrimmer/agent.toml
 
 # Claude Code session state (gitignored except the harness itself)
 .claude/AUDIT.log

@@ -98,10 +98,19 @@ pub fn azure_deployment(model: &str) -> Option<&str> {
 /// Single source of truth for local routing — used by the registry resolver,
 /// the same-provider exemption, and `LocalProvider`'s prefix strip.
 pub fn local_backend(model: &str) -> Option<&'static str> {
-    for id in ["ollama", "vllm", "lmstudio"] {
+    for id in [
+        "ollama", "vllm", "lmstudio", "llamacpp", "mlx", "tgi", "sglang",
+    ] {
         if let Some(rest) = model.strip_prefix(id).and_then(|r| r.strip_prefix('/')) {
             if !rest.is_empty() {
                 return Some(id);
+            }
+        }
+    }
+    if let Some(rest) = model.strip_prefix("local/") {
+        if let Some((profile, upstream_model)) = rest.split_once('/') {
+            if !profile.is_empty() && !upstream_model.is_empty() {
+                return Some("local");
             }
         }
     }
@@ -197,7 +206,14 @@ mod tests {
         assert_eq!(local_backend("ollama/llama3.1:8b"), Some("ollama"));
         assert_eq!(local_backend("vllm/Qwen2.5-7B"), Some("vllm"));
         assert_eq!(local_backend("lmstudio/phi-4"), Some("lmstudio"));
+        assert_eq!(local_backend("llamacpp/llama3"), Some("llamacpp"));
+        assert_eq!(local_backend("mlx/mistral-7b"), Some("mlx"));
+        assert_eq!(local_backend("tgi/falcon"), Some("tgi"));
+        assert_eq!(local_backend("sglang/deepseek"), Some("sglang"));
         assert_eq!(local_backend("ollama"), None);
+        assert_eq!(local_backend("local/gpu-a/Qwen/Qwen3-8B"), Some("local"));
+        assert_eq!(local_backend("local/gpu-a"), None);
+        assert_eq!(local_backend("local//model"), None);
         assert_eq!(local_backend("ollama/"), None);
         assert_eq!(local_backend("gpt-4o"), None);
         assert_eq!(local_backend(""), None);

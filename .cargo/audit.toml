@@ -5,4 +5,11 @@
 # RustSec has no patched rsa release. Remove this exception when SQLx no longer
 # resolves that backend or RustCrypto publishes a fix. Owner:
 # Security/Dependencies. Re-check 2026-09-15.
+# Informational lockfile warnings are tracked even when they are absent from
+# every compiled target and therefore are not valid cargo-deny exceptions:
+# `paste@1.0.15` (RUSTSEC-2024-0436) and `proc-macro-error2@2.0.1`
+# (RUSTSEC-2026-0173). `cargo tree -i <crate> --target all` is empty for both.
+# Owner: Security/Dependencies. Exposure: none in the compiled graph. Remove
+# when their optional resolver edges disappear; no maintained compatible
+# release exists today. Re-check 2026-09-15.
 ignore = ["RUSTSEC-2023-0071"]

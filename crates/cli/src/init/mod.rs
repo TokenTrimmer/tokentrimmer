@@ -124,6 +124,23 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
             skipped += 1;
             continue;
         }
+        // `.gitignore.append` is an instruction, never an output artifact.
+        // Handle it before Fresh/upgrade classification so a repository with
+        // no existing `.gitignore` still receives the merged target file.
+        if f.dest
+            .file_name()
+            .is_some_and(|name| name == ".gitignore.append")
+        {
+            let target = opts.root.join(".gitignore");
+            let current = std::fs::read_to_string(&target).unwrap_or_default();
+            let merged = append_gitignore(&current, &f.content);
+            if !opts.dry_run {
+                std::fs::write(target, merged)?;
+            }
+            written += 1;
+            ui::success("Updated .gitignore");
+            continue;
+        }
         let dest = opts.root.join(&f.dest);
 
         // Read disk current
@@ -134,8 +151,8 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
             classify_upgrade(&existing_manifest, &f.dest, disk_current.as_deref())
         } else if disk_current.is_none() {
             UpgradeAction::Fresh
-        } else if f.dest.ends_with(".gitignore.append") || f.dest.ends_with(".gitignore") {
-            UpgradeAction::SafeOverwrite // append-only, handled below
+        } else if f.dest.ends_with(".gitignore") {
+            UpgradeAction::SafeOverwrite
         } else {
             UpgradeAction::UserModified
         };
@@ -154,18 +171,7 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
                 ));
             }
             UpgradeAction::SafeOverwrite => {
-                let new_content = if f.dest.file_name().is_some_and(|n| n == ".gitignore.append") {
-                    let target_gitignore = opts.root.join(".gitignore");
-                    let existing_gi =
-                        std::fs::read_to_string(&target_gitignore).unwrap_or_default();
-                    let merged = append_gitignore(&existing_gi, &f.content);
-                    if !opts.dry_run {
-                        std::fs::write(&target_gitignore, &merged)?;
-                    }
-                    written += 1;
-                    ui::success("Updated .gitignore");
-                    continue;
-                } else if f.dest.ends_with("settings.json") {
+                let new_content = if f.dest.ends_with("settings.json") {
                     let existing = disk_current.as_deref().unwrap_or("{}");
                     let merged = merge_settings_json(existing, &f.content)?;
                     if !opts.dry_run {
@@ -278,4 +284,50 @@ fn set_mode(dest: &Path, mode: u32) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_dest: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(root: PathBuf) -> RunOptions {
+        RunOptions {
+            root,
+            language_override: Some("rust".into()),
+            framework_override: None,
+            interactive: false,
+            upgrade: false,
+            force: false,
+            diff_only: false,
+            skip_baseline: true,
+            skip_hooks: true,
+            skip_workflows: true,
+            dry_run: false,
+            tt_cli_version: "test".into(),
+        }
+    }
+
+    #[test]
+    fn fresh_init_merges_gitignore_instruction_and_commits_only_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+
+        run(options(temp.path().to_path_buf())).unwrap();
+        run(options(temp.path().to_path_buf())).unwrap();
+
+        assert!(!temp.path().join(".gitignore.append").exists());
+        assert!(temp.path().join(".tokentrimmer/agent.toml").exists());
+        let gitignore = std::fs::read_to_string(temp.path().join(".gitignore")).unwrap();
+        for pattern in [
+            "!.tokentrimmer/",
+            ".tokentrimmer/*",
+            "!.tokentrimmer/agent.toml",
+        ] {
+            assert_eq!(
+                gitignore.lines().filter(|line| *line == pattern).count(),
+                1,
+                "{pattern} must be present exactly once"
+            );
+        }
+    }
 }

@@ -147,6 +147,10 @@ bytes = "1.7"
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
+cap-std = "4.0.2"
+globset = "0.4.18"
+similar = "2.7.0"
+libc = "0.2"
 
 # Tests
 insta = { version = "1.40", features = ["json", "yaml", "redactions"] }

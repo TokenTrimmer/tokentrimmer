@@ -73,12 +73,24 @@
         1
       ],
       "write": "POST /v1/capabilities/preflight"
+    },
+    {
+      "family": "agent_cost_evidence",
+      "id": "tokentrimmer.agent-cost-evidence.v1",
+      "schema": "docs/agent-contract/agent-cost-evidence.schema.json",
+      "versions": [
+        1
+      ]
     }
   ],
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "82a98f44f254ffb8c594ffede616f145b784b494350143cbea41c4fe8e6f49fa"
+      "sha256": "ebf50bcdab2233b85cca08f78e91ea8ac2fdcc5593cf42931bbb0ba2d9012332"
+    },
+    {
+      "path": "docs/agent-contract/agent-cost-evidence.schema.json",
+      "sha256": "48e5e1899850a06b73ee762fe35aa00ea294c692b2de8ee2321c77612d6cbe5b"
     },
     {
       "path": "docs/capability-contract/gateway-capabilities.schema.json",
@@ -118,14 +130,14 @@
     },
     {
       "path": "sdk-python/tokentrimmer/product_contracts_generated.py",
-      "sha256": "ea8fe717bbfd16f754850e22904bf42f8a27dc20201c0d87739973cd37bf2d5c"
+      "sha256": "6f684a113218249f8ab61f45b1ab14130a0e4c00bae77677e2c639470b0477f5"
     },
     {
       "path": "sdk-typescript/src/product-contracts.generated.ts",
-      "sha256": "82a98f44f254ffb8c594ffede616f145b784b494350143cbea41c4fe8e6f49fa"
+      "sha256": "ebf50bcdab2233b85cca08f78e91ea8ac2fdcc5593cf42931bbb0ba2d9012332"
     }
   ],
-  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, and request-preflight response types",
+  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, request-preflight response types, and multi-basis agent cost evidence type",
   "python_sdk": "sdk-python/tokentrimmer/product_contracts_generated.py",
   "typescript": "bindings/product-contracts.generated.ts",
   "typescript_sdk": "sdk-typescript/src/product-contracts.generated.ts"

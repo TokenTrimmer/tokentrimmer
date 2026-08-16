@@ -106,6 +106,69 @@ input_per_million = 30.00
 output_per_million = 180.00
 effective_at = "2026-05-31T00:00:00Z"
 
+# Added 2026-08-16 — verified vs OpenRouter and OpenAI current catalog.
+[[entry]]
+provider = "openai"
+model = "gpt-5.6-sol"
+input_per_million = 5.00
+output_per_million = 30.00
+cached_input_per_million = 0.50
+cache_write_per_million = 6.25
+batch_input_per_million = 2.50
+batch_output_per_million = 15.00
+flex_input_per_million = 2.50
+flex_output_per_million = 15.00
+prompt_cache_min_tokens = 1024
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openai"
+model = "gpt-5.6-terra"
+input_per_million = 1.00
+output_per_million = 6.00
+cached_input_per_million = 0.10
+cache_write_per_million = 1.25
+batch_input_per_million = 0.50
+batch_output_per_million = 3.00
+flex_input_per_million = 0.50
+flex_output_per_million = 3.00
+prompt_cache_min_tokens = 1024
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openai"
+model = "gpt-5.6-luna"
+input_per_million = 0.10
+output_per_million = 0.60
+cached_input_per_million = 0.01
+cache_write_per_million = 0.125
+batch_input_per_million = 0.05
+batch_output_per_million = 0.30
+flex_input_per_million = 0.05
+flex_output_per_million = 0.30
+prompt_cache_min_tokens = 1024
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openai"
+model = "gpt-4.1"
+input_per_million = 2.00
+output_per_million = 8.00
+cached_input_per_million = 0.50
+batch_input_per_million = 1.00
+batch_output_per_million = 4.00
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openai"
+model = "gpt-4.1-mini"
+input_per_million = 0.40
+output_per_million = 1.60
+cached_input_per_million = 0.10
+batch_input_per_million = 0.20
+batch_output_per_million = 0.80
+effective_at = "2026-08-16T00:00:00Z"
+
 # Legacy: gpt-4o / gpt-4o-mini / o3 / o4-mini / text-embedding-3-* are no longer
 # on OpenAI's current pricing page (2026-05-31). Rows retained for historical
 # replay (PricingCatalog::at) — do NOT delete; their effective_at predates any
@@ -230,6 +293,31 @@ batch_output_per_million = 12.50
 prompt_cache_min_tokens = 4096
 effective_at = "2026-05-31T00:00:00Z"
 
+# Added 2026-08-16 — verified vs Anthropic and OpenRouter current catalog.
+[[entry]]
+provider = "anthropic"
+model = "claude-sonnet-5"
+input_per_million = 2.00
+output_per_million = 10.00
+cached_input_per_million = 0.20
+cache_write_per_million = 2.50
+batch_input_per_million = 1.00
+batch_output_per_million = 5.00
+prompt_cache_min_tokens = 2048
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "anthropic"
+model = "claude-opus-5"
+input_per_million = 5.00
+output_per_million = 25.00
+cached_input_per_million = 0.50
+cache_write_per_million = 6.25
+batch_input_per_million = 2.50
+batch_output_per_million = 12.50
+prompt_cache_min_tokens = 4096
+effective_at = "2026-08-16T00:00:00Z"
+
 # ── Google Gemini ─────────────────────────────────────────────────────────────
 # Headline rate is the ≤200K-token bracket; >200K bracket pricing is a v2 item.
 # batch_{input,output}_per_million is the Batch-mode rate — a flat 50% of
@@ -265,6 +353,37 @@ cached_input_per_million = 0.20
 batch_input_per_million = 1.00
 batch_output_per_million = 6.00
 effective_at = "2026-05-01T00:00:00Z"
+
+# Added 2026-08-16 — verified vs Google Gemini and OpenRouter current catalog.
+[[entry]]
+provider = "gemini"
+model = "gemini-3.7-flash"
+input_per_million = 0.375
+output_per_million = 1.875
+cached_input_per_million = 0.0375
+batch_input_per_million = 0.1875
+batch_output_per_million = 0.9375
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "gemini"
+model = "gemini-3.6-flash"
+input_per_million = 0.75
+output_per_million = 3.75
+cached_input_per_million = 0.075
+batch_input_per_million = 0.375
+batch_output_per_million = 1.875
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "gemini"
+model = "gemini-3.5-flash-lite"
+input_per_million = 0.30
+output_per_million = 2.50
+cached_input_per_million = 0.03
+batch_input_per_million = 0.15
+batch_output_per_million = 1.25
+effective_at = "2026-08-16T00:00:00Z"
 
 # ── Groq ──────────────────────────────────────────────────────────────────────
 [[entry]]
@@ -448,3 +567,136 @@ model = "mistralai/mistral-large"
 input_per_million = 2.00
 output_per_million = 6.00
 effective_at = "2026-05-01T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "qwen/qwen3.8-max"
+input_per_million = 2.00
+output_per_million = 6.00
+cached_input_per_million = 0.25
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "qwen/qwen3.8-27b"
+input_per_million = 0.45
+output_per_million = 3.20
+cached_input_per_million = 0.05
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "qwen/qwen3.7-max"
+input_per_million = 1.475
+output_per_million = 4.425
+cached_input_per_million = 0.295
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "qwen/qwen3.7-plus"
+input_per_million = 0.32
+output_per_million = 1.28
+cached_input_per_million = 0.064
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "qwen/qwen3.7-flash"
+input_per_million = 0.03
+output_per_million = 0.13
+cached_input_per_million = 0.006
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "qwen/qwen3-coder-plus"
+input_per_million = 0.65
+output_per_million = 3.25
+cached_input_per_million = 0.13
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "z-ai/glm-5.2"
+input_per_million = 0.308
+output_per_million = 0.968
+cached_input_per_million = 0.0572
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "z-ai/glm-5.1"
+input_per_million = 0.966
+output_per_million = 3.036
+cached_input_per_million = 0.1794
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "z-ai/glm-5"
+input_per_million = 0.60
+output_per_million = 1.92
+cached_input_per_million = 0.12
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "z-ai/glm-4.7-flash"
+input_per_million = 0.06
+output_per_million = 0.40
+cached_input_per_million = 0.01
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "moonshotai/kimi-k3"
+input_per_million = 3.00
+output_per_million = 15.00
+cached_input_per_million = 0.30
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "moonshotai/kimi-k2.7-code"
+input_per_million = 0.71
+output_per_million = 3.50
+cached_input_per_million = 0.15
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "moonshotai/kimi-k2.6"
+input_per_million = 0.5415
+output_per_million = 2.28
+cached_input_per_million = 0.0912
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "deepseek/deepseek-v4-pro"
+input_per_million = 1.168
+output_per_million = 2.336
+cached_input_per_million = 0.0986
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "deepseek/deepseek-v4-flash"
+input_per_million = 0.0615
+output_per_million = 0.1229
+cached_input_per_million = 0.0123
+effective_at = "2026-08-16T00:00:00Z"
+
+[[entry]]
+provider = "openrouter"
+model = "meta-llama/llama-4-maverick"
+input_per_million = 0.20
+output_per_million = 0.80
+effective_at = "2026-08-16T00:00:00Z"
+[[entry]]
+provider = "openrouter"
+model = "meta-llama/llama-4-scout"
+input_per_million = 0.10
+output_per_million = 0.30
+effective_at = "2026-08-16T00:00:00Z"

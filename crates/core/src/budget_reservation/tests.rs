@@ -9,7 +9,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use futures::stream::BoxStream;
 use tokio::sync::Mutex;
 use tt_shared::{
-    context::{ProviderCredentials, SecretString},
+    context::{ProviderCredentials, RunBudgetSettlementBasis, RunBudgetState, SecretString},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ModelInfo, ModelPricing,
     Provider, ProviderError, RequestContext, Usage,
 };
@@ -169,6 +169,66 @@ async fn denied_reservation_prevents_provider_dispatch() {
 }
 
 #[tokio::test]
+async fn run_cap_rejects_before_durable_reservation_or_provider_dispatch() {
+    let provider = Arc::new(MeteredProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(RecordingStore {
+        deny: false,
+        reserved: Mutex::new(vec![]),
+        settled: Mutex::new(vec![]),
+        dispatches: Mutex::new(vec![]),
+        settlement_bases: Mutex::new(vec![]),
+    });
+    let budgeted = BudgetedProvider::new(
+        Arc::clone(&provider) as Arc<dyn Provider>,
+        Arc::clone(&store) as Arc<dyn BudgetReservationStore>,
+    );
+    let run_budget = RunBudgetState::from_usd(0.0, 0.0).unwrap();
+    let mut ctx = request_context();
+    ctx.budget_dispatch = ctx
+        .budget_dispatch
+        .with_run_budget(Some(run_budget.clone()));
+
+    let result = budgeted.chat_completion(bounded_request(), &ctx).await;
+    assert!(matches!(result, Err(ProviderError::BudgetExceeded { .. })));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert!(store.reserved.lock().await.is_empty());
+    assert!(run_budget.snapshot().components.is_empty());
+}
+
+#[tokio::test]
+async fn durable_rejection_releases_the_run_reservation() {
+    let provider = Arc::new(MeteredProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(RecordingStore {
+        deny: true,
+        reserved: Mutex::new(vec![]),
+        settled: Mutex::new(vec![]),
+        dispatches: Mutex::new(vec![]),
+        settlement_bases: Mutex::new(vec![]),
+    });
+    let budgeted = BudgetedProvider::new(
+        Arc::clone(&provider) as Arc<dyn Provider>,
+        Arc::clone(&store) as Arc<dyn BudgetReservationStore>,
+    );
+    let run_budget = RunBudgetState::from_usd(1.0, 0.0).unwrap();
+    let mut ctx = request_context();
+    ctx.budget_dispatch = ctx
+        .budget_dispatch
+        .with_run_budget(Some(run_budget.clone()));
+
+    let result = budgeted.chat_completion(bounded_request(), &ctx).await;
+    assert!(matches!(result, Err(ProviderError::BudgetExceeded { .. })));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    let snapshot = run_budget.snapshot();
+    assert_eq!(snapshot.reserved_micros, 0);
+    assert_eq!(snapshot.settled_micros, 0);
+    assert!(snapshot.components.is_empty());
+}
+
+#[tokio::test]
 async fn admitted_call_settles_to_provider_reported_usage() {
     let provider = Arc::new(MeteredProvider {
         calls: AtomicUsize::new(0),
@@ -199,6 +259,49 @@ async fn admitted_call_settles_to_provider_reported_usage() {
         store.settlement_bases.lock().await.as_slice(),
         &[SettlementBasis::ProviderUsage]
     );
+}
+
+#[tokio::test]
+async fn admitted_provider_usage_settles_both_durable_and_run_ledgers() {
+    let provider = Arc::new(MeteredProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(RecordingStore {
+        deny: false,
+        reserved: Mutex::new(vec![]),
+        settled: Mutex::new(vec![]),
+        dispatches: Mutex::new(vec![]),
+        settlement_bases: Mutex::new(vec![]),
+    });
+    let budgeted = BudgetedProvider::new(
+        Arc::clone(&provider) as Arc<dyn Provider>,
+        Arc::clone(&store) as Arc<dyn BudgetReservationStore>,
+    );
+    let run_budget = RunBudgetState::from_usd(1.0, 0.0).unwrap();
+    let mut ctx = request_context();
+    ctx.budget_dispatch = ctx
+        .budget_dispatch
+        .with_run_budget(Some(run_budget.clone()));
+
+    budgeted
+        .chat_completion(bounded_request(), &ctx)
+        .await
+        .unwrap();
+
+    let snapshot = run_budget.snapshot();
+    assert_eq!(snapshot.components.len(), 1);
+    assert_eq!(snapshot.reserved_micros, 0);
+    assert_eq!(
+        snapshot.settled_micros,
+        snapshot.components[0].settled_micros
+    );
+    assert_eq!(snapshot.components[0].provider, "openai");
+    assert_eq!(snapshot.components[0].operation, "chat");
+    assert_eq!(
+        snapshot.components[0].basis,
+        RunBudgetSettlementBasis::ProviderUsage
+    );
+    assert_eq!(store.settled.lock().await.len(), 1);
 }
 
 #[tokio::test]

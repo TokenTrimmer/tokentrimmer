@@ -4,6 +4,7 @@
 //! part of those contracts. It does not own request orchestration or I/O.
 //! See `docs/02-provider-adapter-guide.md` for the Provider trait.
 
+pub mod agent_cost;
 pub mod batch_advisor;
 pub mod capability_check;
 pub mod content_kind;
@@ -23,6 +24,13 @@ pub mod request_preflight;
 pub mod url_guard;
 pub mod usage;
 
+pub use agent_cost::{
+    AgentCostBasis, AgentCostComponent, AgentCostPurpose, AgentCostValidationError,
+    AgentRunCostEvidence, ApiMeteredEvidence, ExpectedAgentCostBasis, SubscriptionQuotaEvidence,
+    SubscriptionQuotaUnit, UnmeasuredCostReason, UnmeasuredCostReasonCode,
+    AGENT_COST_COMPONENTS_MAX, AGENT_COST_REASONS_MAX, AGENT_COST_SCHEMA_ID,
+    AGENT_COST_SCHEMA_VERSION,
+};
 pub use batch_advisor::{
     project_batch_savings, project_batch_savings_with_tags, BatchFinding, RequestAggregate,
     DEFAULT_BATCH_ELIGIBLE_TAGS,

@@ -41,6 +41,10 @@ reqwest.workspace = true
 regex.workspace = true
 percent-encoding.workspace = true
 
+cap-std.workspace = true
+globset.workspace = true
+similar.workspace = true
+libc.workspace = true
 axum.workspace = true
 clap.workspace = true
 # Shell-completion + man-page generation for the hidden `tt completions`/`tt man`

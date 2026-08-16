@@ -6,7 +6,12 @@ use futures::{stream::BoxStream, StreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tt_shared::{
-    context::BudgetDispatchState, messages::EmbeddingInput, pricing::CacheWriteTier,
+    context::{
+        BudgetDispatchState, RunBudgetAdmissionError, RunBudgetReservation,
+        RunBudgetSettlementBasis, RunBudgetState,
+    },
+    messages::EmbeddingInput,
+    pricing::CacheWriteTier,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
@@ -64,6 +69,16 @@ pub(crate) fn derive_budget_dispatch(
     }
 }
 
+struct ProviderReservations {
+    durable: Option<BudgetReservation>,
+    run: Option<(RunBudgetState, RunBudgetReservation)>,
+}
+
+impl ProviderReservations {
+    fn is_empty(&self) -> bool {
+        self.durable.is_none() && self.run.is_none()
+    }
+}
 impl BudgetedProvider {
     pub(crate) fn new(inner: Arc<dyn Provider>, store: Arc<dyn BudgetReservationStore>) -> Self {
         let model_limits = inner
@@ -151,8 +166,37 @@ impl BudgetedProvider {
         dispatch: BudgetDispatch,
         model: &str,
         estimated_usd: Option<f64>,
-    ) -> Result<Option<BudgetReservation>, ProviderError> {
-        match self
+    ) -> Result<ProviderReservations, ProviderError> {
+        let run = if let Some(run_budget) = ctx.budget_dispatch.run_budget() {
+            let reservation = run_budget
+                .reserve(
+                    dispatch.key,
+                    dispatch.provider,
+                    dispatch.kind.as_str(),
+                    model,
+                    estimated_usd,
+                )
+                .map_err(|error| match error {
+                    RunBudgetAdmissionError::PriceUnknown { model } => {
+                        ProviderError::BudgetPriceUnknown { model }
+                    }
+                    RunBudgetAdmissionError::Exceeded {
+                        estimated_micros,
+                        remaining_micros,
+                    } => ProviderError::BudgetExceeded {
+                        estimated_usd: estimated_micros as f64 / 1_000_000.0,
+                        remaining_usd: remaining_micros as f64 / 1_000_000.0,
+                    },
+                    RunBudgetAdmissionError::DuplicateDispatch => ProviderError::BudgetUnavailable(
+                        "run budget dispatch was already admitted".to_string(),
+                    ),
+                })?;
+            Some((run_budget.clone(), reservation))
+        } else {
+            None
+        };
+
+        let durable = match self
             .store
             .reserve(BudgetReservationRequest {
                 org_id: ctx.org_id,
@@ -165,33 +209,57 @@ impl BudgetedProvider {
             })
             .await
         {
-            Ok(ReservationAdmission::NotCapped) => Ok(None),
-            Ok(ReservationAdmission::Reserved(reservation)) => Ok(Some(reservation)),
-            Err(BudgetReservationError::Exceeded {
-                estimated_usd,
-                remaining_usd,
-            }) => Err(ProviderError::BudgetExceeded {
-                estimated_usd,
-                remaining_usd,
-            }),
-            Err(BudgetReservationError::PriceUnknown { model }) => {
-                Err(ProviderError::BudgetPriceUnknown { model })
+            Ok(ReservationAdmission::NotCapped) => None,
+            Ok(ReservationAdmission::Reserved(reservation)) => Some(reservation),
+            Err(error) => {
+                if let Some((run_budget, reservation)) = run {
+                    run_budget.release(reservation);
+                }
+                return Err(match error {
+                    BudgetReservationError::Exceeded {
+                        estimated_usd,
+                        remaining_usd,
+                    } => ProviderError::BudgetExceeded {
+                        estimated_usd,
+                        remaining_usd,
+                    },
+                    BudgetReservationError::PriceUnknown { model } => {
+                        ProviderError::BudgetPriceUnknown { model }
+                    }
+                    BudgetReservationError::Unavailable(message) => {
+                        ProviderError::BudgetUnavailable(message)
+                    }
+                });
             }
-            Err(BudgetReservationError::Unavailable(message)) => {
-                Err(ProviderError::BudgetUnavailable(message))
-            }
-        }
+        };
+        Ok(ProviderReservations { durable, run })
     }
 
     async fn settle_best_effort(
         &self,
-        reservation: BudgetReservation,
-        actual_usd: f64,
+        reservations: ProviderReservations,
+        actual_usd: Option<f64>,
         basis: SettlementBasis,
     ) {
+        if let Some((run_budget, reservation)) = reservations.run {
+            run_budget.settle(
+                reservation,
+                actual_usd,
+                match basis {
+                    SettlementBasis::ProviderUsage => RunBudgetSettlementBasis::ProviderUsage,
+                    SettlementBasis::ConservativeEstimate => {
+                        RunBudgetSettlementBasis::ConservativeEstimate
+                    }
+                },
+            );
+        }
+        let Some(reservation) = reservations.durable else {
+            return;
+        };
+        let settled_usd = actual_usd.unwrap_or(reservation.estimated_usd);
         if let Err(error) = self
             .store
-            .settle(reservation, actual_usd, basis, Utc::now())
+            .settle(reservation, settled_usd, basis, Utc::now())
             .await
         {
             // Keep the provider response: returning an error after upstream
@@ -237,20 +305,36 @@ fn usage_cost(usage: &Usage, pricing: &ModelPricing, fee_multiplier: f64) -> f64
 
 struct StreamSettlementGuard {
     store: Arc<dyn BudgetReservationStore>,
-    reservation: BudgetReservation,
-    completed: bool,
+    durable: Option<BudgetReservation>,
+    run: Option<(RunBudgetState, RunBudgetReservation)>,
 }
 
 impl StreamSettlementGuard {
-    async fn settle(&mut self, actual_usd: f64, basis: SettlementBasis) {
+    async fn settle(&mut self, actual_usd: Option<f64>, basis: SettlementBasis) {
+        if let Some((run_budget, reservation)) = self.run.take() {
+            run_budget.settle(
+                reservation,
+                actual_usd,
+                match basis {
+                    SettlementBasis::ProviderUsage => RunBudgetSettlementBasis::ProviderUsage,
+                    SettlementBasis::ConservativeEstimate => {
+                        RunBudgetSettlementBasis::ConservativeEstimate
+                    }
+                },
+            );
+        }
+        let Some(reservation) = self.durable else {
+            return;
+        };
+        let settled_usd = actual_usd.unwrap_or(reservation.estimated_usd);
         match self
             .store
-            .settle(self.reservation, actual_usd, basis, Utc::now())
+            .settle(reservation, settled_usd, basis, Utc::now())
             .await
         {
-            Ok(()) => self.completed = true,
+            Ok(()) => self.durable = None,
             Err(error) => tracing::error!(
-                reservation_id = %self.reservation.id,
+                reservation_id = %reservation.id,
                 error = %error,
                 "stream budget settlement failed; reservation remains active"
             ),
@@ -260,14 +344,20 @@ impl StreamSettlementGuard {
 
 impl Drop for StreamSettlementGuard {
     fn drop(&mut self) {
-        if self.completed {
-            return;
+        if let Some((run_budget, reservation)) = self.run.take() {
+            run_budget.settle(
+                reservation,
+                None,
+                RunBudgetSettlementBasis::ConservativeEstimate,
+            );
         }
+        let Some(reservation) = self.durable.take() else {
+            return;
+        };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let store = Arc::clone(&self.store);
-        let reservation = self.reservation;
         runtime.spawn(async move {
             if let Err(error) = store
                 .settle(
@@ -325,7 +415,7 @@ impl Provider for BudgetedProvider {
     ) -> Result<ChatCompletionResponse, ProviderError> {
         let canonical = canonical_request(&req)?;
         let dispatch = self.dispatch(ctx, BudgetDispatchKind::Chat, &req.model, &canonical);
-        let reservation = self
+        let reservations = self
             .reserve(
                 ctx,
                 dispatch,
@@ -335,19 +425,17 @@ impl Provider for BudgetedProvider {
             .await?;
         let model = req.model.clone();
         let result = self.inner.chat_completion(req, ctx).await;
-        if let Some(reservation) = reservation {
-            let settlement = result
-                .as_ref()
-                .ok()
-                .and_then(|response| self.actual_cost(&model, &response.usage))
-                .map(|actual_usd| (actual_usd, SettlementBasis::ProviderUsage))
-                .unwrap_or((
-                    reservation.estimated_usd,
-                    SettlementBasis::ConservativeEstimate,
-                ));
-            self.settle_best_effort(reservation, settlement.0, settlement.1)
-                .await;
-        }
+        let actual_usd = result
+            .as_ref()
+            .ok()
+            .and_then(|response| self.actual_cost(&model, &response.usage));
+        let basis = if actual_usd.is_some() {
+            SettlementBasis::ProviderUsage
+        } else {
+            SettlementBasis::ConservativeEstimate
+        };
+        self.settle_best_effort(reservations, actual_usd, basis)
+            .await;
         result
     }
 
@@ -358,7 +446,7 @@ impl Provider for BudgetedProvider {
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
         let canonical = canonical_request(&req)?;
         let dispatch = self.dispatch(ctx, BudgetDispatchKind::ChatStream, &req.model, &canonical);
-        let reservation = self
+        let reservations = self
             .reserve(
                 ctx,
                 dispatch,
@@ -368,29 +456,24 @@ impl Provider for BudgetedProvider {
             .await?;
         let model = req.model.clone();
         let result = self.inner.chat_completion_stream(req, ctx).await;
-        let Some(reservation) = reservation else {
+        if reservations.is_empty() {
             return result;
-        };
+        }
         let stream = match result {
             Ok(stream) => stream,
             Err(error) => {
-                self.settle_best_effort(
-                    reservation,
-                    reservation.estimated_usd,
-                    SettlementBasis::ConservativeEstimate,
-                )
-                .await;
+                self.settle_best_effort(reservations, None, SettlementBasis::ConservativeEstimate)
+                    .await;
                 return Err(error);
             }
         };
 
-        let store = Arc::clone(&self.store);
         let pricing = self.inner.pricing(&model);
         let fee_multiplier = self.inner.fee_multiplier();
         let guard = StreamSettlementGuard {
-            store,
-            reservation,
-            completed: false,
+            store: Arc::clone(&self.store),
+            durable: reservations.durable,
+            run: reservations.run,
         };
         Ok(futures::stream::unfold(
             (stream, guard, None::<Usage>),
@@ -407,20 +490,16 @@ impl Provider for BudgetedProvider {
                             Some((item, (stream, guard, usage)))
                         }
                         None => {
-                            let settlement = usage
+                            let actual_usd = usage
                                 .as_ref()
                                 .zip(pricing.as_ref())
-                                .map(|(usage, pricing)| {
-                                    (
-                                        usage_cost(usage, pricing, fee_multiplier),
-                                        SettlementBasis::ProviderUsage,
-                                    )
-                                })
-                                .unwrap_or((
-                                    guard.reservation.estimated_usd,
-                                    SettlementBasis::ConservativeEstimate,
-                                ));
-                            guard.settle(settlement.0, settlement.1).await;
+                                .map(|(usage, pricing)| usage_cost(usage, pricing, fee_multiplier));
+                            let basis = if actual_usd.is_some() {
+                                SettlementBasis::ProviderUsage
+                            } else {
+                                SettlementBasis::ConservativeEstimate
+                            };
+                            guard.settle(actual_usd, basis).await;
                             None
                         }
                     }
@@ -437,7 +516,7 @@ impl Provider for BudgetedProvider {
     ) -> Result<EmbeddingsResponse, ProviderError> {
         let canonical = canonical_request(&req)?;
         let dispatch = self.dispatch(ctx, BudgetDispatchKind::Embeddings, &req.model, &canonical);
-        let reservation = self
+        let reservations = self
             .reserve(
                 ctx,
                 dispatch,
@@ -447,19 +526,17 @@ impl Provider for BudgetedProvider {
             .await?;
         let model = req.model.clone();
         let result = self.inner.embeddings(req, ctx).await;
-        if let Some(reservation) = reservation {
-            let settlement = result
-                .as_ref()
-                .ok()
-                .and_then(|response| self.actual_cost(&model, &response.usage))
-                .map(|actual_usd| (actual_usd, SettlementBasis::ProviderUsage))
-                .unwrap_or((
-                    reservation.estimated_usd,
-                    SettlementBasis::ConservativeEstimate,
-                ));
-            self.settle_best_effort(reservation, settlement.0, settlement.1)
-                .await;
-        }
+        let actual_usd = result
+            .as_ref()
+            .ok()
+            .and_then(|response| self.actual_cost(&model, &response.usage));
+        let basis = if actual_usd.is_some() {
+            SettlementBasis::ProviderUsage
+        } else {
+            SettlementBasis::ConservativeEstimate
+        };
+        self.settle_best_effort(reservations, actual_usd, basis)
+            .await;
         result
     }
 

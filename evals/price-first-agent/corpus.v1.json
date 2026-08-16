@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "id": "tokentrimmer-local-agent-corpus-2026-08-15",
+  "runner": "codex-sdk",
+  "models": {
+    "cheap_only": "openai/gpt-5.4-mini",
+    "fixed_premium": "openai/gpt-5.6-sol"
+  },
+  "allocated_plan_micros_per_run": 1000,
+  "tasks": [
+    {
+      "id": "rust-inclusive-boundary",
+      "prompt": "Fix the inclusive limit bug in src/lib.rs. Keep the public signature and make the smallest clear change that passes the existing tests. Change no test and no file outside src/.",
+      "files": {
+        "src/lib.rs": "pub fn within_limit(value: u32, limit: u32) -> bool {\n    value < limit\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn includes_the_limit_and_rejects_values_above_it() {\n        assert!(within_limit(9, 10));\n        assert!(within_limit(10, 10));\n        assert!(!within_limit(11, 10));\n    }\n}\n"
+      },
+      "allowed_changed_paths": ["src/lib.rs"],
+      "validation": [
+        {"executable": "rustc", "args": ["--edition=2021", "--test", "src/lib.rs", "-o", "boundary-test"]},
+        {"executable": "./boundary-test", "args": []}
+      ]
+    },
+    {
+      "id": "js-strict-port-parser",
+      "prompt": "Repair parsePort in src/parse.mjs so it accepts only a complete decimal integer string in the inclusive TCP port range 1..65535 and throws RangeError otherwise. Preserve the export and change no test or file outside src/.",
+      "files": {
+        "src/parse.mjs": "export function parsePort(raw) {\n  return Number.parseInt(raw, 10);\n}\n",
+        "test.mjs": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { parsePort } from './src/parse.mjs';\n\ntest('accepts valid ports', () => {\n  assert.equal(parsePort('1'), 1);\n  assert.equal(parsePort('443'), 443);\n  assert.equal(parsePort('65535'), 65535);\n});\n\ntest('rejects partial, noncanonical, and out-of-range inputs', () => {\n  for (const value of ['0', '65536', '12x', '1.5', '', ' 80', '+80']) {\n    assert.throws(() => parsePort(value), RangeError);\n  }\n});\n"
+      },
+      "allowed_changed_paths": ["src/parse.mjs"],
+      "validation": [
+        {"executable": "node", "args": ["--test", "test.mjs"]}
+      ]
+    },
+    {
+      "id": "js-two-file-api-rename",
+      "prompt": "Rename the exported constant DEFAULT_TIMEOUT to DEFAULT_REQUEST_TIMEOUT and migrate every source caller without leaving an alias. Preserve behavior. Change only src/options.mjs and src/client.mjs; do not edit the test.",
+      "files": {
+        "src/options.mjs": "export const DEFAULT_TIMEOUT = 500;\n",
+        "src/client.mjs": "import { DEFAULT_TIMEOUT } from './options.mjs';\n\nexport function requestOptions(timeout = DEFAULT_TIMEOUT) {\n  return { timeout };\n}\n",
+        "test.mjs": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { DEFAULT_REQUEST_TIMEOUT } from './src/options.mjs';\nimport { requestOptions } from './src/client.mjs';\n\ntest('renamed default remains the client default', () => {\n  assert.equal(DEFAULT_REQUEST_TIMEOUT, 500);\n  assert.deepEqual(requestOptions(), { timeout: 500 });\n  assert.deepEqual(requestOptions(25), { timeout: 25 });\n});\n"
+      },
+      "allowed_changed_paths": ["src/options.mjs", "src/client.mjs"],
+      "validation": [
+        {"executable": "node", "args": ["--test", "test.mjs"]}
+      ]
+    }
+  ]
+}

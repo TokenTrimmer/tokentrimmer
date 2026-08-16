@@ -28,7 +28,6 @@ pub(crate) struct WorkflowRunStartRelease {
 ///
 /// Emitted node-by-node as the workflow executes; `NodeDone` carries the
 /// live cost burndown so the client can update progress in real time.
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub(crate) enum WfEvent {
@@ -104,7 +103,6 @@ impl WfEvent {
     ///
     /// Mirrors `RunEvent::to_sse` from `routes/agent_run.rs` exactly:
     /// `Event::default().event(name).data(serde_json::to_string(self).unwrap_or_default())`.
-    #[allow(dead_code)]
     pub(crate) fn to_sse(&self) -> sse::Event {
         sse::Event::default()
             .event(self.event_name())

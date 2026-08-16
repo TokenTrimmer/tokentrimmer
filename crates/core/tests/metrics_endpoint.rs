@@ -31,7 +31,13 @@ async fn get(app: axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap
 
 #[tokio::test]
 async fn metrics_endpoint_serves_prometheus_text() {
-    let (status, headers, body) = get(router(), "/metrics").await;
+    let app = router();
+    tt_core::metrics::record_request_measurement(
+        "chat",
+        tt_shared::RequestDeltaEvidenceState::Measured,
+    );
+    tt_core::metrics::record_model_catalog_refresh("openrouter", "success", Some(42));
+    let (status, headers, body) = get(app, "/metrics").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers
@@ -44,6 +50,26 @@ async fn metrics_endpoint_serves_prometheus_text() {
     assert!(
         body.contains("process_uptime_seconds"),
         "uptime missing: {body}"
+    );
+    assert!(
+        body.contains("tt_pricing_catalog_newest_effective_at_seconds"),
+        "pricing catalog timestamp missing: {body}"
+    );
+    assert!(
+        body.contains("tt_pricing_catalog_entries_total"),
+        "pricing catalog entry count missing: {body}"
+    );
+    assert!(
+        body.contains("tt_request_measurement_total"),
+        "request measurement counter missing: {body}"
+    );
+    assert!(
+        body.contains("tt_model_catalog_last_success_timestamp_seconds"),
+        "model catalog refresh timestamp missing: {body}"
+    );
+    assert!(
+        body.contains("tt_model_catalog_models"),
+        "model catalog model count missing: {body}"
     );
 }
 

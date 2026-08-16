@@ -164,3 +164,5 @@ with receipts") is honest.
   `tt verify-receipt`.
 - `docs/tt-init-usage.md` + `docs/tt-mcp-usage.md` — the usage detail.
 - The VCR primitive: `crates/telemetry/src/vcr.rs` (`vcr:v1|` canonical payload).
+- `docs/price-first-agent-threat-model.md` — the security boundary and
+  multi-basis cost contract required before a local coding-agent beta.

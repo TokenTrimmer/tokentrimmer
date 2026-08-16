@@ -28,6 +28,7 @@
 //! `Host`/`Origin` guard + a 1 MiB body cap — see [`super::guard`].
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -73,11 +74,35 @@ struct AppState {
 /// `Authorization: Bearer <auth_token>` and a loopback Host/Origin on every
 /// request. Runs until SIGINT/SIGTERM.
 pub async fn run(server: Server, addr: SocketAddr, auth_token: String) -> Result<(), McpError> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| McpError::Internal(format!("bind {addr}: {e}")))?;
+    run_on_listener(
+        server,
+        listener,
+        auth_token,
+        super::guard::shutdown_signal("MCP Streamable HTTP"),
+    )
+    .await
+}
+
+/// Serve on an already-bound listener until `shutdown` resolves.
+///
+/// Embedders use this to bind port zero without a reserve/drop/rebind race and
+/// to tie the loopback broker's lifetime to one local agent run.
+pub async fn run_on_listener(
+    server: Server,
+    listener: tokio::net::TcpListener,
+    auth_token: String,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), McpError> {
+    let addr = listener
+        .local_addr()
+        .map_err(|e| McpError::Internal(format!("inspect listener address: {e}")))?;
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         server: Arc::new(server),
     };
-
     let app = axum::Router::new()
         .route("/mcp", mcp_endpoint())
         .with_state(state)
@@ -87,18 +112,11 @@ pub async fn run(server: Server, addr: SocketAddr, auth_token: String) -> Result
             super::guard::guard,
         ));
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| McpError::Internal(format!("bind {addr}: {e}")))?;
-
     tracing::info!(addr = %addr, "MCP Streamable HTTP server listening (bearer-auth, loopback-only)");
-
     axum::serve(listener, app)
-        .with_graceful_shutdown(super::guard::shutdown_signal("MCP Streamable HTTP"))
+        .with_graceful_shutdown(shutdown)
         .await
-        .map_err(|e| McpError::Internal(format!("Streamable HTTP server: {e}")))?;
-
-    Ok(())
+        .map_err(|e| McpError::Internal(format!("Streamable HTTP server: {e}")))
 }
 
 /// Single endpoint multiplexing POST / GET / DELETE on `/mcp`.

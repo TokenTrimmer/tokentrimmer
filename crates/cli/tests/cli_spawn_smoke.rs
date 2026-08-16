@@ -347,6 +347,27 @@ fn retrieval_help_labels_subcommands_experimental() {
 }
 
 #[test]
+fn proxy_help_is_generated_from_runtime_mode_contracts() {
+    let home = tempfile::tempdir().unwrap();
+    let output = output_tt(home.path(), &["proxy", "--help"]);
+    assert!(output.status.success(), "`tt proxy --help` exited non-zero");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for mode in [
+        tt_cli::proxy::config::Mode::Gateway,
+        tt_cli::proxy::config::Mode::Bypass,
+        tt_cli::proxy::config::Mode::Hybrid,
+    ] {
+        let contract = mode.contract();
+        assert!(
+            stdout.contains(contract.name) && stdout.contains(contract.help),
+            "`tt proxy --help` omitted the runtime contract for {}:\n{stdout}",
+            contract.name
+        );
+    }
+}
+
+#[test]
 fn proxy_spawns_without_panic() {
     // Long-running server on an ephemeral port; killed after the grace window.
     // This is the arm that used to die on a nested Runtime::block_on.

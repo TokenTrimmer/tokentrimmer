@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 mod audit;
 use audit::AuditAction;
@@ -20,7 +20,7 @@ use tt_cli::eval_shadow::EvalAction;
 /// list keeps each command's one-line description.
 const COMMAND_GROUPS: &str = "\
 Command groups:
-  Run             gateway, proxy, chat, agent, embed, models, capabilities, batch
+  Run             gateway, proxy, chat, agent, code, embed, models, capabilities, batch
   Optimize        inspect, plan, route, recipes, advise, workflow
   Prove           audit, verify-receipt
   Account         login, logout, whoami, connect
@@ -494,6 +494,11 @@ enum Command {
         #[arg(long, global = true)]
         tt_api_base: Option<String>,
     },
+    /// Run a policy-bound local coding agent through an official vendor SDK.
+    Code {
+        #[command(subcommand)]
+        action: CodeAction,
+    },
     /// Async Batch Lane: submit a JSONL file, list/get/cancel batches, download results.
     Batch {
         #[command(subcommand)]
@@ -636,6 +641,63 @@ enum AgentAction {
     },
     /// List recent agent runs for the authenticated org (newest first, up to 50).
     Runs,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CodeRunnerArg {
+    CodexSdk,
+    ClaudeAgentSdk,
+    CodexCli,
+    ClaudeCli,
+}
+
+impl From<CodeRunnerArg> for tt_cli::agent_policy::AgentRunner {
+    fn from(value: CodeRunnerArg) -> Self {
+        match value {
+            CodeRunnerArg::CodexSdk => Self::CodexSdk,
+            CodeRunnerArg::ClaudeAgentSdk => Self::ClaudeAgentSdk,
+            CodeRunnerArg::CodexCli | CodeRunnerArg::ClaudeCli => Self::CliSubprocess,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum CodeAction {
+    /// Run against an isolated repository snapshot and emit patch/cost evidence.
+    Run {
+        /// Coding task for the local vendor runtime.
+        prompt: String,
+        /// Pinned official local SDK or structured-CLI adapter.
+        #[arg(long, value_enum)]
+        runner: CodeRunnerArg,
+        /// Exact provider-qualified model id admitted by `.tokentrimmer/agent.toml`.
+        #[arg(long)]
+        model: String,
+        /// Repository root containing `.tokentrimmer/agent.toml`.
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        /// Resume one vendor-owned local session.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Non-secret identifier for the already-paid subscription plan.
+        #[arg(long)]
+        plan_reference: Option<String>,
+        /// Explicit per-run marginal cash in micro-USD (normally zero in-plan).
+        #[arg(long, default_value_t = 0)]
+        marginal_cash_micros: u64,
+        /// Optional user-configured plan allocation in micro-USD.
+        #[arg(long)]
+        allocated_plan_micros: Option<u64>,
+        /// Override the pinned TypeScript SDK bridge.
+        #[arg(long)]
+        bridge_path: Option<PathBuf>,
+        /// Use one supported user-installed vendor CLI instead of the bundled runtime.
+        #[arg(long)]
+        vendor_executable: Option<PathBuf>,
+        /// Also write the complete JSON run evidence to this path.
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1622,6 +1684,101 @@ async fn main() -> anyhow::Result<()> {
             }
             AgentAction::Runs => {
                 tt_cli::agent::list_runs(tt_api_key, tt_api_base).await?;
+            }
+        },
+        Command::Code { action } => match action {
+            CodeAction::Run {
+                prompt,
+                runner,
+                model,
+                repository,
+                session_id,
+                plan_reference,
+                marginal_cash_micros,
+                allocated_plan_micros,
+                bridge_path,
+                vendor_executable,
+                receipt,
+            } => {
+                use tt_cli::agent_policy::{
+                    load_repository_policy, resolve_agent_policy, OrganizationPolicyMode,
+                    PolicyCostBasis,
+                };
+
+                let repository = std::fs::canonicalize(&repository)
+                    .with_context(|| format!("open repository {}", repository.display()))?;
+                let repository_policy = load_repository_policy(&repository)?;
+                let selected_runner: tt_cli::agent_policy::AgentRunner = runner.into();
+                let provider = match runner {
+                    CodeRunnerArg::CodexSdk | CodeRunnerArg::CodexCli => "openai",
+                    CodeRunnerArg::ClaudeAgentSdk | CodeRunnerArg::ClaudeCli => "anthropic",
+                };
+                let mut task_policy = repository_policy.policy.clone();
+                task_policy
+                    .inference
+                    .allowed_runners
+                    .retain(|candidate| *candidate == selected_runner);
+                task_policy
+                    .inference
+                    .allowed_providers
+                    .retain(|candidate| candidate == provider);
+                task_policy
+                    .inference
+                    .allowed_models
+                    .retain(|candidate| candidate == &model);
+                task_policy
+                    .inference
+                    .allowed_cost_bases
+                    .retain(|basis| *basis == PolicyCostBasis::Subscription);
+                task_policy.budgets.max_subscription_marginal_cash_micros = marginal_cash_micros;
+                task_policy.budgets.max_subscription_allocated_micros =
+                    allocated_plan_micros.unwrap_or(0);
+                let policy = resolve_agent_policy(
+                    OrganizationPolicyMode::NotConfigured,
+                    &repository_policy,
+                    Some(&task_policy),
+                    None,
+                )?;
+                let vendor_executable = vendor_executable
+                    .map(|path| {
+                        std::fs::canonicalize(&path)
+                            .with_context(|| format!("open vendor executable {}", path.display()))
+                    })
+                    .transpose()?;
+                let plan_reference = plan_reference.unwrap_or_else(|| match runner {
+                    CodeRunnerArg::CodexSdk | CodeRunnerArg::CodexCli => {
+                        "local-codex-session".into()
+                    }
+                    CodeRunnerArg::ClaudeAgentSdk | CodeRunnerArg::ClaudeCli => {
+                        "local-claude-session".into()
+                    }
+                });
+                let report = tt_cli::local_agent::run_local_agent(
+                    tt_cli::local_agent::LocalAgentRequest {
+                        repository,
+                        prompt,
+                        runner: selected_runner,
+                        model,
+                        session_id,
+                        plan_reference,
+                        marginal_cash_micros,
+                        allocated_plan_micros,
+                        bridge_path,
+                        vendor_executable,
+                    },
+                    &policy,
+                )
+                .await?;
+                let failed = report.status == tt_cli::local_agent::LocalRunStatus::Failed;
+                let encoded = serde_json::to_string_pretty(&report)?;
+                if let Some(path) = receipt {
+                    std::fs::write(&path, encoded.as_bytes())
+                        .with_context(|| format!("write run evidence {}", path.display()))?;
+                }
+                println!("{encoded}");
+                if failed {
+                    anyhow::bail!("local coding-agent run failed; complete evidence emitted");
+                }
             }
         },
         Command::Batch {
