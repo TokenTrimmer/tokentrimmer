@@ -1490,9 +1490,9 @@ async fn complete_once_with_retry_policy(
         // routing/failover output.
         requested_model: Some(requested_model.clone()),
         model: model_used.clone(),
-        input_tokens: response.usage.prompt_tokens as i32,
-        output_tokens: response.usage.completion_tokens as i32,
-        cached_tokens: response.usage.cached_tokens as i32,
+        input_tokens: response.usage.prompt_tokens.min(i32::MAX as u64) as i32,
+        output_tokens: response.usage.completion_tokens.min(i32::MAX as u64) as i32,
+        cached_tokens: response.usage.cached_tokens.min(i32::MAX as u64) as i32,
         cost_usd,
         baseline_cost_usd,
         provider_cache_saved_usd,

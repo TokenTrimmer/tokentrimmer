@@ -468,9 +468,8 @@ impl Stream for UsageTrackingStream {
             // Authoritative usage from terminal chunk overrides byte count.
             if let Some(ref usage) = chunk.usage {
                 self.authoritative = Some(AuthoritativeUsage {
-                    prompt: usage.prompt_tokens as i32,
-                    completion: usage.completion_tokens as i32,
-                    // Raw cache-read Option, with a fold-rescue: a pre-fix
+                    prompt: usage.prompt_tokens.min(i32::MAX as u64) as i32,
+                    completion: usage.completion_tokens.min(i32::MAX as u64) as i32,
                     // folded chunk (cached_tokens > 0, raw field absent) still
                     // proves real cache reads — map it to Some so it never
                     // regresses to NULL. A folded 0 with no raw field is
