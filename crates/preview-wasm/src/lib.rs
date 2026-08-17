@@ -29,14 +29,30 @@ const PRICING_TOML: &str = include_str!("../../shared/data/pricing.toml");
 /// pulls `mio`). A drift test (`downroutes_match_catalog`-style) is impractical
 /// across the wasm boundary, so these are documented as a manual mirror.
 const DOWNROUTES: &[(&str, &str)] = &[
+    ("gpt-5.6-sol", "gpt-5.6-terra"),
+    ("gpt-5.6-terra", "gpt-5.6-luna"),
     ("gpt-5.5", "gpt-5.4"),
     ("gpt-5.4", "gpt-5.4-mini"),
+    ("gpt-4.1", "gpt-4.1-mini"),
     ("gpt-4o", "gpt-4o-mini"),
-    ("claude-opus-4-7", "claude-haiku-4-5"),
+    ("claude-opus-5", "claude-sonnet-5"),
+    ("claude-sonnet-5", "claude-haiku-4-5"),
     ("claude-opus-4-8", "claude-haiku-4-5"),
+    ("claude-opus-4-7", "claude-haiku-4-5"),
     ("claude-sonnet-4-6", "claude-haiku-4-5"),
+    ("gemini-3.7-flash", "gemini-3.1-flash-lite"),
+    ("gemini-3.6-flash", "gemini-3.5-flash-lite"),
     ("gemini-3.1-pro", "gemini-3.1-flash-lite"),
     ("gemini-3.5-flash", "gemini-3.1-flash-lite"),
+    ("qwen/qwen3.8-max", "qwen/qwen3.8-27b"),
+    ("qwen/qwen3.7-max", "qwen/qwen3.7-plus"),
+    ("z-ai/glm-5.2", "z-ai/glm-4.7-flash"),
+    ("z-ai/glm-5.1", "z-ai/glm-5"),
+    ("moonshotai/kimi-k3", "moonshotai/kimi-k2.7-code"),
+    ("moonshotai/kimi-k2.7-code", "moonshotai/kimi-k2.6"),
+    ("meta-llama/llama-4-maverick", "meta-llama/llama-4-scout"),
+    ("mistral-large-latest", "mistral-small-latest"),
+    ("mistral-medium-latest", "mistral-small-latest"),
     ("deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"),
 ];
 
