@@ -8632,7 +8632,7 @@ Used by:
 - [block-buffer 0.10.4](https://github.com/RustCrypto/utils)
 - [block-padding 0.3.3](https://github.com/RustCrypto/utils)
 - [cbc 0.1.2](https://github.com/RustCrypto/block-modes)
-- [chacha20 0.10.1](https://github.com/RustCrypto/stream-ciphers)
+- [chacha20 0.10.2](https://github.com/RustCrypto/stream-ciphers)
 - [chacha20 0.9.1](https://github.com/RustCrypto/stream-ciphers)
 - [chacha20poly1305 0.10.1](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305)
 - [cipher 0.4.4](https://github.com/RustCrypto/traits)
@@ -11631,7 +11631,7 @@ SOFTWARE.
 ## MIT License
 
 Used by:
-- [h2 0.4.14](https://github.com/hyperium/h2)
+- [h2 0.4.19](https://github.com/hyperium/h2)
 
 ```
 Copyright (c) 2017 h2 authors

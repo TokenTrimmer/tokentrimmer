@@ -158,13 +158,11 @@ fn validate_with_schedule_floor(
                     node.id
                 ));
             }
-            Some(ModelSelection::Model { model }) => {
-                if !model_exists(model) {
-                    errors.push(format!(
-                        "node \"{}\" references unknown model \"{}\"",
-                        node.id, model
-                    ));
-                }
+            Some(ModelSelection::Model { model }) if !model_exists(model) => {
+                errors.push(format!(
+                    "node \"{}\" references unknown model \"{}\"",
+                    node.id, model
+                ));
             }
             _ => {}
         }

@@ -64,7 +64,9 @@ struct RunCommandOutput {
 }
 
 pub(super) fn select_backend(
-    repository: &Path,
+    // Used only by the seatbelt probe below on macOS; Linux CI builds read
+    // this as unused, so the loader needs the platform-scoped allow.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] repository: &Path,
     command_rules: &[CommandRule],
 ) -> Result<SandboxBackend, BrokerError> {
     if command_rules.is_empty() {

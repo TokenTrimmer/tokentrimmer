@@ -232,7 +232,7 @@ impl BatchStore for InMemoryBatchStore {
             .map_err(|e| BatchStoreError::Storage(e.to_string()))?;
         let mut rows: Vec<BatchJob> = g.values().filter(|j| j.org_id == org_id).cloned().collect();
         // Newest-first, mirroring the Postgres `ORDER BY created_at DESC`.
-        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        rows.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         Ok(rows)
     }
 

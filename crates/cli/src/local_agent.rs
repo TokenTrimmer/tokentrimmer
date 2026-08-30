@@ -485,8 +485,7 @@ pub async fn run_local_agent(
         .policy
         .process
         .max_output_bytes
-        .min(BRIDGE_OUTPUT_HARD_CAP)
-        .max(1);
+        .clamp(1, BRIDGE_OUTPUT_HARD_CAP);
     let bridge_request = BridgeRequest {
         runner: admitted.bridge_runner,
         prompt: &request.prompt,
@@ -910,6 +909,7 @@ fn broker_tool_metadata(name: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // bridge plumbing — see failover.rs precedent
 async fn run_bridge_process(
     node: &Path,
     bridge: &Path,
@@ -1101,6 +1101,7 @@ async fn probe_bridge(
         .map_err(|error| LocalAgentError::BridgeProbe(format!("invalid probe JSON: {error}")))
 }
 
+#[allow(clippy::too_many_arguments)] // probe-evidence tuple — see failover.rs precedent
 fn verify_probe(
     runner: AgentRunner,
     bridge_runner: &str,

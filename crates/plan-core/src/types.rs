@@ -132,18 +132,15 @@ pub struct RequestLog {
 /// `#[non_exhaustive]` so additional classes can be added without breaking
 /// downstream match arms.
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum L2TaskClass {
     /// `POST /v1/chat/completions` — the only class in the v1 corpus.
+    #[default]
     ChatCompletions,
-}
-
-impl Default for L2TaskClass {
-    fn default() -> Self {
-        Self::ChatCompletions
-    }
 }
 
 impl L2TaskClass {

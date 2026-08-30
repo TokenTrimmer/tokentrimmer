@@ -205,7 +205,7 @@ fn is_loopback_http(url: &Url) -> bool {
 fn describe_timeout(timeout: Duration) -> String {
     if timeout == Duration::from_secs(1) {
         "1 second".to_string()
-    } else if timeout.as_millis() % 1_000 == 0 {
+    } else if timeout.as_millis().is_multiple_of(1_000) {
         format!("{} seconds", timeout.as_secs())
     } else {
         format!("{} ms", timeout.as_millis())

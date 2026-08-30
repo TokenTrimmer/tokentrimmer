@@ -146,7 +146,7 @@ pub async fn run_harness(opts: HarnessOpts) -> anyhow::Result<()> {
         let strategy = opts
             .strategy
             .unwrap_or_else(|| DEFAULT_FUSION_STRATEGY.to_string());
-        let default_members = vec!["claude-sonnet-5".to_string(), "gpt-5.4".to_string()];
+        let default_members = ["claude-sonnet-5".to_string(), "gpt-5.4".to_string()];
         let members: Vec<&str> = if opts.members.is_empty() {
             default_members.iter().map(|s| s.as_str()).collect()
         } else {

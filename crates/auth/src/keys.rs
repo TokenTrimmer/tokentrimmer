@@ -257,7 +257,7 @@ impl KeyStore for InMemoryKeyStore {
             .filter(|k| k.org_id == org_id && k.revoked_at.is_none())
             .map(ApiKeySummary::from)
             .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at)); // newest first
+        out.sort_by_key(|k| std::cmp::Reverse(k.created_at)); // newest first
         Ok(out)
     }
 
