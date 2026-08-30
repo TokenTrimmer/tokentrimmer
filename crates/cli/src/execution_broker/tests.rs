@@ -1,3 +1,6 @@
+// `Path` + `Duration` are consumed only by the seatbelt test on macOS —
+// cfg-scope the import so non-macOS (CI) builds don't see it unused.
+#[cfg(target_os = "macos")]
 use std::{path::Path, time::Duration};
 
 use tt_client::ToolExecutor as _;
