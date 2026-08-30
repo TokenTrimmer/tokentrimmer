@@ -499,13 +499,19 @@ pub(crate) fn compute_cost_full(
         0.0
     };
 
-    // Served-model cost as if no provider caching had occurred: all prompt
-    // tokens at the full input rate. The delta against the (standard) cost is the
+    // Served-model cost as if no provider caching had occurred: ALL prompt
+    // tokens at the full input rate (the cache-read discount is exactly what
+    // we are isolating). The delta against the (standard) cost is the
     // provider's automatic cache discount (read discount net of any
     // cache-write premium) — savings the provider grants with or without
-    // TokenTrimmer, so they are excluded from the TT-attributed figure. Computed
-    // on standard rates (flex never widens the cache-attributed figure).
-    let no_cache_cost_usd = standard_full_cost_usd;
+    // TokenTrimmer, so they are excluded from the TT-attributed figure by
+    // `tt_saved_usd()`. Computed on standard rates (flex never widens the
+    // cache-attributed figure). NOTE: this is NOT `standard_full_cost_usd` —
+    // that alias exists for the flex comparison and carries the same
+    // discount-inclusive basis as the flex cost, which would make the delta
+    // (and with it `provider_cache_saved_usd`) identically zero.
+    let no_cache_cost_usd = (usage.prompt_tokens as f64) * pricing.input_per_million / 1_000_000.0
+        + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
 
     // Baseline: full input × input rate + output × output rate (no cache
     // discount), priced against the originally-requested model.
