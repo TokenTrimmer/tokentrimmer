@@ -109,6 +109,7 @@ pub mod agentic_budget;
 pub mod cache_classifier;
 pub mod compression;
 pub mod doc_compaction;
+pub mod prefix_normalizer;
 pub mod redaction;
 pub mod split;
 
@@ -118,6 +119,7 @@ pub use agentic_budget::{
 pub use cache_classifier::CacheClassifierPass;
 pub use compression::CompressionPass;
 pub use doc_compaction::DocCompactionPass;
+pub use prefix_normalizer::normalize_request_prefix;
 pub use redaction::{RedactedField, RedactedHit, RedactionPass};
 pub use split::{
     CacheBustEstimate, MutationDeterminism, PassContext, SplitRequest, StablePrefix, StableReason,

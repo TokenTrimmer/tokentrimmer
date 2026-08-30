@@ -92,7 +92,9 @@ pub async fn substitute_in_messages(
 
         let query_text = without_tags.trim();
         let fallback_query = if query_text.is_empty() {
-            tags.first().map(|t| &text[t.span.0..t.span.1]).unwrap_or("")
+            tags.first()
+                .map(|t| &text[t.span.0..t.span.1])
+                .unwrap_or("")
         } else {
             query_text
         };

@@ -198,7 +198,8 @@ mod cache_control_tests {
     }
     #[test]
     fn prune_policy_parsed() {
-        let cfg = parse_cache_control(&extras(r#"{"cache":{"mode":"normal","prune":"auto"}}"#)).unwrap();
+        let cfg =
+            parse_cache_control(&extras(r#"{"cache":{"mode":"normal","prune":"auto"}}"#)).unwrap();
         assert_eq!(cfg.mode, CacheMode::Normal);
         assert_eq!(cfg.prune, CachePrunePolicy::Auto);
     }

@@ -138,7 +138,11 @@ pub fn cache_key_with(
     req: &ChatCompletionRequest,
     canonicalizer: &dyn ModelCanonicalizer,
 ) -> String {
-    cache_key_with_policy(req, canonicalizer, tt_shared::messages::CachePrunePolicy::None)
+    cache_key_with_policy(
+        req,
+        canonicalizer,
+        tt_shared::messages::CachePrunePolicy::None,
+    )
 }
 
 /// Derive a cache key with explicit [`ModelCanonicalizer`] and [`tt_shared::messages::CachePrunePolicy`].
@@ -167,23 +171,15 @@ fn round6(v: f32) -> f64 {
     ((v as f64) * factor).round() / factor
 }
 
-/// Normalize a [`MessageContent`] value for **cache-key derivation only**.
-///
-/// Delegates text segments to [`normalize_text_for_key`]; non-text content
-/// parts (images, audio, etc.) are cloned as-is.
-fn normalize_message_content(
-    content: &tt_shared::messages::MessageContent,
-) -> tt_shared::messages::MessageContent {
-    normalize_message_content_with_policy(content, tt_shared::messages::CachePrunePolicy::None)
-}
-
 fn normalize_message_content_with_policy(
     content: &tt_shared::messages::MessageContent,
     policy: tt_shared::messages::CachePrunePolicy,
 ) -> tt_shared::messages::MessageContent {
     use tt_shared::messages::{ContentPart, MessageContent};
     match content {
-        MessageContent::Text(s) => MessageContent::Text(normalize_text_for_key_with_policy(s, policy)),
+        MessageContent::Text(s) => {
+            MessageContent::Text(normalize_text_for_key_with_policy(s, policy))
+        }
         MessageContent::Parts(parts) => MessageContent::Parts(
             parts
                 .iter()
@@ -198,24 +194,10 @@ fn normalize_message_content_with_policy(
     }
 }
 
-/// Normalize a text segment for **cache-key derivation only**.
-///
-/// Applies Unicode NFC normalization followed by trailing-whitespace trimming.
-/// The returned `String` is used only when building the canonical JSON object
-/// that is hashed to produce the cache key; the original string is forwarded
-/// to the upstream provider unchanged.
-///
-/// This merges requests that are identical except for:
-/// - Different Unicode encoding forms of the same character (NFC vs NFD).
-/// - Trailing whitespace characters (`\t`, `\n`, `\r`, space).
-///
-/// Leading whitespace and mid-content whitespace are intentionally preserved —
-/// a space at the start or inside a message can be semantically meaningful.
-fn normalize_text_for_key(s: &str) -> String {
-    normalize_text_for_key_with_policy(s, tt_shared::messages::CachePrunePolicy::None)
-}
-
-fn normalize_text_for_key_with_policy(s: &str, policy: tt_shared::messages::CachePrunePolicy) -> String {
+fn normalize_text_for_key_with_policy(
+    s: &str,
+    policy: tt_shared::messages::CachePrunePolicy,
+) -> String {
     use tt_shared::messages::CachePrunePolicy;
     let nfc: String = s.nfc().collect();
     let trimmed = nfc.trim_end_matches([' ', '\t', '\n', '\r']);
@@ -277,7 +259,9 @@ fn build_canonical_with_policy(
             } => Message::Assistant {
                 name: name.clone(),
                 tool_calls: tool_calls.clone(),
-                content: content.as_ref().map(|c| normalize_message_content_with_policy(c, policy)),
+                content: content
+                    .as_ref()
+                    .map(|c| normalize_message_content_with_policy(c, policy)),
             },
             Message::Tool {
                 content,

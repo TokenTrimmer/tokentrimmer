@@ -62,6 +62,7 @@ pub use registry::{
 pub use retry::{with_retry, RetryPolicy};
 pub use server::{
     build_router, build_router_with_retrieval, panel_enabled_from_env, panel_min_tier_from_env,
+    prefix_normalization_from_env,
 };
 pub use state::AppState;
 

@@ -708,8 +708,14 @@ Anthropic, whose max is `1.0`). A `route_paused:<route-name>` token is emitted
 when the matched route is **paused** (manually or by the quality auto-pause —
 see §10.7): the request was served on its originally-requested model with the
 route's rewrite and every other cost lever suppressed; the matching
-`request_logs` row carries `route_paused = true`. Pre-dispatch tokens
-(`route_paused:*`, `redacted:*`, the output-shaping tokens below) are attached
+warning is additionally a `prefix_normalization_applied` token — emitted on
+every chat request when the operator enabled `TT_PREFIX_NORMALIZATION=1`
+(deterministic canonicalization of tool definitions + system-prompt text
+before cache-key derivation; tool order can change model tool-selection
+behavior, which is why it is opt-in). The
+matching `request_logs` row carries `route_paused = true`. Pre-dispatch tokens
+(`route_paused:*`, `redacted:*`, `prefix_normalization_applied`,
+the output-shaping tokens below) are attached
 on L1/L2 cache-hit responses as well as dispatched ones; `param_dropped:*`
 tokens appear on dispatched responses only (no dispatch happened on a hit).
 The embeddings endpoint has no warnings header — a paused embeddings
@@ -1832,8 +1838,11 @@ From the billing and overage meter perspective a panel counts as **one request**
 
 ### 21.7 Controls (env vars)
 
+Table also includes the non-panel gateway control env vars referenced elsewhere in this reference.
+
 | Env var | Default | Description |
 |---|---|---|
+| `TT_PREFIX_NORMALIZATION` | `""` (off) | Opt-in deterministic request-prefix canonicalization for chat requests: tool definitions sorted by name + JSON schemas key-sorted, system text line-ending/whitespace normalized, BEFORE cache-key derivation. Emits `prefix_normalization_applied` on `X-TokenTrimmer-Warnings`. Off by default — tool order can be behavior-relevant. |---|
 | `TT_PANEL_ENABLED` | `""` (off) | Kill-switch. Set to `1` or `true` to enable. Absent or any other value → disabled. Panel requests receive `403` when disabled. |
 | `TT_PANEL_MIN_TIER` | `"Free"` (allow-all) | Minimum caller tier required to use the panel. Accepted values: `Free`, `Pro`, `Team`, `Scale` (case-insensitive). Unknown values log a warning and fall back to `Free`. Below-tier requests receive `403`. |
 | `TT_PANEL_MAX_MEMBERS` | `8` | Hard cap on the number of panel members (arbiter not counted). A request specifying more members than the cap receives `400`. Must be ≥ 1; invalid or zero values are ignored. |

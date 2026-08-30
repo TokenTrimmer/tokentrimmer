@@ -103,6 +103,18 @@ pub fn panel_enabled_from_env() -> bool {
         .unwrap_or(false)
 }
 
+/// Read the `TT_PREFIX_NORMALIZATION` environment variable and return the
+/// opt-in value for [`AppState::with_prefix_normalization`].
+///
+/// Truthy values: `"1"` or any case-insensitive variant of `"true"`.
+/// Absent or any other value → `false` (off by default — tool ordering can be
+/// behavior-relevant, so normalization is never default-on).
+pub fn prefix_normalization_from_env() -> bool {
+    std::env::var("TT_PREFIX_NORMALIZATION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Read `TT_PANEL_MIN_TIER` → the minimum `CallerTier` allowed to use the panel.
 /// `"pro"|"team"|"scale"` (case-insensitive) → that tier; absent/unknown → `Free`
 /// (allow-all — the default, so the panel works today behind the kill-switch

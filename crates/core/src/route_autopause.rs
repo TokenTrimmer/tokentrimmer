@@ -221,6 +221,31 @@ pub fn should_pause(acceptable: u64, degraded: u64, min_verdicts: u32, floor: f6
     }
 }
 
+/// Lower bound of the Wilson score interval (95% confidence, z = 1.96) for
+/// the pass rate `acceptable / (acceptable + degraded)`.
+///
+/// Unlike the raw pass rate, this converges to the observed rate from BELOW
+/// at small samples: 9/10 passes yields ~0.596 on the classic interval, not
+/// 0.9. Recorded windows are usually larger; the bound makes the decision
+/// statistically conservative when they aren't.
+#[must_use]
+pub fn wilson_pass_rate_lower_bound(acceptable: u64, degraded: u64) -> f64 {
+    let n = acceptable + degraded;
+    if n == 0 {
+        return 0.0;
+    }
+    let n = n as f64;
+    let p_hat = acceptable as f64 / n;
+    let z = 1.96;
+    let z2 = z * z;
+
+    let denominator = 1.0 + z2 / n;
+    let center = p_hat + z2 / (2.0 * n);
+    let spread = z * ((p_hat * (1.0 - p_hat) / n) + (z2 / (4.0 * n * n))).sqrt();
+
+    ((center - spread) / denominator).max(0.0)
+}
+
 /// JudgeSink that AUTO-PAUSES a regressing down-route. Appended to the
 /// fanout AFTER the persistent sink (FanoutJudgeSink awaits in order) so the
 /// just-recorded verdict is included in the DB window. Best-effort: every
@@ -372,6 +397,21 @@ mod tests {
         assert!(should_pause(17, 3, 20, 0.90).is_some());
         // No classified verdicts → never (even with min 0).
         assert_eq!(should_pause(0, 0, 0, 0.90), None);
+    }
+
+    /// Wilson lower bound is conservative at small n and converges to the
+    /// observed rate at large n. Pins two reference values so the statistic
+    /// cannot silently drift.
+    #[test]
+    fn wilson_lower_bound_conservative_and_converging() {
+        // 9/10 ≈ 0.90 raw; the 95% lower bound is far below the floor value.
+        let small = wilson_pass_rate_lower_bound(9, 1);
+        assert!(small < 0.70, "small-n bound must be conservative: {small}");
+        // 995/1000 ≈ 0.995 raw; the lower bound stays above 0.985 large-n.
+        let large = wilson_pass_rate_lower_bound(995, 5);
+        assert!(large > 0.985, "large-n bound must converge: {large}");
+        // Degenerate: no verdicts → 0.0.
+        assert_eq!(wilson_pass_rate_lower_bound(0, 0), 0.0);
     }
 
     /// The in-memory window honors recency + limit and excludes unclear (the

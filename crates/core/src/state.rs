@@ -350,6 +350,20 @@ pub struct AppState {
     /// [`AppState::with_panel_enabled`] or the `TT_PANEL_ENABLED` env var
     /// (`"1"` or case-insensitive `"true"`).
     pub panel_enabled: bool,
+    /// Opt-in gateway flag for deterministic request-prefix normalization
+    /// (`passes::prefix_normalizer`). **Off by default.**
+    ///
+    /// When enabled, chat-completion requests are canonicalized before
+    /// cache-key derivation and dispatch: tool definitions are sorted by name
+    /// with their JSON schemas key-sorted, and system-prompt text is
+    /// line-ending/whitespace normalized. The transform is deterministic on
+    /// the ingress bytes, so warmed provider prompt caches keep hitting — its
+    /// purpose is to MAKE identical-intent requests byte-identical so both
+    /// the gateway L1 and provider prompt caches hit more often. Because tool
+    /// ORDER can be behavior-relevant to model tool-selection, it stays opted
+    /// into via [`AppState::with_prefix_normalization`] or the
+    /// `TT_PREFIX_NORMALIZATION` env var, never on by default.
+    pub prefix_normalization: bool,
     /// Minimum [`tt_shared::CallerTier`] required to use the Fusion panel.
     ///
     /// Defaults to `CallerTier::Free` (allow-all — the gate is a no-op until an
@@ -415,7 +429,16 @@ impl AppState {
             batch_store: None,
             panel_enabled: false,
             panel_min_tier: tt_shared::CallerTier::Free,
+            prefix_normalization: false,
         }
+    }
+
+    /// Builder: enable deterministic request-prefix normalization. See
+    /// [`Self::prefix_normalization`]; default is off.
+    #[must_use]
+    pub fn with_prefix_normalization(mut self, on: bool) -> Self {
+        self.prefix_normalization = on;
+        self
     }
 
     /// Builder-style attach: register the Postgres pool with the readiness

@@ -789,7 +789,23 @@ pub(crate) async fn prepare(
         &mut warnings,
     );
 
-    // ── Request-pass stage ───────────────────────────────────────────────────
+    // Opt-in deterministic prefix normalization (gateway flag
+    // `TT_PREFIX_NORMALIZATION`, default OFF): canonicalize tool definitions
+    // (sort by name, key-sort JSON schemas) + system-prompt text (CRLF→LF,
+    // trailing-whitespace strip, 3+ newline collapse) BEFORE cache-key
+    // derivation, so identical-intent-but-not-byte-identical requests share
+    // L1 keys and warmed provider prompt-cache prefixes. The transform is
+    // deterministic on the ingress bytes (fixed orderings, fixed whitespace
+    // rules) — no cache bust is booked because re-sends re-produce the same
+    // canonical bytes. Tool ORDER can be behavior-relevant to model
+    // tool-selection, which is why this is opt-in, and the fired marker on
+    // the warnings header is the caller-visible signal.
+    if state.prefix_normalization {
+        *req = crate::passes::prefix_normalizer::normalize_request_prefix(std::mem::take(req));
+        warnings.push("prefix_normalization_applied".to_string());
+    }
+
+    // ── Request-pass stage ────────────────────────────────────────────────
     //
     // Order: redaction (escape hatch) → compression pipeline (cache-aware
     // split + token-true gate) → cache classifier (always-on diagnostics).
