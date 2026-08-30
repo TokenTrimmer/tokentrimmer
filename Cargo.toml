@@ -178,7 +178,7 @@ regex = "1"
 tiktoken-rs = "0.12"
 
 # tt init installer
-tera = "1.20"
+tera = "2.1"
 include_dir = { version = "0.7", features = ["glob"] }
 dialoguer = "0.12"
 toml = "1.1"
