@@ -8,7 +8,6 @@
     "skipLibCheck": true,
     "types": ["node"],
     "ignoreDeprecations": "6.0",
-    "baseUrl": ".",
     "paths": {
       "@tokentrimmer/client": ["../../sdk-typescript/src/index.ts"],
       "openai": ["../../sdk-typescript/node_modules/openai/index.d.ts"],
