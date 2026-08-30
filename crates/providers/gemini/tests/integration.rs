@@ -370,7 +370,10 @@ fn provider_id_and_models() {
     assert_eq!(p.id(), "gemini");
 
     let models = p.models();
-    assert!(models.len() >= 3, "expected at least 3 models in pricing table");
+    assert!(
+        models.len() >= 3,
+        "expected at least 3 models in pricing table"
+    );
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert!(ids.contains(&"gemini-3.1-flash-lite"));
     assert!(ids.contains(&"gemini-3.5-flash"));
