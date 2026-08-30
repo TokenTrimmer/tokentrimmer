@@ -268,6 +268,64 @@ tt advise ./my-app --describe "a customer-support chatbot"
 
 ---
 
+## `tt harness`
+
+The native, cost-governed coding-agent harness. It runs a fully local analysis
+pass first — `tt-context` ranks the repo's symbols/imports for the task and
+assembles a token-budgeted context pack — then drives the gateway's
+server-side agent loop over a local sandboxed execution broker (read-only
+command allowlists, process/filesystem/network guards, patch evidence). Every
+run reports turns, aggregate cost, and staged workspace changes. Requires a
+key.
+
+### Flags
+
+- `<prompt>` — the coding task to execute.
+- `--repository <path>` — target checkout. Default: the current directory.
+- `--model <id>` — primary model. Default: `claude-sonnet-5`.
+- `--context-tokens <n>` — token budget for the ranked repo context pack.
+  Default: 4000.
+- `--max-turns <n>` / `--max-cost <usd>` — run ceilings.
+- `--tag <text>` — cost attribution tag.
+- `--fusion` — opt into Fusion multi-model synthesis (see the panel docs);
+  `--strategy synthesize|best-of-n|majority`, `--members a,b`, `--arbiter <id>`,
+  `--quorum <n>` refine the panel.
+- `--tt-api-key <KEY>` / `--tt-api-base <URL>` — override the resolved key / base.
+
+### Example
+
+```bash
+tt harness "add input validation to src/api.py" --max-cost 0.50 --fusion --members claude-sonnet-5,gpt-5.4
+tt harness "write unit tests for the auth module" --context-tokens 8000
+```
+
+---
+
+## `tt ci-comment`
+
+Generates the GitHub **PR cost-&-waste audit comment** from the local working
+tree: a cost-diff analysis of the diff against `--base` plus the Tier-1
+findings scan, rendered as markdown, on stdout. **Local-only — no network, no
+API key.** CI (or the official GitHub Action) pipes the markdown into a PR
+comment; `--max-increase` turns it into a gate (non-zero exit on breach).
+
+### Flags
+
+- `--path <path>` — scope for the diff + findings scan. Default `.`.
+- `--base <ref>` — base git ref to diff against. Default `HEAD`.
+- `--monthly-calls <n>` — assumed monthly volume for the projections.
+  Default 50,000.
+- `--max-increase <usd>` — exit non-zero when the projected monthly impact
+  exceeds this amount.
+
+### Example
+
+```bash
+tt ci-comment --base origin/main --monthly-calls 250000
+```
+
+---
+
 ## `tt workflow check`
 
 Validate a `WorkflowDefinition` JSON file offline, project its cost, and

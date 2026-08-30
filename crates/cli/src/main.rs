@@ -20,8 +20,8 @@ use tt_cli::eval_shadow::EvalAction;
 /// list keeps each command's one-line description.
 const COMMAND_GROUPS: &str = "\
 Command groups:
-  Run             gateway, proxy, chat, agent, code, embed, models, capabilities, batch
-  Optimize        inspect, plan, route, recipes, advise, workflow
+  Run             gateway, proxy, chat, agent, harness, code, embed, models, capabilities, batch
+  Optimize        inspect, plan, route, recipes, advise, workflow, ci-comment
   Prove           audit, verify-receipt
   Account         login, logout, whoami, connect
   MCP & tooling   mcp, init, retrieval, context
@@ -382,6 +382,22 @@ enum Command {
         #[arg(long)]
         tt_api_base: Option<String>,
     },
+    /// Generate a GitHub PR cost-&-waste audit comment from the local diff
+    /// and Tier-1 findings (local-only; CI pipes the markdown into a PR comment).
+    CiComment {
+        /// Path to scope the diff + findings scan to.
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Base git ref to diff the working tree against.
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Assumed monthly call volume for the projections.
+        #[arg(long = "monthly-calls", default_value_t = 50_000)]
+        monthly_calls: u64,
+        /// Exit non-zero when the projected monthly increase exceeds this USD amount.
+        #[arg(long = "max-increase")]
+        max_increase: Option<f64>,
+    },
     /// Install TokenTrimmer best-practices into the current repo.
     Init {
         #[arg(long)]
@@ -498,6 +514,50 @@ enum Command {
     Code {
         #[command(subcommand)]
         action: CodeAction,
+    },
+    /// Run the native, cost-governed coding agent harness with optional Fusion multi-model synthesis.
+    Harness {
+        /// The coding task or prompt to execute.
+        prompt: String,
+        /// Target repository checkout directory (defaults to current directory).
+        #[arg(long, default_value = ".")]
+        repository: std::path::PathBuf,
+        /// Primary model to request (defaults to claude-sonnet-5).
+        #[arg(long)]
+        model: Option<String>,
+        /// Token budget for the ranked repository context pack (defaults to 4000).
+        #[arg(long = "context-tokens")]
+        context_tokens: Option<u32>,
+        /// Maximum agent turns allowed.
+        #[arg(long)]
+        max_turns: Option<u32>,
+        /// Maximum total USD budget for the run.
+        #[arg(long = "max-cost")]
+        max_cost: Option<f64>,
+        /// Cost attribution tag.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Enable Fusion multi-model synthesis.
+        #[arg(long)]
+        fusion: bool,
+        /// Fusion arbitration strategy: synthesize, best-of-n, or majority.
+        #[arg(long)]
+        strategy: Option<String>,
+        /// Fusion member models (comma-separated or multiple flags).
+        #[arg(long, value_delimiter = ',')]
+        members: Vec<String>,
+        /// Arbiter model for Fusion synthesis.
+        #[arg(long)]
+        arbiter: Option<String>,
+        /// Minimum required quorum of successful member legs.
+        #[arg(long)]
+        quorum: Option<usize>,
+        /// Override the API key.
+        #[arg(long, global = true)]
+        tt_api_key: Option<String>,
+        /// Override the gateway base URL.
+        #[arg(long, global = true)]
+        tt_api_base: Option<String>,
     },
     /// Async Batch Lane: submit a JSONL file, list/get/cancel batches, download results.
     Batch {
@@ -1431,6 +1491,19 @@ async fn main() -> anyhow::Result<()> {
             tt_cli::advise::run(path, describe, model, server_loop, tt_api_key, tt_api_base)
                 .await?;
         }
+        Command::CiComment {
+            path,
+            base,
+            monthly_calls,
+            max_increase,
+        } => {
+            tt_cli::ci_comment::run_ci_comment(tt_cli::ci_comment::CiCommentOpts {
+                path,
+                base,
+                monthly_calls,
+                max_allowed_monthly_increase_usd: max_increase,
+            })?;
+        }
         Command::Docprep { path, json } => {
             tt_cli::docprep::run(&path, json)?;
         }
@@ -1781,6 +1854,40 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Command::Harness {
+            prompt,
+            repository,
+            model,
+            context_tokens,
+            max_turns,
+            max_cost,
+            tag,
+            fusion,
+            strategy,
+            members,
+            arbiter,
+            quorum,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            tt_cli::harness::run_harness(tt_cli::harness::HarnessOpts {
+                prompt,
+                repository,
+                model,
+                context_tokens: context_tokens.unwrap_or(tt_cli::harness::DEFAULT_CONTEXT_TOKENS),
+                max_turns,
+                max_cost,
+                tag,
+                flag_key: tt_api_key,
+                flag_base: tt_api_base,
+                fusion,
+                strategy,
+                members,
+                arbiter,
+                quorum,
+            })
+            .await?;
+        }
         Command::Batch {
             action,
             tt_api_key,
@@ -2652,6 +2759,13 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // fallback.
     state = state.with_panel_enabled(tt_core::panel_enabled_from_env());
     state = state.with_panel_min_tier(tt_core::panel_min_tier_from_env());
+
+    // Deterministic request-prefix normalization: off by default; set
+    // TT_PREFIX_NORMALIZATION=1 to canonicalize tool definitions + system
+    // text before cache-key derivation (deterministic-on-ingress, so warmed
+    // prefixes keep hitting; see passes::prefix_normalizer for the full
+    // contract). Off by default because tool order can matter to models.
+    state = state.with_prefix_normalization(tt_core::prefix_normalization_from_env());
 
     // Start background catalogue refreshers (OpenRouter's dynamic `GET /models`
     // fetch). Best-effort + non-blocking: it refreshes once shortly after boot
@@ -3950,5 +4064,53 @@ mod inspect_format_tests {
         assert!(!audit_verify_emits_merkle_to_stdout(argv(
             "inspect . --format json"
         )));
+    }
+}
+
+/// README ↔ COMMAND_GROUPS parity gate (drift check): every command named in
+/// the `tt help` groups string must have a row in the README's CLI table.
+/// Adding a CLI command without documenting it fails `cargo test`.
+#[cfg(test)]
+mod readme_command_parity {
+    use super::COMMAND_GROUPS;
+
+    /// Command names from the group lines (`Run  gateway, proxy, …`).
+    fn group_commands() -> Vec<String> {
+        COMMAND_GROUPS
+            .lines()
+            .filter_map(|l| l.trim_start().split_once("  "))
+            .flat_map(|(_, rest)| rest.split(','))
+            .map(|c| c.trim().to_string())
+            .filter(|c| {
+                // Command ids are alphanumeric + dashes only; this drops any
+                // leading-capture artifacts rather than false-failing on them.
+                !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            })
+            .collect()
+    }
+
+    /// The `tt <command>` token appears in the README table either alone
+    /// (`` `tt gateway` ``), with a subcommand (`` `tt agent run` ``), or
+    /// grouped on one row (`` `tt login` / `logout` / `whoami` ``).
+    fn readme_lists_command(readme: &str, cmd: &str) -> bool {
+        let alone = format!("`tt {cmd}`");
+        let with_sub = format!("`tt {cmd} ");
+        let slashed = format!("`{cmd}`");
+        readme.contains(&alone) || readme.contains(&with_sub) || readme.contains(&slashed)
+    }
+
+    #[test]
+    fn readme_cli_table_covers_every_shipped_command() {
+        let readme = include_str!("../../../README.md");
+        let missing: Vec<String> = group_commands()
+            .into_iter()
+            .filter(|cmd| !readme_lists_command(readme, cmd))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "README.md command table is missing rows for: {missing:?} — keep it \
+             in sync with COMMAND_GROUPS in crates/cli/src/main.rs (this test \
+             is the drift gate)."
+        );
     }
 }

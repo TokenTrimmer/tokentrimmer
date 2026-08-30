@@ -260,6 +260,8 @@ pub struct AgentBuilder<'a> {
     /// cross-provider failover is disabled.
     provider: Option<String>,
     cost_limit: Option<f64>,
+    panel_header: Option<String>,
+    panel_extras: Option<serde_json::Value>,
     interactive: bool,
     /// Client-side cap on resume (`tool_outputs`) round-trips before the driver
     /// returns the still-paused run, so a model that loops forever on client
@@ -279,11 +281,12 @@ impl<'a> AgentBuilder<'a> {
             tag: None,
             provider: None,
             cost_limit: None,
+            panel_header: None,
+            panel_extras: None,
             interactive: false,
             max_resume_rounds: 8,
         }
     }
-
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
@@ -361,6 +364,44 @@ impl<'a> AgentBuilder<'a> {
         self
     }
 
+    /// Opt-in to Fusion multi-model synthesis for this agent run.
+    /// Sets `X-TokenTrimmer-Panel` to `strategy` (e.g. "synthesize", "best-of-n", "majority")
+    /// and injects the members / arbiter / budget configuration into `tt_extras.panel`.
+    #[must_use]
+    pub fn fusion(
+        mut self,
+        strategy: impl Into<String>,
+        members: &[&str],
+        arbiter: Option<&str>,
+        quorum: Option<usize>,
+    ) -> Self {
+        let strat = strategy.into();
+        self.panel_header = Some(strat.clone());
+        let mut panel_map = serde_json::Map::new();
+        panel_map.insert("strategy".into(), serde_json::Value::String(strat));
+        panel_map.insert(
+            "members".into(),
+            serde_json::Value::Array(
+                members
+                    .iter()
+                    .map(|m| serde_json::Value::String((*m).to_string()))
+                    .collect(),
+            ),
+        );
+        if let Some(arb) = arbiter {
+            panel_map.insert("arbiter".into(), serde_json::Value::String(arb.to_string()));
+            panel_map.insert(
+                "arbiter_model".into(),
+                serde_json::Value::String(arb.to_string()),
+            );
+        }
+        if let Some(q) = quorum {
+            panel_map.insert("quorum".into(), serde_json::json!(q));
+        }
+        self.panel_extras = Some(serde_json::Value::Object(panel_map));
+        self
+    }
+
     /// Drive the agent run to completion: create the run, then while it is
     /// paused on client tools, execute them via `executor` and resume — until a
     /// terminal status or the resume cap.
@@ -426,6 +467,11 @@ impl<'a> AgentBuilder<'a> {
         if let Some(c) = self.max_cost_usd {
             body["max_cost_usd"] = serde_json::json!(c);
         }
+        if let Some(extras) = &self.panel_extras {
+            let mut tt_extras = serde_json::Map::new();
+            tt_extras.insert("panel".into(), extras.clone());
+            body["tt_extras"] = serde_json::Value::Object(tt_extras);
+        }
         let url = format!("{}/v1/agent/runs", self.client.base);
         self.send_run(url, body).await
     }
@@ -450,6 +496,9 @@ impl<'a> AgentBuilder<'a> {
             crate::apply_tt_headers(req, self.tag.as_deref(), self.cost_limit, self.interactive)?;
         if let Some(provider) = self.provider.as_deref() {
             req = req.header("X-TokenTrimmer-Provider", provider);
+        }
+        if let Some(panel) = self.panel_header.as_deref() {
+            req = req.header("X-TokenTrimmer-Panel", panel);
         }
         let resp = req.send().await.map_err(Error::Request)?;
         let cost = crate::parse_cost(resp.headers());

@@ -8,7 +8,7 @@
 TokenTrimmer is four products that ship together:
 
 - **Gateway** — OpenAI-compatible HTTP proxy with rule-based routing, two-layer caching (L1 Redis exact-match + L2 pgvector semantic), cross-provider failover with circuit breakers, and per-request cost telemetry via `x-tokentrimmer-*` response headers.
-- **Inspect** — Static analyzer that scans Python, TypeScript, and JavaScript codebases for token-waste patterns (19 Tier-1 rules: oversized prompts, missing prompt caching, unbounded agent loops, flagship models on classification work, …).
+- **Inspect** — Static analyzer that scans Python, TypeScript, and JavaScript codebases for token-waste patterns (23 Tier-1 rules: oversized prompts, missing prompt caching, unbounded agent loops, flagship models on classification work, …).
 - **Plan** — Deterministic replay simulator that projects how a proposed config change would have affected cost, savings, and cache hit rate, with bootstrap confidence intervals.
 - **Reporting** — Dashboard, weekly digest, monthly PDF (closed-source, hosted-only).
 
@@ -18,7 +18,7 @@ This repo is the **open-source core** (Apache 2.0): the Gateway, the `tt` CLI, t
 
 ## Status
 
-Alpha. The open-source core is implemented and tested: the Gateway (routing, L1/L2 caching, failover), all 19 Tier-1 Inspect rules, the Plan replay engine, the full `tt` CLI, the MCP server, retrieval, and the three SDKs all ship from this repo, gated by CI (fmt, clippy `-D warnings`, tests, and a self-inspect run).
+Alpha. The open-source core is implemented and tested: the Gateway (routing, L1/L2 caching, failover), all 23 Tier-1 Inspect rules, the Plan replay engine, the full `tt` CLI, the MCP server, retrieval, and the three SDKs all ship from this repo, gated by CI (fmt, clippy `-D warnings`, tests, and a self-inspect run).
 
 Two things to know up front, so you don't find out the hard way:
 
@@ -78,12 +78,23 @@ One binary, every surface:
 | `tt audit verify` | Verify the integrity of a hash-chained, Ed25519-signed audit log export |
 | `tt chat` | Interactive chat through a gateway — streaming, savings display, optional tool-calling |
 | `tt agent run` | Drive a gateway's server-side agent loop (`POST /v1/agent/runs`) over a prompt; prints turns + aggregate cost |
+| `tt harness` | Run the cost-governed coding-agent harness over a local repo (ranked context, sandboxed tool broker, optional Fusion multi-model synthesis) |
+| `tt ci-comment` | Generate a GitHub PR cost-&-waste audit comment from the local diff + Tier-1 findings (local-only) |
+| `tt code` | Run a policy-bound local coding agent through a pinned official vendor SDK runner, emitting patch/cost evidence |
+| `tt batch` | Async Batch Lane: submit JSONL files, list / get / cancel batches, download results |
+| `tt capabilities` | Print a gateway's runtime capabilities (evidence-backed) |
 | `tt proxy` | Local OpenAI/Anthropic-compatible proxy for coding agents (port 31415) |
 | `tt advise` | AI cost advisor: scans a repo and recommends optimizations (read-only) |
 | `tt route` | Manage routing rules on a gateway (list / show / add / rm) |
+| `tt recipes` | Browse / apply per-builder integration recipes (n8n, LangChain, …) |
+| `tt workflow` | Offline workflow validate / estimate / cost-diff tools |
 | `tt models` | List a gateway's model catalog (context windows, capabilities, pricing) |
 | `tt embed` | Embeddings through a gateway, with a cost summary |
+| `tt docprep` | Distill a local document/image to text client-side (Document Lane; byte-for-byte parity with the gateway sidecar) |
+| `tt verify-receipt` | Verify an Ed25519-signed savings receipt (VCR / savings-bundle) offline |
 | `tt retrieval` | RAG doc-add / search (EXPERIMENTAL, in-process — not persisted) |
+| `tt context` | Build a ranked, token-budgeted repo context pack for a task (local; powers the MCP tool) |
+| `tt connect` | Exchange an invite / connect code for gateway credentials |
 | `tt init` | Install TokenTrimmer best-practices config into a repo |
 | `tt mcp` | Run the MCP server (stdio or SSE transport) |
 | `tt login` / `logout` / `whoami` | Manage the locally stored API key |
@@ -102,7 +113,7 @@ crates/
 ├── tokenize/                  Shared token estimator
 ├── preview/                   Cost-preview engine
 ├── inspect-core/              Rule trait, tree-sitter harness
-├── inspect-rules-tier1/       The 19 Tier-1 rules
+├── inspect-rules-tier1/       The 23 Tier-1 rules
 ├── plan-core/                 Replay engine + bootstrap CIs
 ├── retrieval/                 RAG / context-compression engine
 ├── mcp/                       MCP server
