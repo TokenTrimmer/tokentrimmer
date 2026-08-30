@@ -1,0 +1,111 @@
+name: gate-failure-alert
+
+# SECURITY-QUALITY FIX (2026-08-30): during the 2026-08-16..30 quiet period the
+# WEEKLY SCHEDULED CI runs (2026-08-23 and 2026-08-30 08:23 UTC) failed silently
+# while the tree accumulated fmt drift, clippy regressions, a real h2 advisory
+# (RUSTSEC-2026-0258), and red tests — nobody saw a red gate for two weeks.
+# A failing gate nobody sees is not a gate.
+#
+# This listener opens ONE pinned tracking issue whenever the CI acceptance
+# workflow fails on the default branch, appends the failed-job list per run, and
+# auto-closes the issue with a comment when CI returns green. It uses only the
+# ephemeral `github.token` (no repository secrets) and no third-party actions —
+# the repository workflow-security policy applies (see
+# .github/scripts/workflow-security-policy.mjs).
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: gate-failure-alert
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    name: Track CI gate state as a pinned issue
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # `github.token` (the workflow-scoped ephemeral token) — deliberately not
+      # `secrets.GITHUB_TOKEN`, same effective identity, no secret reference.
+    steps:
+      - name: Open or resolve the gate-failure tracking issue
+        run: |
+          set -euo pipefail
+
+          repo="${{ github.repository }}"
+          run_id="${{ github.event.workflow_run.id }}"
+          run_url="${{ github.event.workflow_run.html_url }}"
+          run_event="${{ github.event.workflow_run.event }}"
+          run_branch="${{ github.event.workflow_run.head_branch }}"
+          conclusion="${{ github.event.workflow_run.conclusion }}"
+          head_sha="${{ github.event.workflow_run.head_sha }}"
+
+          # Only track default-branch acceptance runs (the scheduled backstop
+          # and dispatched audits). Failure runs from a scratch --ref dispatch
+          # land below too, which is fine: a red gate is a red gate.
+          if [ "${run_branch}" != "main" ]; then
+            echo "skipping non-main run (${run_branch})"
+            exit 0
+          fi
+
+          title="CI gate is RED — acceptance matrix failing"
+
+          find_tracking_issue() {
+            gh api -X GET "repos/${repo}/issues?state=open&per_page=100" \
+              --jq ".[] | select(.title == \"${title}\") | .number" | head -n1
+          }
+
+          if [ "${conclusion}" != "success" ]; then
+            # ── Failure: upsert the tracking issue ──────────────────────────
+            failed_jobs="$(gh api "repos/${repo}/actions/runs/${run_id}/jobs" \
+              --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join("\n- ")' || true)"
+            stamp="$(date -u +'%Y-%m-%d %H:%M UTC')"
+            body="**${stamp}** — [\`${run_event}\` run #${run_id}](${run_url}) at \`${head_sha:0:10}\` failed.\n\nFailed jobs:\n- ${failed_jobs:-(job list unavailable)}\n\nThe full acceptance matrix is failing; treat every artifact built from this revision as untrusted until green."
+
+            issue_number="$(find_tracking_issue)"
+            if [ -z "${issue_number}" ]; then
+              issue_number="$(gh api -X POST "repos/${repo}/issues" \
+                -f title="${title}" \
+                -f body="${body}" \
+                --jq .number)"
+              gh api -X POST "repos/${repo}/issues/${issue_number}/labels" \
+                -f 'labels[]=ci-gate-failure' || true
+              # Pin the issue so every repo visit / `gh issue list` carries it.
+              # shellcheck disable=SC2016 # $repo/$issue are GraphQL variables
+              gh api graphql -f query='
+                mutation($repo: ID!, $issue: ID!) {
+                  pinIssue(input: { repositoryId: $repo, issueId: $issue }) {
+                    issue { number }
+                  }
+                }' \
+                -f "repo=$(gh api "repos/${repo}" --jq .node_id)" \
+                -f "issue=$(gh api "repos/${repo}/issues/${issue_number}" --jq .node_id)" \
+                || true
+              echo "opened + pinned tracking issue #${issue_number}"
+            else
+              gh api -X POST "repos/${repo}/issues/${issue_number}/comments" \
+                -f body="${body}" > /dev/null
+              echo "commented on tracking issue #${issue_number}"
+            fi
+          else
+            # ── Success: resolve the tracking issue if one is open ──────────
+            issue_number="$(find_tracking_issue)"
+            if [ -n "${issue_number}" ]; then
+              stamp="$(date -u +'%Y-%m-%d %H:%M UTC')"
+              gh api -X POST "repos/${repo}/issues/${issue_number}/comments" \
+                -f body="**${stamp}** — [\`${run_event}\` run #${run_id}](${run_url}) at \`${head_sha:0:10}\` is green across the acceptance matrix. Closing the tracking issue." > /dev/null
+              gh api -X PATCH "repos/${repo}/issues/${issue_number}" \
+                -f state=closed \
+                -f state_reason=completed > /dev/null
+              echo "closed tracking issue #${issue_number}"
+            else
+              echo "CI green; no open tracking issue"
+            fi
+          fi
