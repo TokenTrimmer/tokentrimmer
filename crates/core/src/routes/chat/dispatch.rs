@@ -559,38 +559,6 @@ fn admit_budgeted_workflow_dispatch(
     Ok(())
 }
 
-#[cfg(test)]
-mod workflow_budget_dispatch_tests {
-    use super::*;
-
-    fn request(model: &str) -> ChatCompletionRequest {
-        ChatCompletionRequest {
-            model: model.into(),
-            messages: vec![Message::User {
-                content: MessageContent::Text("hello".into()),
-                name: None,
-            }],
-            max_tokens: Some(64),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn final_routed_request_must_be_priceable_and_fit_the_effective_cap() {
-        let known = request("gpt-4o-mini");
-        let estimate = crate::routes::agent_run_budget::estimate_next_turn_cost(
-            &known.model,
-            &known.messages,
-            known.max_tokens,
-        )
-        .expect("catalog model");
-
-        assert!(admit_budgeted_workflow_dispatch(&known, estimate).is_ok());
-        assert!(admit_budgeted_workflow_dispatch(&known, estimate / 2.0).is_err());
-        assert!(admit_budgeted_workflow_dispatch(&request("unknown-model"), 1.0).is_err());
-    }
-}
-
 async fn complete_once_with_retry_policy(
     state: &AppState,
     ctx: &RequestContext,
@@ -1730,4 +1698,36 @@ async fn complete_once_with_retry_policy(
             panel_body: None,
         }),
     })
+}
+
+#[cfg(test)]
+mod workflow_budget_dispatch_tests {
+    use super::*;
+
+    fn request(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
+            messages: vec![Message::User {
+                content: MessageContent::Text("hello".into()),
+                name: None,
+            }],
+            max_tokens: Some(64),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn final_routed_request_must_be_priceable_and_fit_the_effective_cap() {
+        let known = request("gpt-4o-mini");
+        let estimate = crate::routes::agent_run_budget::estimate_next_turn_cost(
+            &known.model,
+            &known.messages,
+            known.max_tokens,
+        )
+        .expect("catalog model");
+
+        assert!(admit_budgeted_workflow_dispatch(&known, estimate).is_ok());
+        assert!(admit_budgeted_workflow_dispatch(&known, estimate / 2.0).is_err());
+        assert!(admit_budgeted_workflow_dispatch(&request("unknown-model"), 1.0).is_err());
+    }
 }

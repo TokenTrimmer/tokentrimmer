@@ -147,10 +147,12 @@ jobs:
     env:
       # tt-core migrations, tt-auth PostgresKeyStore, and the CLI BYO test read
       # TEST_DATABASE_URL; the tt-cache L2 tests read DATABASE_URL. Point both at
-      # the same pgvector service. tt-cache L1 reads REDIS_URL.
+      # the same pgvector service. tt-cache L1 reads REDIS_URL; the ignored L1
+      # integration tests (org purge, rate limit) read TEST_REDIS_URL.
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       REDIS_URL: redis://localhost:6379
+      TEST_REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

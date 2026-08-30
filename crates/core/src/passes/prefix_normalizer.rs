@@ -23,10 +23,12 @@ pub fn normalize_request_prefix(mut req: ChatCompletionRequest) -> ChatCompletio
 
     // 2. Canonicalize system message text whitespace and structure
     for msg in &mut req.messages {
-        if let Message::System { content, .. } = msg {
-            if let MessageContent::Text(ref mut txt) = content {
-                *txt = canonicalize_system_text(txt);
-            }
+        if let Message::System {
+            content: MessageContent::Text(txt),
+            ..
+        } = msg
+        {
+            *txt = canonicalize_system_text(txt);
         }
     }
 

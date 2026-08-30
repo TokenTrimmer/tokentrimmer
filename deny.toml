@@ -62,6 +62,15 @@ ignore = [
     # path. Owner: Document Lane. Blocker: lopdf must migrate off ttf-parser.
     # Re-check 2026-09-15.
     "RUSTSEC-2026-0192", # ttf-parser unmaintained (not vuln); blocker: lopdf transitive (doc-sidecar); re-check 2026-09-15
+    # --- paste unmaintained --------------------------------------------------
+    # `paste` (proc-macro token pasting) — unmaintained but NOT vulnerable
+    # (RUSTSEC-2024-0436). Resolved in Cargo.lock only via non-workspace
+    # resolver edges (aws-lc-rs / itertools / portable-atomic / sqlx /
+    # wasm-bindgen); absent from the compiled default target graph per the
+    # same evidence standard as audit.toml's tracking note. Owner:
+    # Security/Dependencies. Remove when those crates drop paste. Re-check
+    # 2026-09-15.
+    "RUSTSEC-2024-0436", # paste unmaintained (not vuln); lockfile-resolver-only, not in compiled graph; re-check 2026-09-15
 ]
 
 [sources]

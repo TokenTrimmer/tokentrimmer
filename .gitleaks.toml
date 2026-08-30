@@ -54,7 +54,6 @@ regexes = [
   '''(?:sk-proj-|sk-ant-|AKIAIOSFODNN7EXAMPLE|tt_live_abc123)''',
 ]
 
-
 [[allowlists]]
 description = "Stripe setup scripts pass the credential only by environment reference"
 targetRules = ["curl-auth-user"]
@@ -65,4 +64,15 @@ paths = [
 ]
 regexes = [
   '''-u\s+"\$\{STRIPE_SECRET_KEY\}:"''',
+]
+
+# Vendor-SDK bridge test fixture (bridge.test.mjs): a fixed 32-hex
+# placeholder token for a loopback-only MCP server URL. Verified non-secret —
+# it is the same string checked into the test and asserted verbatim; a real
+# credential would have to match this exact dummy value to be silenced.
+[[allowlists]]
+description = "Vendor-SDK bridge test fixture: fixed 32-hex placeholder token for a loopback-only MCP server URL"
+targetRules = ["generic-api-key"]
+regexes = [
+  '''0123456789abcdef0123456789abcdef''',
 ]
