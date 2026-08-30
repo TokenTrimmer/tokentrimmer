@@ -47,7 +47,7 @@ async-trait = "0.1"
 tokio = { version = "1.40", features = ["full"] }
 axum = { version = "0.7", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "timeout"] }
 hyper = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
 # Direct dep ONLY so binaries can install an explicit process-default
