@@ -1,7 +1,8 @@
 //! Assemble a ranked file list into a token-budgeted context pack.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use tt_inspect_core::Language;
 
 use crate::index::RepoIndex;
 use crate::rank::RankedFile;
@@ -55,6 +56,18 @@ pub fn assemble(
             if spent.saturating_add(cost) <= token_budget {
                 spent = spent.saturating_add(cost);
                 content = Some(src);
+            } else if let Some(language) = language_for_path(&r.path) {
+                // Required file doesn't fit the remaining budget — inline its
+                // AST signature skeleton instead of dropping it outright
+                // (`skeletonizer.rs`). A rated-but-skipped file is invisible
+                // to the consumer; a skeletonized one keeps its API surface
+                // (signature) visible for near-zero tokens.
+                let skeleton = crate::skeletonizer::skeletonize_source(&src, language);
+                let skeleton_cost = tt_tokenize::estimate_tokens("openai", &skeleton);
+                if spent.saturating_add(skeleton_cost) <= token_budget {
+                    spent = spent.saturating_add(skeleton_cost);
+                    content = Some(skeleton);
+                }
             }
         }
         files.push(ContextFile {
@@ -79,6 +92,18 @@ pub fn assemble(
         files,
         token_estimate: spent,
         note,
+    }
+}
+
+/// Extension → tree-sitter language for the skeleton fallback in
+/// [`assemble`]. Files in other languages simply keep the drop-instead-of-
+/// inline behavior when they don't fit the budget.
+fn language_for_path(path: &Path) -> Option<Language> {
+    match path.extension()?.to_str()? {
+        "py" => Some(Language::Python),
+        "ts" | "tsx" | "mts" | "cts" => Some(Language::Typescript),
+        "js" | "jsx" | "mjs" | "cjs" => Some(Language::Javascript),
+        _ => None,
     }
 }
 
@@ -108,16 +133,54 @@ mod tests {
         );
         assert!(
             pack.files.iter().any(|f| f.path.ends_with("big.py")),
-            "big.py must be in the pack to prove it isn't inlined"
+            "big.py must be in the pack to prove it isn't fully inlined"
         );
         let big_inlined = pack
             .files
             .iter()
             .find(|f| f.path.ends_with("big.py"))
             .and_then(|f| f.content.as_ref());
+        // The full text never fits a 50-token budget; the skeleton fallback
+        // may inline a tiny signature-only view instead.
+        if let Some(content) = big_inlined {
+            assert!(
+                content.contains("skeletonized"),
+                "oversized file may only inline as a skeleton, got: {content:?}"
+            );
+        }
+    }
+
+    /// When a ranked file does not fit the remaining budget, its AST skeleton
+    /// is inlined instead of being dropped entirely.
+    #[test]
+    fn oversized_file_falls_back_to_ast_skeleton() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // A Python file: enough real definitions that the full text exceeds a
+        // tight budget, but whose skeleton (names only) fits.
+        let mut big = String::new();
+        for i in 0..8 {
+            big.push_str(&format!(
+                "def handler_{i}(req: int, res: str, payload: dict[str, int]) -> dict[str, int]:\n    return {{}}  # no-op body padding padding padding padding\n\n"
+            ));
+        }
+        fs::write(root.join("big.py"), &big).unwrap();
+        let idx = RepoIndex::build(root);
+        let ranked = rank(&idx, "handler");
+        // Budget sized so the FULL file cannot inline (~310 estimated tokens
+        // for 8 fully-commented handlers) but its 8-signature skeleton can
+        // (~≈205 estimated tokens).
+        let pack = assemble(&ranked, &idx, 10, 250);
+        let content = pack
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("big.py"))
+            .and_then(|f| f.content.as_ref())
+            .expect("skeleton should be inlined when the full file doesn't fit");
         assert!(
-            big_inlined.is_none(),
-            "big.py should not be inlined under a 50-token budget"
+            content.contains("skeletonized"),
+            "inlined content must be the skeleton"
         );
+        assert!(content.contains("handler_1"), "skeleton keeps definitions");
     }
 }

@@ -5,6 +5,8 @@ pub mod assemble;
 pub mod cache;
 pub mod index;
 pub mod rank;
+pub mod skeletonizer;
+pub mod turn_compactor;
 
 use std::path::Path;
 use std::sync::OnceLock;
