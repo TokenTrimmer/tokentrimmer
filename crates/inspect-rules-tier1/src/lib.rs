@@ -4,6 +4,7 @@
 pub mod rules;
 
 pub use rules::AgentNoTerminationConditionRule;
+pub use rules::AgentRunawayLoopTripwireRule;
 pub use rules::CacheAnthropicPromptCacheMissingRule;
 pub use rules::CacheAnthropicToolsNotCachedRule;
 pub use rules::CacheOpenaiPromptCacheEligibleRule;
@@ -46,6 +47,7 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(PromptVerboseFewShotRule::new()),
         Box::new(ConversationUnboundedHistoryRule::new()),
         Box::new(AgentNoTerminationConditionRule::new()),
+        Box::new(AgentRunawayLoopTripwireRule::new()),
         Box::new(ConfigNoAgentsMdRule::new()),
         Box::new(ConfigAgentsMdContainsSecretsRule::new()),
         Box::new(ConfigAgentsMdTooLongRule::new()),

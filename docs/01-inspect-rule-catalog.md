@@ -344,6 +344,22 @@ Every rule has the following fields:
 - **Why it costs:** Runaway loops can rack up hundreds of dollars per incident. Critical for cost AND correctness.
 - **Fix:** Add max iteration cap, idle detection, and budget circuit breaker.
 
+### `agent-runaway-loop-tripwire`
+- **Tier:** 1 · **Severity:** high · **Priority:** **P1**
+- **Detect:** The runtime half of the termination contract — agent loops that DO
+  carry a termination condition but one the code can defeat: a `continue` that
+  skips the
+  counter/termination update, a break/check behind a conditional that
+  tool output commonly fails, or a loop-carried counter never re-assigned on the
+  hot path. Ships in the Tier-1 rule pack (`all_rules()`).
+- **Why it costs:** A loop whose termination bookkeeping is bypassed is
+  runtime-unkillable from the inside — the cap token exists but never fires;
+  the spend continues until the caller kills the process or the budget
+  circuit breaker trips at the gateway.
+- **Fix:** Move the iteration cap increment/until-check onto the loop's
+  unconditional path (or floor it with a separate hard `for range(...)`), and
+  gate the termination branch on the cap, not on a tool-success condition.
+
 ### `agent-no-budget-limit`
 - **Tier:** 2 · **Severity:** high · **Priority:** **P1**
 - **Detect:** Agent without per-invocation cost ceiling.

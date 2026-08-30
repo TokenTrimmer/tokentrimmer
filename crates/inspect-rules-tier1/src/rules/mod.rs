@@ -4,6 +4,7 @@
 //! re-exported here for convenience.
 
 pub mod agent_no_termination_condition;
+pub mod agent_runaway_loop_tripwire;
 pub mod cache_anthropic_prompt_cache_missing;
 pub mod cache_anthropic_tools_not_cached;
 pub mod cache_openai_prompt_cache_eligible;
@@ -27,6 +28,7 @@ pub mod prompt_volatile_in_system_prompt;
 pub mod raw_document_to_vision_model;
 
 pub use agent_no_termination_condition::AgentNoTerminationConditionRule;
+pub use agent_runaway_loop_tripwire::AgentRunawayLoopTripwireRule;
 pub use cache_anthropic_prompt_cache_missing::CacheAnthropicPromptCacheMissingRule;
 pub use cache_anthropic_tools_not_cached::CacheAnthropicToolsNotCachedRule;
 pub use cache_openai_prompt_cache_eligible::CacheOpenaiPromptCacheEligibleRule;

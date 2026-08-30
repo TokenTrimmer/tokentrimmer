@@ -245,14 +245,14 @@ fn every_rule_has_min_fixtures_and_detects_correctly() {
     check_config_no_agents_md();
 }
 
-/// Verify `all_rules()` returns exactly 22 rules.
+/// Verify `all_rules()` returns exactly 23 rules.
 #[test]
-fn all_rules_count_is_22() {
+fn all_rules_count_is_23() {
     let rules = all_rules();
     assert_eq!(
         rules.len(),
-        22,
-        "all_rules() should return 22 rules, got {}",
+        23,
+        "all_rules() should return 23 rules, got {}",
         rules.len()
     );
 }
