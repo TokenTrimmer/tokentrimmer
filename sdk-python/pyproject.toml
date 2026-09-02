@@ -64,7 +64,7 @@ langgraph = ["langgraph>=0.2", "langchain-core>=0.3"]
 # post-API response-header metadata and de-duplicates the later success event.
 # Keep the published compatibility boundary below the first unverified 1.93
 # release until both hooks are rechecked there.
-litellm = ["litellm>=1.40,<1.95"]
+litellm = ["litellm>=1.40,<1.99"]
 # OpenTelemetry span recording. The integrations record cost attributes onto the
 # current span when this is installed; without it, they still accumulate totals.
 otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
@@ -79,7 +79,7 @@ test = [
     "respx>=0.22",
     "langchain-core>=0.3",
     "langgraph>=0.2",
-    "litellm>=1.40,<1.95",
+    "litellm>=1.40,<1.99",
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
     # D3: pypdf for the client-side document-distillation tests.
