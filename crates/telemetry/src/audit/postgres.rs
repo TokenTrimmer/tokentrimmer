@@ -18,7 +18,9 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{compute_hash, Actor, AuditEntry, AuditError, AuditWriter, PayloadFields};
+use super::{
+    compute_hash, Actor, AuditEntry, AuditError, AuditStorageReadiness, AuditWriter, PayloadFields,
+};
 
 /// Normalize a wall-clock timestamp to PostgreSQL's microsecond precision
 /// before it enters the signed payload. PostgreSQL discards sub-microsecond
@@ -65,6 +67,30 @@ impl PostgresAuditWriter {
 
 #[async_trait]
 impl AuditWriter for PostgresAuditWriter {
+    async fn storage_readiness(&self) -> Result<AuditStorageReadiness, AuditError> {
+        // Exercise this writer's actual pool and column contract, without
+        // creating synthetic tenants or polluting an immutable audit chain.
+        sqlx::query("SELECT id, org_id, ts, actor, event, payload, prev_hash, hash, signature, seq FROM audit_entries LIMIT 0")
+            .execute(&self.pool).await.map_err(|e| AuditError::Storage(e.to_string()))?;
+        let writable: bool = sqlx::query_scalar(
+            "SELECT NOT pg_is_in_recovery() \
+             AND current_setting('transaction_read_only') = 'off' \
+             AND has_table_privilege(current_user, 'audit_entries', 'INSERT')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AuditError::Storage(e.to_string()))?;
+        if !writable {
+            return Err(AuditError::Storage("audit storage is not writable".into()));
+        }
+        // This proves connectivity, readable columns and write eligibility,
+        // not every FK/trigger or future write. Actual append errors still
+        // must fail their owning transaction/action.
+        Ok(AuditStorageReadiness::Postgres {
+            verifying_key: self.verifying_key(),
+        })
+    }
+
     async fn write(
         &self,
         org_id: Uuid,
@@ -77,7 +103,24 @@ impl AuditWriter for PostgresAuditWriter {
             .begin()
             .await
             .map_err(|e| AuditError::Storage(e.to_string()))?;
+        let entry = self
+            .write_in_transaction(&mut tx, org_id, actor, event, payload)
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|e| AuditError::Storage(e.to_string()))?;
+        record_committed_tip(&entry);
+        Ok(entry)
+    }
 
+    async fn write_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        org_id: Uuid,
+        actor: Actor,
+        event: String,
+        payload: serde_json::Value,
+    ) -> Result<AuditEntry, AuditError> {
         // Serialize the entire read-sign-insert decision, including genesis.
         // `FOR UPDATE` alone cannot lock the absence of a predecessor row, so
         // two first writes could otherwise both sign seq=0 against zeroes.
@@ -90,7 +133,7 @@ impl AuditWriter for PostgresAuditWriter {
              )",
         )
         .bind(org_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| AuditError::Storage(e.to_string()))?;
 
@@ -104,7 +147,7 @@ impl AuditWriter for PostgresAuditWriter {
              FOR UPDATE",
         )
         .bind(org_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|e| AuditError::Storage(e.to_string()))?;
 
@@ -166,27 +209,9 @@ impl AuditWriter for PostgresAuditWriter {
         .bind(&hash_hex)
         .bind(&signature_hex)
         .bind(next_seq)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| AuditError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| AuditError::Storage(e.to_string()))?;
-
-        // Emit the new chain tip on a dedicated target so operators can route it
-        // to an append-only, off-box sink. This out-of-band anchor is what makes
-        // tail-truncation / whole-chain deletion detectable later via
-        // `tt audit verify --expected-tip` (the DB alone cannot reveal it).
-        // Per-write is fine: audit writes happen only on privileged actions.
-        tracing::info!(
-            target: "tt::audit::tip",
-            org_id = %org_id,
-            seq = next_seq,
-            tip_hash = %hash_hex,
-            ts = %timestamp.to_rfc3339(),
-            "audit chain tip advanced"
-        );
 
         Ok(AuditEntry {
             id,
@@ -216,6 +241,19 @@ impl AuditWriter for PostgresAuditWriter {
 
         rows.into_iter().map(AuditRow::into_entry).collect()
     }
+}
+
+/// Publish an off-box chain-tip anchor ONLY after the owning transaction has
+/// committed successfully. An uncommitted tip is not evidence of durable work.
+pub fn record_committed_tip(entry: &AuditEntry) {
+    tracing::info!(
+        target: "tt::audit::tip",
+        org_id = %entry.org_id,
+        seq = entry.seq,
+        tip_hash = %entry.hash,
+        ts = %entry.timestamp.to_rfc3339(),
+        "audit chain tip advanced"
+    );
 }
 
 #[cfg(test)]

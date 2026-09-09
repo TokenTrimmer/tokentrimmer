@@ -87,6 +87,16 @@ pub fn build_entry(
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
+/// Storage evidence exposed by a writer, not a promise of end-to-end audit
+/// completeness. Unknown/custom and in-memory writers cannot establish hosted
+/// PostgreSQL durability merely because they can produce a signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditStorageReadiness {
+    Unknown,
+    InMemory,
+    Postgres { verifying_key: VerifyingKey },
+}
+
 /// Storage backend for the audit log.
 ///
 /// Implementations are responsible for atomic `prev_hash` lookup + append to
@@ -105,6 +115,30 @@ pub trait AuditWriter: Send + Sync {
 
     /// Return all entries for `org_id` in insertion order (genesis first).
     async fn list(&self, org_id: Uuid) -> Result<Vec<AuditEntry>, AuditError>;
+
+    /// Probe this writer's own backend. The conservative default keeps an
+    /// uninspected/custom writer from advertising durable hosted evidence.
+    async fn storage_readiness(&self) -> Result<AuditStorageReadiness, AuditError> {
+        Ok(AuditStorageReadiness::Unknown)
+    }
+
+    /// Append within the caller's PostgreSQL business transaction. The caller
+    /// must commit before acknowledging success or publishing a chain-tip
+    /// anchor. No nested transaction or second pool connection is acquired.
+    /// Unsupported writers MUST fail, never silently append elsewhere.
+    #[cfg(feature = "postgres")]
+    async fn write_in_transaction(
+        &self,
+        _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        _org_id: Uuid,
+        _actor: Actor,
+        _event: String,
+        _payload: serde_json::Value,
+    ) -> Result<AuditEntry, AuditError> {
+        Err(AuditError::Storage(
+            "transactional audit append is unsupported by this writer".into(),
+        ))
+    }
 }
 
 // ─── InMemoryAuditWriter ──────────────────────────────────────────────────────
@@ -153,6 +187,10 @@ impl Default for InMemoryAuditWriter {
 
 #[async_trait]
 impl AuditWriter for InMemoryAuditWriter {
+    async fn storage_readiness(&self) -> Result<AuditStorageReadiness, AuditError> {
+        Ok(AuditStorageReadiness::InMemory)
+    }
+
     async fn write(
         &self,
         org_id: Uuid,
