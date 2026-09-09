@@ -29,7 +29,7 @@ uuid.workspace = true
 # (the `tests/replay.rs` insta snapshot + the `tests/bootstrap.rs` value pin) and
 # re-attesting — never an incidental `cargo update`. See the RNG-reproducibility
 # constraint in the repo memory.
-rand = "=0.10.1"
+rand = "=0.10.2"
 rand_chacha = "=0.10.0"
 
 [features]
