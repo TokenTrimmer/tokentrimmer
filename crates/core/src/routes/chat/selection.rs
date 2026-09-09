@@ -137,6 +137,48 @@ pub(crate) struct RouteMatch {
     pub(crate) workflow: Option<tt_routing::RouteWorkflow>,
 }
 
+impl RouteMatch {
+    /// Preserve the selected policy's privacy effects independently of dispatch
+    /// selection. Suppression must clear every optional cost/action effect, not
+    /// discard the match (which would also discard redaction and cache denial).
+    /// A capability rejection is not a sticky pause and must not claim one.
+    fn safety_only(
+        route: &tt_routing::Route,
+        route_version_id: Option<i64>,
+        requested_model: &str,
+        input_tokens_estimate: u32,
+    ) -> Self {
+        Self {
+            route_id: route.id,
+            route_version_id,
+            route_name: route.name.clone(),
+            paused: route.paused,
+            disable_cache: route.then.disable_cache,
+            redact: route.then.redact,
+            input_tokens_estimate,
+            target_model: requested_model.to_owned(),
+            fallbacks: vec![],
+            max_cost_usd: None,
+            flex: false,
+            batch: false,
+            compress: false,
+            doc_compaction: false,
+            content_compress: false,
+            document_lane: false,
+            format_switch: None,
+            diff: false,
+            traffic_pct: None,
+            shadow_model: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
+            agentic_budget: None,
+            panel: None,
+            workflow: None,
+        }
+    }
+}
+
 /// Post-selection boundary reached by the live gateway routing seam.
 ///
 /// This deliberately stops before canary assignment and the downstream action
@@ -206,8 +248,11 @@ fn forced_miss(forced: Option<&str>) -> ApiResult<Option<RouteMatch>> {
 ///
 /// - no routing store is configured (dev / free tier),
 /// - the request has no resolvable org (synthetic context),
-/// - the backend errors (we log + fall through — never fail user traffic),
 /// - or no enabled route matches.
+///
+/// A configured store that cannot supply a fresh policy returns 503 before
+/// dispatch/cache I/O. Neither no policy nor an expired snapshot is permission
+/// to bypass potentially mandatory privacy controls.
 pub(crate) async fn apply_routing(
     state: &AppState,
     ctx: &RequestContext,
@@ -224,8 +269,11 @@ pub(crate) async fn apply_routing(
     let engine = match store.engine_for(ctx.org_id).await {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(error = %e, org_id = %ctx.org_id, "routing store lookup failed — passing request through unrouted");
-            return Ok(None); // never fail user traffic on a transient backend error
+            tracing::warn!(error = %e, org_id = %ctx.org_id, "routing policy unavailable — refusing request before dispatch");
+            return Err(ApiError::ServiceUnavailable(
+                "Routing policy is temporarily unavailable; retry when policy storage recovers."
+                    .into(),
+            ));
         }
     };
 
@@ -328,47 +376,12 @@ pub(crate) async fn apply_routing(
         // passthroughs — embeddings has no warnings-header or request_logs
         // plumbing, so this counter is its only pause-visibility signal.
         crate::metrics::record_route_paused_passthrough(&m.name);
-        return Ok(Some(RouteMatch {
-            batch: false,
-            route_id: m.id,
+        return Ok(Some(RouteMatch::safety_only(
+            m,
             route_version_id,
-            route_name: m.name.clone(),
-            paused: true,
-            // ALL cost levers off (fail-safe expensive direction):
-            fallbacks: vec![],
-            max_cost_usd: None,
-            flex: false,
-            compress: false,
-            doc_compaction: false,
-            content_compress: false,
-            // Paused route → Document Lane suppressed (COST lever).
-            document_lane: false,
-            format_switch: None,
-            diff: false,
-            traffic_pct: None,
-            shadow_model: None,
-            minify_json: false,
-            reasoning_max_effort: None,
-            reasoning_budget_tokens: None,
-            // The agentic context budget is a COST lever (it nets caching /
-            // elision / routing for savings) — suppressed on a paused route,
-            // exactly like compress/flex/format_switch above.
-            agentic_budget: None,
-            // The Fusion panel is a COST lever (it fans out across N
-            // members + an arbiter) — suppressed on a paused route, so a paused
-            // panel route flows to the originally-requested single model.
-            panel: None,
-            // The workflow detour is a COST lever (a matched workflow runs real
-            // multi-step spend) — suppressed on a paused route, exactly like the
-            // panel above.
-            workflow: None,
-            // SAFETY/privacy levers stay ON (pausing a quality gate must never
-            // disable a privacy guardrail):
-            disable_cache: m.then.disable_cache,
-            redact: m.then.redact,
-            input_tokens_estimate: input_tokens,
-            target_model: req.model.clone(), // no rewrite
-        }));
+            &req.model,
+            input_tokens,
+        )));
     }
 
     let route_id = m.id;
@@ -419,16 +432,28 @@ pub(crate) async fn apply_routing(
                 route_id = %route_id,
                 model = %effective_target,
                 reasons = ?reasons,
-                "route_skipped_capability: rewrite target lacks required capabilities, passing through unchanged"
+                "route_skipped_capability: target lacks required capabilities; privacy effects remain required"
             );
             record_route_application_trace(
                 ctx.org_id,
                 RouteApplicationOutcome::CapabilitySuppressed,
                 &trace,
             );
-            // Do not rewrite req.model — return None so the request
-            // continues with the original model.
-            return Ok(None);
+            // An explicitly forced target must not silently become a different
+            // dispatch. Refuse before I/O. Ordinary selection may use the caller
+            // model, but only with the selected privacy effects still enforced.
+            if forced_route.is_some() {
+                return Err(ApiError::InvalidRequest(format!(
+                    "forced route target lacks required capabilities: {}",
+                    reasons.join(", ")
+                )));
+            }
+            return Ok(Some(RouteMatch::safety_only(
+                m,
+                route_version_id,
+                &req.model,
+                input_tokens,
+            )));
         }
     }
 
