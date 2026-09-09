@@ -289,6 +289,51 @@ impl KeyStore for InMemoryKeyStore {
     }
 }
 
+/// Generate the material for a new API key — a fresh plaintext secret (which
+/// the caller MUST show exactly once and then discard), its argon2 hash and
+/// the [`ApiKey`] record that will be persisted — WITHOUT touching any store
+/// or audit writer.
+///
+/// Transactional callers use this to prepare the row outside their database
+/// transaction (argon2 hashing is CPU-bound and should not extend a lock),
+/// then insert via `PostgresKeyStore::insert_in_transaction` and append their
+/// signed audit evidence in the same transaction. [`issue`] uses the same
+/// generator for the pooled flow.
+///
+/// The plaintext is exactly what [`issue`] would have produced: an
+/// environment-prefixed hex string of `KEY_RANDOM_BYTES` random bytes.
+pub fn generate_key_material(
+    org_id: Uuid,
+    label: impl Into<String>,
+    environment: Environment,
+) -> (ApiKey, String) {
+    let mut bytes = [0u8; KEY_RANDOM_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    let random_hex = hex::encode(bytes);
+    let plaintext = format!("{}{}", environment.prefix(), random_hex);
+    let prefix = plaintext[..PREFIX_DISPLAY_LEN].to_string();
+
+    // Hash the plaintext with argon2.
+    let salt = SaltString::generate(&mut ArgonRng);
+    let argon = Argon2::default();
+    let hash = argon
+        .hash_password(plaintext.as_bytes(), &salt)
+        .expect("argon2 hashing of a bounded-charset password cannot fail")
+        .to_string();
+
+    let key = ApiKey {
+        id: Uuid::now_v7(),
+        org_id,
+        prefix,
+        hash,
+        label: label.into(),
+        environment,
+        created_at: Utc::now(),
+        revoked_at: None,
+    };
+    (key, plaintext)
+}
+
 /// Issue a new API key for `org_id`.
 ///
 /// Writes the key to `store`, emits an `apikey.issued` audit row via
@@ -319,33 +364,9 @@ pub async fn issue<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
     loop {
         attempt += 1;
 
-        // Generate 16 random bytes via the OS CSPRNG.
-        let mut bytes = [0u8; KEY_RANDOM_BYTES];
-        OsRng.fill_bytes(&mut bytes);
-        let random_hex = hex::encode(bytes);
-        let plaintext = format!("{}{}", environment.prefix(), random_hex);
-        let prefix = plaintext[..PREFIX_DISPLAY_LEN].to_string();
-
-        // Hash the plaintext with argon2.
-        let salt = SaltString::generate(&mut ArgonRng);
-        let argon = Argon2::default();
-        let hash = argon
-            .hash_password(plaintext.as_bytes(), &salt)
-            .map_err(|e| KeyError::Hash(e.to_string()))?
-            .to_string();
-
-        let id = Uuid::now_v7();
-        let now = Utc::now();
-        let key = ApiKey {
-            id,
-            org_id,
-            prefix: prefix.clone(),
-            hash,
-            label: label.clone(),
-            environment,
-            created_at: now,
-            revoked_at: None,
-        };
+        let (key, plaintext) = generate_key_material(org_id, &label, environment);
+        let id = key.id;
+        let prefix = key.prefix.clone();
 
         match store.insert(key.clone()).await {
             Ok(()) => {
@@ -360,11 +381,14 @@ pub async fn issue<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
                     .write(org_id, actor, "apikey.issued".to_string(), payload)
                     .await
                 {
-                    // The key IS persisted but the tamper-evident chain entry
-                    // failed. KeyStore + AuditWriter are separate traits (not a
-                    // shared txn yet — see follow-up), so surface this loudly so
-                    // it can be re-emitted out-of-band rather than silently
-                    // diverging. (§5.10)
+                    // Pooled-flow limitation: the trait cannot carry a shared
+                    // transaction, so the key IS persisted without its chain
+                    // entry. Callers that must not acknowledge issuance without
+                    // durable evidence (the hosted admin service) use
+                    // `generate_key_material` +
+                    // `PostgresKeyStore::insert_in_transaction` and append
+                    // audit via `write_in_transaction` instead of this
+                    // helper.
                     tracing::error!(
                         key_id = %id,
                         event = "apikey.issued",
@@ -485,8 +509,11 @@ pub async fn revoke_key<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
         .write(org_id, actor, "apikey.revoked".to_string(), payload)
         .await
     {
-        // Key IS revoked but the chain entry failed; loud signal for
-        // out-of-band re-emission (no shared txn across stores yet). (§5.10)
+        // Pooled-flow limitation: the key IS revoked but the chain entry
+        // failed. The hosted admin service uses
+        // `PostgresKeyStore::revoke_in_transaction` plus
+        // `write_in_transaction` so revocation cannot acknowledge success
+        // without durable evidence.
         tracing::error!(
             key_id = %key_id,
             event = "apikey.revoked",
