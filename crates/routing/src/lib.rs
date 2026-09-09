@@ -26,7 +26,7 @@ pub use contract::{
     canonicalize_route_parts, canonicalize_route_value, CanonicalRoute, RouteValidationIssue,
     RouteWriteRequest, ROUTE_SCHEMA_ID, ROUTE_SCHEMA_VERSION,
 };
-pub use latency::{LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
+pub use latency::{LatencyOperation, LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
 pub use matcher::{
     evaluate_route_conditions, route_conditions_match, RouteConditionDecision,
     RouteConditionEvaluation, RouteConditionField, RouteConditionOutcome, RouteFeatureEvidence,
@@ -2497,9 +2497,14 @@ mod tests {
 
         // Feed a handful of slow samples — not yet enough to report a p95.
         for _ in 0..(crate::LATENCY_MIN_SAMPLES - 1) {
-            tracker.record("openai", "gpt-4o", 3000);
+            tracker.record(
+                "openai",
+                "gpt-4o",
+                LatencyOperation::StreamEstablishment,
+                3000,
+            );
         }
-        let p95_cold = tracker.p95("openai", "gpt-4o");
+        let p95_cold = tracker.p95("openai", "gpt-4o", LatencyOperation::StreamEstablishment);
         assert!(p95_cold.is_none(), "still cold");
         assert!(
             eng.evaluate_with_signals(
@@ -2515,8 +2520,13 @@ mod tests {
         );
 
         // One more slow sample crosses MIN_SAMPLES → p95 is reported and high.
-        tracker.record("openai", "gpt-4o", 3000);
-        let p95_warm = tracker.p95("openai", "gpt-4o");
+        tracker.record(
+            "openai",
+            "gpt-4o",
+            LatencyOperation::StreamEstablishment,
+            3000,
+        );
+        let p95_warm = tracker.p95("openai", "gpt-4o", LatencyOperation::StreamEstablishment);
         assert_eq!(p95_warm, Some(3000));
         assert!(
             eng.evaluate_with_signals(
