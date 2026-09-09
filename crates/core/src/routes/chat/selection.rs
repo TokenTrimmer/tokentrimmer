@@ -309,7 +309,11 @@ pub(crate) async fn apply_routing(
     let observed_p95_ms = if provider_id.is_empty() {
         None
     } else {
-        state.latency_tracker.p95(provider_id, &req.model)
+        state.latency_tracker.p95(
+            provider_id,
+            &req.model,
+            tt_routing::LatencyOperation::StreamEstablishment,
+        )
     };
 
     // Forced routing has its own trace mode: it does not evaluate conditions or

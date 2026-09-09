@@ -217,9 +217,12 @@ pub(super) async fn handle_streaming(
                 // (time-to-first-byte). See the non-streaming hook above.
                 if __stream_result.is_ok() {
                     let __ms = u32::try_from(__elapsed.as_millis()).unwrap_or(u32::MAX);
-                    state
-                        .latency_tracker
-                        .record(provider.id(), &req.model, __ms);
+                    state.latency_tracker.record(
+                        provider.id(),
+                        &req.model,
+                        tt_routing::LatencyOperation::StreamEstablishment,
+                        __ms,
+                    );
                 }
                 let stream = __stream_result?;
                 Ok((provider, req.model.clone(), stream))
@@ -902,9 +905,12 @@ async fn complete_once_with_retry_policy(
             // upstream latency. Keyed by the served `(provider, model)`.
             if __dispatch.is_ok() {
                 let __ms = u32::try_from(__elapsed.as_millis()).unwrap_or(u32::MAX);
-                state
-                    .latency_tracker
-                    .record(provider.id(), &req.model, __ms);
+                state.latency_tracker.record(
+                    provider.id(),
+                    &req.model,
+                    tt_routing::LatencyOperation::BufferedCompletion,
+                    __ms,
+                );
             }
             __dispatch
                 .map(|resp| (provider, resp))

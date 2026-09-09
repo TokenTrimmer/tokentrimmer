@@ -28,13 +28,17 @@ use crate::{
 /// The set of capabilities a [`ChatCompletionRequest`] requires.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequiredCapabilities {
-    /// At least one message contains an image_url or input_audio content part.
+    /// At least one message contains an image_url content part.
     pub vision: bool,
+    /// At least one message contains an input_audio content part.
+    pub audio: bool,
     /// The request has non-empty `tools`, or any assistant message contains
     /// `tool_calls`.
     pub tools: bool,
     /// `response_format.type` is `"json_object"` or `"json_schema"`.
     pub json_mode: bool,
+    /// `stream` is true; models explicitly lacking Streaming cannot serve.
+    pub streaming: bool,
 }
 
 impl RequiredCapabilities {
@@ -54,15 +58,23 @@ impl RequiredCapabilities {
             }
         }
 
-        // scan messages for vision content and tool_calls
+        // streaming
+        if req.stream {
+            caps.streaming = true;
+        }
+
+        // scan messages for vision/audio content and tool_calls
         for msg in &req.messages {
             match msg {
                 Message::User { content, .. } | Message::System { content } => {
                     if let MessageContent::Parts(parts) = content {
                         for part in parts {
                             match part {
-                                ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => {
+                                ContentPart::ImageUrl { .. } => {
                                     caps.vision = true;
+                                }
+                                ContentPart::InputAudio { .. } => {
+                                    caps.audio = true;
                                 }
                                 // A Document part does NOT require Vision: the
                                 // Document Lane's target is a TEXT model (the
@@ -99,10 +111,16 @@ impl RequiredCapabilities {
         if self.vision && !info.capabilities.contains(&Capability::Vision) {
             return false;
         }
+        if self.audio && !info.capabilities.contains(&Capability::Audio) {
+            return false;
+        }
         if self.tools && !info.capabilities.contains(&Capability::Tools) {
             return false;
         }
         if self.json_mode && !info.capabilities.contains(&Capability::JsonMode) {
+            return false;
+        }
+        if self.streaming && !info.capabilities.contains(&Capability::Streaming) {
             return false;
         }
         if estimated_tokens > 0 && info.max_input_tokens < estimated_tokens {
@@ -118,11 +136,17 @@ impl RequiredCapabilities {
         if self.vision && !info.capabilities.contains(&Capability::Vision) {
             reasons.push("vision_not_supported");
         }
+        if self.audio && !info.capabilities.contains(&Capability::Audio) {
+            reasons.push("audio_not_supported");
+        }
         if self.tools && !info.capabilities.contains(&Capability::Tools) {
             reasons.push("tools_not_supported");
         }
         if self.json_mode && !info.capabilities.contains(&Capability::JsonMode) {
             reasons.push("json_mode_not_supported");
+        }
+        if self.streaming && !info.capabilities.contains(&Capability::Streaming) {
+            reasons.push("streaming_not_supported");
         }
         if estimated_tokens > 0 && info.max_input_tokens < estimated_tokens {
             reasons.push("context_window_too_small");
@@ -165,8 +189,8 @@ fn extract_text(content: &MessageContent) -> String {
 
 /// True when any message carries an image (`ContentPart::ImageUrl`) content part.
 ///
-/// Distinct from [`RequiredCapabilities`], which collapses image **and** audio
-/// into a single `vision` flag; routing needs to tell the two modalities apart.
+/// Distinct from [`RequiredCapabilities`], which separates image and audio
+/// into independent required capabilities.
 pub fn request_has_images(req: &ChatCompletionRequest) -> bool {
     req.messages
         .iter()
@@ -506,6 +530,69 @@ mod tests {
         }];
         assert!(request_has_audio(&req));
         assert!(!request_has_images(&req));
+    }
+
+    #[test]
+    fn audio_part_sets_audio_not_vision() {
+        let mut req = base_req();
+        req.messages = vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "abc".into(),
+                    format: "wav".into(),
+                },
+            }]),
+            name: None,
+        }];
+        let caps = RequiredCapabilities::from_request(&req);
+        assert!(caps.audio);
+        assert!(!caps.vision, "audio must not be treated as vision");
+    }
+
+    #[test]
+    fn audio_cannot_route_to_vision_only_model() {
+        let vision_only = ModelInfo {
+            id: "vision-only".into(),
+            provider: "mock".into(),
+            capabilities: vec![Capability::Text, Capability::Vision, Capability::Tools],
+            max_input_tokens: 128_000,
+            max_output_tokens: 4096,
+        };
+        let req_with_audio = RequiredCapabilities {
+            audio: true,
+            ..Default::default()
+        };
+        assert!(
+            !req_with_audio.satisfied_by(&vision_only, 0),
+            "a vision-only model without Audio cannot serve audio"
+        );
+        let reasons = req_with_audio.skip_reasons(&vision_only, 0);
+        assert!(reasons.contains(&"audio_not_supported"));
+    }
+
+    #[test]
+    fn streaming_request_requires_streaming_capability() {
+        let mut req = base_req();
+        req.stream = true;
+        let caps = RequiredCapabilities::from_request(&req);
+        assert!(caps.streaming);
+        let no_streaming = ModelInfo {
+            id: "no-streaming".into(),
+            provider: "mock".into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 4096,
+            max_output_tokens: 1024,
+        };
+        assert!(!caps.satisfied_by(&no_streaming, 0));
+        assert!(caps
+            .skip_reasons(&no_streaming, 0)
+            .contains(&"streaming_not_supported"));
+
+        let with_streaming = ModelInfo {
+            capabilities: vec![Capability::Text, Capability::Streaming],
+            ..no_streaming
+        };
+        assert!(caps.satisfied_by(&with_streaming, 0));
     }
 
     #[test]
