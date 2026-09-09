@@ -38,6 +38,28 @@ Each created route gets a stable `id` (a UUID), echoed back on create and used
 for `tt route show <id>` / `tt route rm <id>` and for telemetry attribution
 (`request_logs.matched_route_id`).
 
+## Routing failures and privacy
+
+When a configured routing store cannot supply a fresh policy snapshot, routing
+returns `503 service_unavailable` instead of continuing unrouted. An expired
+snapshot is not used to authorize dispatch; recover policy storage and retry.
+Explicitly unconfigured local routing still permits an unforced request.
+
+For chat completions (buffered and streaming), a selected route whose target
+fails known capability checks keeps its `redact` and `disable_cache` effects
+while serving the caller's original model. Optional route cost effects,
+including route fallbacks and shadows, are suppressed. A pause uses the same
+privacy-preserving projection. `disable_cache` still overrides client cache
+opt-ins; authentication revocation-marker reads are not response caching.
+
+An unknown forced route or a known-incompatible forced target returns `400`
+rather than silently dispatching another model. Forcing a paused route still
+honors the pause. `X-TokenTrimmer-Route-Matched` identifies a selected definition,
+not proof that its target rewrite or all configured effects executed.
+
+This does not introduce organization-wide rule composition: legacy first-match
+selection remains unchanged.
+
 ## Conditions (`when`)
 
 All conditions in a `when` block are **AND-ed**: a route matches only when every

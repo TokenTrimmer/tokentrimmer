@@ -55,8 +55,9 @@ impl CachingRoutingStore {
     }
 
     /// Hot path. Returns the cached engine for `org_id` when fresh, otherwise
-    /// refreshes from the underlying store. Errors from the backend propagate
-    /// — callers should treat them as "no routes" and dispatch unchanged.
+    /// refreshes from the underlying store. Errors from the backend propagate.
+    /// Callers must refuse policy-governed work when no fresh policy is available;
+    /// an error is NOT an empty policy and expired snapshots are not served.
     pub async fn engine_for(&self, org_id: Uuid) -> Result<Arc<RoutingEngine>, RoutingStoreError> {
         // Cheap fresh-cache check.
         {

@@ -50,3 +50,4 @@ read individual archives directly.
 - 2026-05-29T13:26:59Z · task=`trackA-simulate-plan-tool` · branch=`main` · diff=" 29 files changed, 352 insertions(+), 78 deletions(-)" → [archive](sessions/2026-05-29T13-26-59Z-trackA-simulate-plan-tool.md)
 - 2026-05-29T13:46:15Z · task=`trackA-sse-transport` · branch=`main` · diff=" 30 files changed, 386 insertions(+), 90 deletions(-)" → [archive](sessions/2026-05-29T13-46-15Z-trackA-sse-transport.md)
 - 2026-05-29T13:52:59Z · task=`trackA-sse-transport` · branch=`main` · diff=" 32 files changed, 405 insertions(+), 100 deletions(-)" → [archive](sessions/2026-05-29T13-52-59Z-trackA-sse-transport.md)
+- 2026-09-09T01:39:52Z · task=`(idle — all OSS actionable items shipped)` · branch=`fix/september-review-correctness` · diff=" 6 files changed, 100 insertions(+), 250 deletions(-)" → [archive](sessions/2026-09-09T01-39-52Z-(idle — all OSS actionable items shipped).md)
