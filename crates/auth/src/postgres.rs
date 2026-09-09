@@ -150,19 +150,18 @@ impl PostgresProviderCredentialStore {
         Ok(Self { pool, master_key })
     }
 
-    /// Encrypt + insert/upsert a new credential row.
-    ///
-    /// Used by the dashboard's credential-entry UI (when that lands) and by
-    /// the integration tests below.
-    pub async fn put(
+    /// Encrypt (but do not persist) `upstream_api_key` for `(org_id,
+    /// provider)` under this store's root key, returning the sealed blob plus
+    /// the serialized extra headers — the row values shared by the pooled and
+    /// caller-owned-transaction upserts.
+    fn seal(
         &self,
         org_id: Uuid,
         provider: &str,
-        label: &str,
         upstream_api_key: &str,
         base_url: Option<&str>,
         extra_headers: &[(String, String)],
-    ) -> Result<Uuid, CredentialStoreError> {
+    ) -> Result<(Vec<u8>, serde_json::Value), CredentialStoreError> {
         validate_credential_inputs(base_url, extra_headers)?;
         let derived = self.derive_key(org_id, provider);
         let cipher = XChaCha20Poly1305::new((&derived).into());
@@ -178,8 +177,26 @@ impl PostgresProviderCredentialStore {
         let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         blob.extend_from_slice(&nonce);
         blob.extend_from_slice(&ciphertext);
-
         let extra_json = serde_json::to_value(extra_headers)?;
+        Ok((blob, extra_json))
+    }
+
+    /// Encrypt + insert/upsert a new credential row.
+    ///
+    /// Used by the dashboard's credential-entry UI (when that lands) and by
+    /// the integration tests below.
+    pub async fn put(
+        &self,
+        org_id: Uuid,
+        provider: &str,
+        label: &str,
+        upstream_api_key: &str,
+        base_url: Option<&str>,
+        extra_headers: &[(String, String)],
+    ) -> Result<Uuid, CredentialStoreError> {
+        let (blob, extra_json) =
+            self.seal(org_id, provider, upstream_api_key, base_url, extra_headers)?;
+
         let id = sqlx::query_scalar::<_, Uuid>(
             r#"INSERT INTO provider_credentials
                  (org_id, provider, label, secret_enc, base_url, extra_headers)
@@ -199,6 +216,53 @@ impl PostgresProviderCredentialStore {
         .bind(base_url)
         .bind(&extra_json)
         .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Encrypt + upsert inside a **caller-owned transaction** — identical
+    /// encryption, upsert key and rotated_at semantics to [`Self::put`], so a
+    /// credential row and its caller-appended signed audit evidence commit or
+    /// roll back together. Callers that can fail between issues and evidence
+    /// must use this instead of the pooled `put`.
+    ///
+    /// Mirrors the pooled [`Self::put`] argument list plus the owning
+    /// transaction (8 > clippy's default limit of 7) rather than introducing a
+    /// one-off params struct — parity keeps the two upserts auditable against
+    /// each other.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        org_id: Uuid,
+        provider: &str,
+        label: &str,
+        upstream_api_key: &str,
+        base_url: Option<&str>,
+        extra_headers: &[(String, String)],
+    ) -> Result<Uuid, CredentialStoreError> {
+        let (blob, extra_json) =
+            self.seal(org_id, provider, upstream_api_key, base_url, extra_headers)?;
+
+        let id = sqlx::query_scalar::<_, Uuid>(
+            r#"INSERT INTO provider_credentials
+                 (org_id, provider, label, secret_enc, base_url, extra_headers)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (org_id, provider) DO UPDATE SET
+                 label = EXCLUDED.label,
+                 secret_enc = EXCLUDED.secret_enc,
+                 base_url = EXCLUDED.base_url,
+                 extra_headers = EXCLUDED.extra_headers,
+                 rotated_at = now()
+               RETURNING id"#,
+        )
+        .bind(org_id)
+        .bind(provider)
+        .bind(label)
+        .bind(&blob)
+        .bind(base_url)
+        .bind(&extra_json)
+        .fetch_one(&mut **tx)
         .await?;
         Ok(id)
     }
@@ -476,6 +540,60 @@ impl ProviderCredentialStore for PostgresProviderCredentialStore {
     }
 }
 
+impl PostgresProviderCredentialStore {
+    /// Delete within a **caller-owned transaction** — same `(org_id, provider)`
+    /// scoping as [`ProviderCredentialStore::delete`]. Returns `true` when a
+    /// row existed and was removed, so the caller can condition its signed
+    /// audit evidence on an actual mutation.
+    pub async fn delete_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        org_id: Uuid,
+        provider: &str,
+    ) -> Result<bool, CredentialStoreError> {
+        let res =
+            sqlx::query(r#"DELETE FROM provider_credentials WHERE org_id = $1 AND provider = $2"#)
+                .bind(org_id)
+                .bind(provider)
+                .execute(&mut **tx)
+                .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Count an org's stored credentials within a caller-owned transaction,
+    /// for cap checks that must be taken under the same locks as the upsert
+    /// (a pooled count can pass a check-then-insert race).
+    pub async fn count_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        org_id: Uuid,
+    ) -> Result<u32, CredentialStoreError> {
+        let n: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM provider_credentials WHERE org_id = $1"#)
+                .bind(org_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        Ok(n as u32)
+    }
+
+    /// Existence check within a caller-owned transaction (no decryption,
+    /// unlike [`ProviderCredentialStore::get`]) for cap gating on updates.
+    pub async fn exists_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        org_id: Uuid,
+        provider: &str,
+    ) -> Result<bool, CredentialStoreError> {
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM provider_credentials WHERE org_id = $1 AND provider = $2
+               )"#,
+        )
+        .bind(org_id)
+        .bind(provider)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(CredentialStoreError::Sql)
+    }
+}
+
 // ─── Postgres-backed API key store ─────────────────────────────────────────
 //
 // Pairs with the `api_keys` table from the cloud-schema-0001 migration
@@ -498,6 +616,72 @@ impl PostgresKeyStore {
     /// Construct from an existing pool.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Insert `key` inside a caller-owned transaction — same statement and
+    /// org-scoped semantics as [`KeyStore::insert`], but the row (and its
+    /// signed audit evidence, appended by the caller through the same
+    /// transaction) commit or roll back together.
+    ///
+    /// Associated function on purpose: transactional callers bypass the
+    /// `dyn KeyStore` trait object and address the concrete Postgres store,
+    /// because the trait cannot carry a caller-owned transaction.
+    pub async fn insert_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        key: ApiKey,
+    ) -> Result<(), KeyError> {
+        let res = sqlx::query(
+            r#"INSERT INTO api_keys
+                 (id, org_id, label, prefix, secret_hash, environment, created_at, last_used_at, revoked_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+        )
+        .bind(key.id)
+        .bind(key.org_id)
+        .bind(&key.label)
+        .bind(&key.prefix)
+        .bind(&key.hash)
+        .bind(env_to_str(key.environment))
+        .bind(key.created_at)
+        .bind(Option::<DateTime<Utc>>::None) // last_used_at — not tracked at insert time
+        .bind(key.revoked_at)
+        .execute(&mut **tx)
+        .await;
+
+        match res {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(db_err))
+                if db_err.code().as_deref() == Some("23505")
+                    && db_err
+                        .constraint()
+                        .map(|c| c.contains("prefix"))
+                        .unwrap_or(false) =>
+            {
+                Err(KeyError::PrefixCollision)
+            }
+            Err(e) => Err(KeyError::Store(e.to_string())),
+        }
+    }
+
+    /// Revoke within a caller-owned transaction — org-scoped, active-only,
+    /// exactly the [`KeyStore::revoke`] statement. Returns `true` only when
+    /// exactly the one `(id, org_id)` row flipped from active to revoked.
+    pub async fn revoke_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: Uuid,
+        org_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<bool, KeyError> {
+        let rows = sqlx::query(
+            r#"UPDATE api_keys SET revoked_at = $3
+               WHERE id = $1 AND org_id = $2 AND revoked_at IS NULL"#,
+        )
+        .bind(id)
+        .bind(org_id)
+        .bind(at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| KeyError::Store(e.to_string()))?;
+        Ok(rows.rows_affected() == 1)
     }
 }
 
@@ -837,6 +1021,142 @@ mod key_store_tests {
             .await
             .ok();
     }
+
+    /// Transactional variants: caller-owned transactions commit or roll back the
+    /// key row exactly as the caller directs, with the same org scoping and
+    /// idempotence semantics as the pooled statements. Signed-evidence
+    /// atomicity (audit append + rollback) is exercised by the cloud repo's
+    /// integration tests, which own the `MutationAudit` pattern.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL (Postgres; the test creates its own api_keys table) — run with --include-ignored"]
+    async fn postgres_key_store_transactional_insert_revoke_semantics() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS orgs (
+             id   uuid PRIMARY KEY,
+             name text NOT NULL DEFAULT 'test-org'
+           )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create orgs");
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS api_keys (
+             id            uuid PRIMARY KEY,
+             org_id        uuid NOT NULL,
+             label         text NOT NULL,
+             prefix        text NOT NULL UNIQUE,
+             secret_hash   text NOT NULL,
+             environment   text NOT NULL,
+             created_at    timestamptz NOT NULL DEFAULT now(),
+             last_used_at  timestamptz,
+             revoked_at    timestamptz,
+             CHECK (environment IN ('live', 'test'))
+           )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create api_keys");
+
+        let org = Uuid::now_v7();
+        sqlx::query("INSERT INTO orgs (id, name) VALUES ($1, 'test-org') ON CONFLICT DO NOTHING")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("seed org");
+
+        // A rollback leaves no key row: the caller that fails after appending
+        // its evidence cannot leave an issued-but-unevidenced key behind.
+        let key_rolled_back = ApiKey {
+            id: Uuid::now_v7(),
+            org_id: org,
+            prefix: format!("tt_live_{}", &Uuid::now_v7().simple().to_string()[..12]),
+            hash: String::new(),
+            label: "rolled back".into(),
+            environment: Environment::Live,
+            created_at: Utc::now(),
+            revoked_at: None,
+        };
+        {
+            let mut tx = pool.begin().await.expect("begin");
+            PostgresKeyStore::insert_in_transaction(&mut tx, key_rolled_back.clone())
+                .await
+                .expect("insert in tx");
+            tx.rollback().await.expect("rollback");
+        }
+        let rolled_back_present: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1)")
+                .bind(key_rolled_back.id)
+                .fetch_one(&pool)
+                .await
+                .expect("check rolled-back row");
+        assert!(!rolled_back_present, "rollback must leave no key row");
+
+        // Commit persists; revoke is org-scoped, exactly-once and only-while-active.
+        let key = ApiKey {
+            id: Uuid::now_v7(),
+            org_id: org,
+            prefix: format!("tt_live_{}", &Uuid::now_v7().simple().to_string()[..12]),
+            hash: String::new(),
+            label: "committed".into(),
+            environment: Environment::Live,
+            created_at: Utc::now(),
+            revoked_at: None,
+        };
+        {
+            let mut tx = pool.begin().await.expect("begin");
+            PostgresKeyStore::insert_in_transaction(&mut tx, key.clone())
+                .await
+                .expect("insert in tx");
+            let cross = PostgresKeyStore::revoke_in_transaction(
+                &mut tx,
+                key.id,
+                Uuid::now_v7(),
+                Utc::now(),
+            )
+            .await
+            .expect("cross-org revoke in tx");
+            assert!(!cross, "cross-org revoke must affect zero rows");
+            tx.commit().await.expect("commit");
+        }
+        let present: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1)")
+                .bind(key.id)
+                .fetch_one(&pool)
+                .await
+                .expect("check committed row");
+        assert!(present, "committed insert must persist");
+
+        let first = {
+            let mut tx = pool.begin().await.expect("begin");
+            let flipped = PostgresKeyStore::revoke_in_transaction(&mut tx, key.id, org, Utc::now())
+                .await
+                .expect("revoke in tx");
+            tx.commit().await.expect("commit first revoke");
+            flipped
+        };
+        assert!(first, "owning-org revoke must flip exactly one active row");
+        let second = {
+            let mut tx = pool.begin().await.expect("begin");
+            let flipped = PostgresKeyStore::revoke_in_transaction(&mut tx, key.id, org, Utc::now())
+                .await
+                .expect("second revoke in tx");
+            tx.commit().await.expect("commit second revoke");
+            flipped
+        };
+        assert!(!second, "already-revoked must not flip again");
+
+        sqlx::query("DELETE FROM api_keys WHERE org_id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .ok();
+    }
 }
 
 #[cfg(test)]
@@ -1044,5 +1364,141 @@ mod tests {
             master_key: new,
         };
         assert_eq!(store.decrypt(org, provider, &blob_new).unwrap(), plain);
+    }
+
+    /// Transactional credential-store variants against a live Postgres: a
+    /// caller-owned transaction commits or rolls back the sealed row, with the
+    /// same encryption/upsert semantics as the pooled `put`, and the
+    /// delete/count/exists helpers scope strictly by `(org_id, provider)`.
+    /// Cloud integration tests exercise the signed-evidence atomicity built
+    /// on these primitives.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL (Postgres; the test creates its own provider_credentials table) — run with --include-ignored"]
+    async fn postgres_credential_store_transactional_semantics() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS provider_credentials (
+                 id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                 org_id uuid NOT NULL,
+                 provider text NOT NULL,
+                 label text NOT NULL DEFAULT '',
+                 secret_enc bytea NOT NULL,
+                 base_url text,
+                 extra_headers jsonb NOT NULL DEFAULT '[]'::jsonb,
+                 created_at timestamptz NOT NULL DEFAULT now(),
+                 rotated_at timestamptz,
+                 UNIQUE (org_id, provider)
+               )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create provider_credentials");
+
+        let store = PostgresProviderCredentialStore::new(pool.clone(), [7u8; 32]);
+        let org = Uuid::now_v7();
+        let other_org = Uuid::now_v7();
+
+        // Parent rows so the cloud schema's provider_credentials.org_id FK is
+        // satisfied when the test runs against a cloud-schema DB (the bare
+        // OSS-created table has no such FK and tolerates the missing rows).
+        for org in [org, other_org] {
+            sqlx::query(
+                "INSERT INTO orgs (id, name) VALUES ($1, 'test-org') ON CONFLICT DO NOTHING",
+            )
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("seed org");
+        }
+
+        // A rollback leaves no row.
+        {
+            let mut tx = pool.begin().await.expect("begin");
+            store
+                .put_in_transaction(&mut tx, org, "openai", "rolled-back", "sk-tx-1", None, &[])
+                .await
+                .expect("put in tx");
+            tx.rollback().await.expect("rollback");
+        }
+        assert!(
+            store
+                .get(org, "openai")
+                .await
+                .expect("get after rollback")
+                .is_none(),
+            "rolled back credential must not persist"
+        );
+
+        // Commit persists a decryptable row; count/exists scope strictly.
+        {
+            let mut tx = pool.begin().await.expect("begin");
+            assert_eq!(
+                PostgresProviderCredentialStore::count_in_transaction(&mut tx, org)
+                    .await
+                    .expect("count before"),
+                0
+            );
+            let id = store
+                .put_in_transaction(&mut tx, org, "openai", "committed", "sk-tx-2", None, &[])
+                .await
+                .expect("put in tx");
+            assert!(
+                PostgresProviderCredentialStore::exists_in_transaction(&mut tx, org, "openai")
+                    .await
+                    .expect("exists before commit"),
+                "exists must see its own transaction's insert"
+            );
+            tx.commit().await.expect("commit");
+            assert!(!id.is_nil());
+        }
+        let stored = store.get(org, "openai").await.expect("get").expect("row");
+        assert_eq!(stored.api_key.expose(), "sk-tx-2");
+        assert_eq!(stored.base_url, None);
+
+        // Tenant scoping: delete_in_transaction only removes the owning org's row.
+        let removed_other = {
+            let mut tx = pool.begin().await.expect("begin");
+            let removed = PostgresProviderCredentialStore::delete_in_transaction(
+                &mut tx, other_org, "openai",
+            )
+            .await
+            .expect("cross-org delete");
+            tx.commit().await.expect("commit cross-org");
+            removed
+        };
+        assert!(!removed_other, "cross-org delete must remove nothing");
+        let removed_own = {
+            let mut tx = pool.begin().await.expect("begin");
+            let removed =
+                PostgresProviderCredentialStore::delete_in_transaction(&mut tx, org, "openai")
+                    .await
+                    .expect("delete");
+            tx.commit().await.expect("commit delete");
+            removed
+        };
+        assert!(removed_own, "owning-org delete must remove the row");
+        let removed_again = {
+            let mut tx = pool.begin().await.expect("begin");
+            let removed =
+                PostgresProviderCredentialStore::delete_in_transaction(&mut tx, org, "openai")
+                    .await
+                    .expect("delete again");
+            tx.commit().await.expect("commit delete again");
+            removed
+        };
+        assert!(!removed_again, "second delete must find nothing");
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_credentials WHERE org_id = $1")
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .expect("final count");
+        assert_eq!(count, 0, "cleanup: no rows remain for the test org");
     }
 }
