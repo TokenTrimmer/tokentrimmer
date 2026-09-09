@@ -29,7 +29,11 @@ use tt_provider_anthropic::messages::{
 };
 use tt_shared::ChatCompletionChunk;
 
-use crate::{middleware::trace::TraceId, routes::chat, ApiError, ApiResult, AppState};
+use crate::{
+    middleware::{retrieval::DeferredRetrieval, trace::TraceId},
+    routes::chat,
+    ApiError, ApiResult, AppState,
+};
 
 /// Handler for `POST /v1/messages`.
 ///
@@ -40,6 +44,7 @@ pub async fn handler(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
     auth_ctx: Option<Extension<ApiKeyContext>>,
+    retrieval: Option<Extension<DeferredRetrieval>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -48,7 +53,16 @@ pub async fn handler(
     // Anthropic-native, so every error body — parse/translate failures, the
     // credential-guard 400, and any upstream error propagated from `chat::handler`
     // — is re-shaped into the Anthropic error envelope before it leaves the handler.
-    match handle(State(state), Extension(trace), auth_ctx, headers, body).await {
+    match handle(
+        State(state),
+        Extension(trace),
+        auth_ctx,
+        retrieval,
+        headers,
+        body,
+    )
+    .await
+    {
         Ok(resp) => resp,
         // Render the ApiError to its (status, OpenAI body), then transcode that body
         // to the Anthropic shape so strict Anthropic SDK clients (Claude Code) parse it.
@@ -64,6 +78,7 @@ async fn handle(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
     auth_ctx: Option<Extension<ApiKeyContext>>,
+    retrieval: Option<Extension<DeferredRetrieval>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Response> {
@@ -79,7 +94,7 @@ async fn handle(
         State(state),
         Extension(trace),
         auth_ctx,
-        None,
+        retrieval,
         headers,
         Json(chat_req),
     )

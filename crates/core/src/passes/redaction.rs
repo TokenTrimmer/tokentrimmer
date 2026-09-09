@@ -215,6 +215,31 @@ impl RedactionPass {
     }
 }
 
+/// Guard an auxiliary embedding query using the same deterministic patterns.
+/// Unlike transcript mutation, this applies to the entire query regardless of
+/// its originating role, including the retrieval whole-tag fallback.
+pub(crate) fn redact_query(query: &str) -> String {
+    redact_str(query).unwrap_or_else(|| query.to_owned())
+}
+
+/// Apply required route redaction to every direct embedding input. Do not use
+/// Iterator::any here: short-circuiting would leave later batch items exposed.
+pub(crate) fn redact_embedding_input(input: &mut tt_shared::messages::EmbeddingInput) -> bool {
+    let redact = |text: &mut String| match redact_str(text) {
+        Some(guarded) => {
+            *text = guarded;
+            true
+        }
+        None => false,
+    };
+    match input {
+        tt_shared::messages::EmbeddingInput::Single(text) => redact(text),
+        tt_shared::messages::EmbeddingInput::Batch(texts) => texts
+            .iter_mut()
+            .fold(false, |changed, text| redact(text) | changed),
+    }
+}
+
 /// Redact a [`MessageContent`] in place. Returns `true` when at least one
 /// pattern fired (the content was changed); `false` leaves it byte-identical.
 fn redact_content(content: &mut MessageContent) -> bool {

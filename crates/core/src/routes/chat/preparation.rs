@@ -33,7 +33,7 @@ pub(crate) async fn prepare(
     source_creds_missing: bool,
     caller_tier: Option<tt_shared::CallerTier>,
     l2_allowed: bool,
-    retrieval_telemetry: RetrievalTelemetry,
+    deferred_retrieval: Option<crate::middleware::retrieval::DeferredRetrieval>,
     request_started: Instant,
     is_mechanical: bool,
     skip_shadow: bool,
@@ -53,21 +53,8 @@ pub(crate) async fn prepare(
     // `req.model`. Recorded as `gen_ai.request.model` on the request span (the
     // served model becomes `gen_ai.response.model`).
     let requested_model = req.model.clone();
-    // Sampled-quality-judge inputs, captured BEFORE routing rewrites the model
-    // or rebinds the provider/credentials. The async judge (spawned only for a
-    // ~2% sample of rerouted-DOWN requests, after the user response is returned)
-    // re-dispatches the ORIGINAL model on the SOURCE provider to produce a
-    // reference answer, then scores the served (cheaper) answer against it.
-    // Cheap clones (a few Arc bumps + a request clone); they cost nothing on the
-    // hot path when the judge is disabled because we only build the job later
-    // when sampling actually fires.
-    let judge_enabled = state.judge_config.enabled && state.judge_sink.is_some();
-    let (mut judge_source_provider, mut judge_source_ctx, mut judge_original_req) = if judge_enabled
-    {
-        (Some(provider.clone()), Some(ctx.clone()), Some(req.clone()))
-    } else {
-        (None, None, None)
-    };
+    let (mut judge_source_provider, mut judge_source_ctx, mut judge_original_req) =
+        super::retrieval::capture_judge_inputs(state, &provider, ctx, req);
     let route_match = apply_routing(state, ctx, req, forced_route.as_deref()).await?;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
     // This is the immutable ledger ID captured with the runtime route cache
@@ -194,6 +181,14 @@ pub(crate) async fn prepare(
         judge_source_ctx = None;
         judge_original_req = None;
     }
+    let retrieval_telemetry = super::retrieval::prepare_retrieval(
+        deferred_retrieval,
+        req,
+        ctx,
+        route_redact,
+        &mut judge_original_req,
+    )
+    .await?;
     // Canary traffic split (#454) + shadow mode, captured before `route_match`
     // is consumed below. `route_traffic_pct` is the configured split percentage
     // (None = unconditional rewrite). `route_shadow_model` is the discarded

@@ -62,6 +62,24 @@ pub async fn substitute_in_messages(
     store: &dyn RetrievalStore,
     embedder: &EmbeddingClient,
 ) -> Result<SubstitutionReport, RetrievalError> {
+    substitute_in_messages_with_query_transform(messages, org_id, store, embedder, str::to_owned)
+        .await
+}
+
+/// Apply a caller-owned query guard immediately before embedding I/O. The
+/// guard sees the actual query, including the whole-tag fallback, regardless
+/// of the message's role. Retrieval itself does not define privacy policy.
+/// Token overhead is estimated on the guarded query actually sent upstream.
+pub async fn substitute_in_messages_with_query_transform<F>(
+    messages: &mut [Value],
+    org_id: Uuid,
+    store: &dyn RetrievalStore,
+    embedder: &EmbeddingClient,
+    query_transform: F,
+) -> Result<SubstitutionReport, RetrievalError>
+where
+    F: Fn(&str) -> String + Send + Sync,
+{
     let mut substitutions = 0u32;
     let mut low_confidence_skips = 0u32;
     let mut size_increase_skips = 0u32;
@@ -103,10 +121,14 @@ pub async fn substitute_in_messages(
             continue;
         }
 
-        let query_emb = embedder.embed(fallback_query).await?;
-        // One embedding request was made for this message — deduct its token
-        // cost from the gross savings.
-        let query_tokens = estimate_tokens(EMBEDDING_PROVIDER, &without_tags) as i64;
+        let query = query_transform(fallback_query);
+        if query.trim().is_empty() {
+            continue;
+        }
+        let query_emb = embedder.embed(&query).await?;
+        // Count the actual guarded query, including a whole-tag fallback;
+        // counting `without_tags` would report zero for a paid fallback call.
+        let query_tokens = estimate_tokens(EMBEDDING_PROVIDER, &query) as i64;
         embedding_cost += query_tokens;
 
         // Reassemble — replace each tag with retrieved chunks (joined by ---),
@@ -211,6 +233,50 @@ mod tests {
             embedding_model: "x".into(),
             metadata: json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn guarded_whole_tag_fallback_is_metered_on_the_actual_query() {
+        let server = MockServer::start_async().await;
+        let original = r#"<retrievable corpus="docs">sensitive payload</retrievable>"#;
+        let guarded = original.replace("sensitive", "[REDACTED]");
+        let expected = guarded.clone();
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/embeddings")
+                    .json_body(json!({"input": expected, "model": "x"}));
+                then.status(200)
+                    .json_body(json!({"data": [{"embedding": [1.0, 0.0]}]}));
+            })
+            .await;
+        let embedder = EmbeddingClient {
+            api_key: "k".into(),
+            base_url: server.base_url(),
+            model: "x".into(),
+            http: reqwest::Client::new(),
+        };
+        let mut messages = vec![json!({"role": "assistant", "content": original})];
+        let report = substitute_in_messages_with_query_transform(
+            &mut messages,
+            Uuid::new_v4(),
+            &MemoryStore::new(),
+            &embedder,
+            |query| query.replace("sensitive", "[REDACTED]"),
+        )
+        .await
+        .unwrap();
+        mock.assert_calls_async(1).await;
+        assert_eq!(
+            report.embedding_tokens_cost,
+            i64::from(estimate_tokens(EMBEDDING_PROVIDER, &guarded))
+        );
+        assert!(report.embedding_tokens_cost > 0);
+        assert!(report.tokens_saved_estimate < 0);
+        assert_eq!(
+            messages[0]["content"], original,
+            "no hits leaves caller content unchanged"
+        );
     }
 
     // (a) Chunks below the floor are NOT substituted; original payload is kept.

@@ -178,6 +178,11 @@ pub async fn handler(
     let route_match = apply_routing(&state, &ctx, &mut synth, None).await?;
     req.model = synth.model; // adopt the routed model
     let matched = route_match.is_some();
+    // The synthetic request is only for selection. Enforce privacy on the
+    // actual embedding inputs, including every batch item, even when a pause
+    // or capability rejection suppressed the target rewrite.
+    let redacted_input = route_match.as_ref().is_some_and(|m| m.redact)
+        && crate::passes::redaction::redact_embedding_input(&mut req.input);
     // Keep the route's original matcher estimate for its per-request ceiling.
     // It is evaluated only after an optional provider pin settles the actual
     // serving provider below.
@@ -363,5 +368,11 @@ pub async fn handler(
         &served_model,
         &breakdown,
     );
+    if redacted_input {
+        http.headers_mut().insert(
+            "x-tokentrimmer-warnings",
+            axum::http::HeaderValue::from_static("redacted:body"),
+        );
+    }
     Ok(http)
 }

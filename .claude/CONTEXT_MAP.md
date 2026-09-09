@@ -122,7 +122,7 @@ Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 | Embedding model swap | `crates/retrieval/src/embed.rs::EmbeddingClient` |
 | Custom store backend | `crates/retrieval/src/store/mod.rs::RetrievalStore` trait |
 | Tag parser | `crates/retrieval/src/tags.rs` |
-| Substitution orchestrator | `crates/retrieval/src/substitute.rs` |
+| Substitution orchestrator / pre-egress policy boundary | `crates/retrieval/src/substitute.rs`, `crates/core/src/middleware/retrieval/{deferred,tests}.rs`, `crates/core/src/routes/chat/retrieval.rs`, `crates/core/tests/retrieval_policy.rs` — middleware defers I/O; routing selects original input once; guarded queries and returned context retain that policy. |
 | Spec | `docs/superpowers/specs/2026-05-28-trackE-rag-context-compression-design.md` |
 
 ---

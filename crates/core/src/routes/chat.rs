@@ -41,7 +41,7 @@ use tt_shared::{
 };
 
 use crate::{
-    middleware::retrieval::RetrievalTelemetry,
+    middleware::retrieval::{DeferredRetrieval, RetrievalTelemetry},
     middleware::trace::TraceId,
     passes::PassEffects,
     retry::{with_retry, RetryPolicy},
@@ -59,6 +59,7 @@ mod cache;
 mod dispatch;
 mod preparation;
 mod response;
+mod retrieval;
 mod selection;
 use dispatch::handle_streaming;
 pub(crate) use dispatch::{complete_once, complete_once_budgeted_workflow};
@@ -323,13 +324,13 @@ pub async fn handler(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
     auth_ctx: Option<Extension<ApiKeyContext>>,
-    retrieval: Option<Extension<RetrievalTelemetry>>,
+    retrieval: Option<Extension<DeferredRetrieval>>,
     headers: HeaderMap,
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> ApiResult<Response> {
     // Wall-clock start — fed into `request_logs.latency_ms`.
     let request_started = Instant::now();
-    let retrieval_telemetry = retrieval.map(|Extension(v)| v).unwrap_or_default();
+    let deferred_retrieval = retrieval.map(|Extension(v)| v);
 
     // 1. Resolve provider — 404 for unknown models. (May be re-resolved inside
     //    `prepare` after routing rewrites req.model.) `resolve` falls back to
@@ -472,7 +473,7 @@ pub async fn handler(
         source_creds_missing,
         caller_tier,
         l2_allowed,
-        retrieval_telemetry,
+        deferred_retrieval,
         request_started,
         // The chat path is never a mechanical agent-loop sub-step: pass `false`
         // so the `prepare` mechanical down-route block is inert (behavior-
