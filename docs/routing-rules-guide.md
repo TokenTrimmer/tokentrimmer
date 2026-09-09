@@ -57,8 +57,21 @@ rather than silently dispatching another model. Forcing a paused route still
 honors the pause. `X-TokenTrimmer-Route-Matched` identifies a selected definition,
 not proof that its target rewrite or all configured effects executed.
 
+Direct `/v1/embeddings` requests also enforce a selected route's redaction on
+every text input (single or batch), including paused/capability-suppressed
+routes. Actual replacements emit `X-TokenTrimmer-Warnings: redacted:body`.
+The endpoint has no response-cache path; policy-store failure refuses before
+embedding dispatch.
+
+For chat and native Messages requests, retrieval is deferred until routing
+succeeds. Selection uses the original caller input, before retrieval can remove
+matching keywords or change token counts. A selected redaction policy guards
+embedding queries (including whole-tag fallbacks), and the same selected
+privacy effects govern retrieved context before primary dispatch. See
+[retrieval ordering and audit limits](tt-retrieval-usage.md#tag-based-substitution).
+
 This does not introduce organization-wide rule composition: legacy first-match
-selection remains unchanged.
+rule precedence remains unchanged.
 
 ## Conditions (`when`)
 
