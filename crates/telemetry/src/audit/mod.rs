@@ -25,7 +25,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub use writer::{build_entry, generate_signing_key, AuditWriter, InMemoryAuditWriter};
+pub use writer::{
+    build_entry, generate_signing_key, AuditStorageReadiness, AuditWriter, InMemoryAuditWriter,
+};
 
 // ─── Schema types ────────────────────────────────────────────────────────────
 
