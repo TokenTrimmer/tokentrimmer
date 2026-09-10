@@ -213,6 +213,11 @@ struct RawEntry {
     /// answers "when", this answers "where".
     #[serde(default)]
     source: Option<String>,
+    /// C08: the provider marked this model deprecated (off the current
+    /// pricing page / announced shutdown). The row stays for historical
+    /// replay; resolvable via [`PricingCatalog::is_deprecated`].
+    #[serde(default)]
+    deprecated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,14 +228,27 @@ struct RawCatalog {
 
 /// In-memory pricing catalog: per `(provider, model)`, a price history sorted
 /// ascending by `effective_at`. Built once from the embedded TOML.
+/// Per-model catalog provenance for the LATEST-effective entry (C08):
+/// where the rate came from and whether the provider deprecated the model.
+#[derive(Debug, Clone)]
+struct CatalogProvenance {
+    effective_at: DateTime<Utc>,
+    /// Where the rate was taken from (pricing page URL or stable snapshot
+    /// label). `None` = no recorded provenance — never guessed.
+    source: Option<String>,
+    /// The provider marked this model deprecated (off the current pricing
+    /// page / announced shutdown). Resolved per-entry; un-deprecating is an
+    /// explicit newer entry without the flag (no implicit inheritance).
+    deprecated: bool,
+}
+
 #[derive(Debug)]
 pub struct PricingCatalog {
     by_model: HashMap<(String, String), Vec<ModelPricing>>,
-    /// C08 source tracking: the LATEST entry's `(effective_at, provenance)`
+    /// C08 provenance: the LATEST-effective entry's source + deprecation
     /// per (provider, model) — latest by EFFECTIVE DATE, not file order (the
-    /// price history is sorted; the source must resolve identically).
-    /// An absent provenance string = no recorded source.
-    sources: HashMap<(String, String), (DateTime<Utc>, Option<String>)>,
+    /// price history is sorted; provenance must resolve identically).
+    provenance: HashMap<(String, String), CatalogProvenance>,
 }
 
 impl PricingCatalog {
@@ -239,20 +257,29 @@ impl PricingCatalog {
     pub fn parse(toml_text: &str) -> Result<Self, toml::de::Error> {
         let raw: RawCatalog = toml::from_str(toml_text)?;
         let mut by_model: HashMap<(String, String), Vec<ModelPricing>> = HashMap::new();
-        let mut sources: HashMap<(String, String), (DateTime<Utc>, Option<String>)> =
-            HashMap::new();
+        let mut provenance: HashMap<(String, String), CatalogProvenance> = HashMap::new();
         for e in raw.entry {
             // C08: keep the provenance of the entry with the LATEST
             // effective_at (mirrors the price-history sort — file order is
-            // not authoritative).
-            sources
+            // not authoritative). A newer entry REPLACES the whole provenance
+            // (source and deprecation): the current rate's own metadata is
+            // what resolves.
+            provenance
                 .entry((e.provider.clone(), e.model.clone()))
                 .and_modify(|slot| {
-                    if e.effective_at > slot.0 {
-                        *slot = (e.effective_at, e.source.clone());
+                    if e.effective_at > slot.effective_at {
+                        *slot = CatalogProvenance {
+                            effective_at: e.effective_at,
+                            source: e.source.clone(),
+                            deprecated: e.deprecated,
+                        };
                     }
                 })
-                .or_insert_with(|| (e.effective_at, e.source.clone()));
+                .or_insert_with(|| CatalogProvenance {
+                    effective_at: e.effective_at,
+                    source: e.source.clone(),
+                    deprecated: e.deprecated,
+                });
             by_model
                 .entry((e.provider, e.model))
                 .or_default()
@@ -275,7 +302,10 @@ impl PricingCatalog {
         for history in by_model.values_mut() {
             history.sort_by_key(|p| p.effective_at);
         }
-        Ok(Self { by_model, sources })
+        Ok(Self {
+            by_model,
+            provenance,
+        })
     }
 
     /// The current (most recently effective) rate for `(provider, model)`,
@@ -293,9 +323,20 @@ impl PricingCatalog {
     /// `None` when the model is unknown or no source was recorded (honest:
     /// provenance absent, never guessed).
     pub fn source_for(&self, provider: &str, model: &str) -> Option<&str> {
-        self.sources
+        self.provenance
             .get(&(provider.to_string(), model.to_string()))
-            .and_then(|slot| slot.1.as_deref())
+            .and_then(|slot| slot.source.as_deref())
+    }
+
+    /// C08: whether the provider marked this model deprecated, resolved on
+    /// the LATEST-effective entry. Un-deprecating is an explicit newer entry
+    /// WITHOUT the flag — no implicit inheritance in either direction.
+    /// `false` for unknown models (absence of a catalog row is not evidence
+    /// of deprecation, and live local models are catalog-absent by design).
+    pub fn is_deprecated(&self, provider: &str, model: &str) -> bool {
+        self.provenance
+            .get(&(provider.to_string(), model.to_string()))
+            .is_some_and(|slot| slot.deprecated)
     }
 
     /// The rate that was in effect at `at` for `(provider, model)` — the most
@@ -465,6 +506,93 @@ mod catalog_tests {
         assert_eq!(
             pricing.verified_at.map(|v| v.to_rfc3339()),
             Some("2026-05-31T00:00:00+00:00".to_string())
+        );
+    }
+
+    /// C08 deprecation flags: the legacy rows the header documents as off the
+    /// provider's current pricing page resolve deprecated; current flagships
+    /// and unknown models resolve false (absence is not evidence).
+    #[test]
+    fn deprecated_flags_resolve() {
+        let c = catalog();
+        // The 2026-05-31 note: "gpt-4o/o3/o4-mini/text-embedding-3-* are off
+        // OpenAI's current pricing page (legacy rows retained for replay)".
+        assert!(
+            c.is_deprecated("openai", "gpt-4o"),
+            "gpt-4o is documented legacy"
+        );
+        assert!(c.is_deprecated("openai", "o3"), "o3 is documented legacy");
+        assert!(
+            c.is_deprecated("openai", "o4-mini"),
+            "o4-mini is documented legacy"
+        );
+        assert!(
+            c.is_deprecated("openai", "text-embedding-3-large"),
+            "text-embedding-3-large is documented legacy"
+        );
+        assert!(
+            c.is_deprecated("openai", "text-embedding-3-small"),
+            "text-embedding-3-small is documented legacy"
+        );
+        // Current flagships: not deprecated.
+        assert!(!c.is_deprecated("openai", "gpt-5.5"));
+        assert!(!c.is_deprecated("anthropic", "claude-sonnet-4-6"));
+        // A newer rate refresh on a deprecated model does NOT implicitly
+        // un-deprecate (the o3 05-31 price-cut row is flagged too).
+        assert!(c.is_deprecated("openai", "o3"));
+        // Unknown model: absence of a row is not deprecation evidence.
+        assert!(!c.is_deprecated("openai", "no-such-model"));
+        assert!(!c.is_deprecated("local", "anything"));
+    }
+
+    /// Deprecation resolves on the LATEST-effective entry: a NEWER entry
+    /// without the flag explicitly un-deprecates (rate refresh + provider
+    /// re-listing), and a NEWER entry WITH the flag deprecates a model whose
+    /// older row was fine.
+    #[test]
+    fn deprecation_resolves_on_latest_effective_entry() {
+        let toml_un = r#"
+            [[entry]]
+            provider = "x"
+            model = "m"
+            input_per_million = 1.0
+            output_per_million = 2.0
+            effective_at = "2026-05-01T00:00:00Z"
+            deprecated = true
+
+            [[entry]]
+            provider = "x"
+            model = "m"
+            input_per_million = 1.5
+            output_per_million = 3.0
+            effective_at = "2026-08-01T00:00:00Z"
+        "#;
+        let c = PricingCatalog::parse(toml_un).unwrap();
+        assert!(
+            !c.is_deprecated("x", "m"),
+            "newer entry without the flag un-deprecates"
+        );
+
+        let toml_dep = r#"
+            [[entry]]
+            provider = "y"
+            model = "m"
+            input_per_million = 1.0
+            output_per_million = 2.0
+            effective_at = "2026-05-01T00:00:00Z"
+
+            [[entry]]
+            provider = "y"
+            model = "m"
+            input_per_million = 1.5
+            output_per_million = 3.0
+            effective_at = "2026-08-01T00:00:00Z"
+            deprecated = true
+        "#;
+        let c2 = PricingCatalog::parse(toml_dep).unwrap();
+        assert!(
+            c2.is_deprecated("y", "m"),
+            "newer entry with the flag deprecates"
         );
     }
 

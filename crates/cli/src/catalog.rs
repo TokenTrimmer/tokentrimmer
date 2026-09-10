@@ -130,10 +130,18 @@ pub async fn run(flag_key: Option<String>, flag_base: Option<String>) -> anyhow:
         &["MODEL", "PROVIDER", "CONTEXT", "CAPS", "$IN/1M", "$OUT/1M"],
         console::colors_enabled(),
     );
+    let mut deprecated_count = 0usize;
     for m in &models {
+        // C08: cross-reference the embedded pricing catalog's deprecation
+        // flags so `tt models` warns about provider-deprecated models (off
+        // the current pricing page) before new work starts on them.
+        let deprecated = tt_shared::pricing::catalog().is_deprecated(&m.provider, &m.id);
+        if deprecated {
+            deprecated_count += 1;
+        }
         let price = |p: Option<f64>| p.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
         table.add_row(vec![
-            m.id.clone(),
+            format!("{}\u{2020}", m.id),
             m.provider.clone(),
             format_window(m.max_input_tokens),
             m.capabilities.join(","),
@@ -143,6 +151,16 @@ pub async fn run(flag_key: Option<String>, flag_base: Option<String>) -> anyhow:
     }
     println!("{table}");
     ui::note(&format!("{} models", models.len()));
+    if deprecated_count > 0 {
+        ui::note(&format!(
+            "\u{2020} deprecated by the provider — do not start new work on {}",
+            if deprecated_count == 1 {
+                "this model".to_string()
+            } else {
+                format!("these {deprecated_count} models")
+            }
+        ));
+    }
     Ok(())
 }
 
@@ -174,6 +192,24 @@ mod tests {
         assert_eq!(m[0].input_per_million, Some(0.15));
         assert_eq!(m[1].input_per_million, None); // pricing: null
         assert!(parse_catalog("not json").is_err());
+    }
+
+    /// C08: the `tt models` deprecation marker renders the dagger character
+    /// (guards the \u{2020} escape — double braces would render the literal
+    /// text instead) and the embedded catalog flags the documented legacy
+    /// models so the cross-reference produces a marker for real deprecated
+    /// rows.
+    #[test]
+    fn deprecated_marker_renders_and_flags_resolve() {
+        let dagger = "\u{2020}";
+        assert_eq!(dagger.chars().count(), 1, "single dagger character");
+        let marked = format!("{}\u{2020}", "gpt-4o");
+        assert_eq!(marked, "gpt-4o\u{2020}");
+        // The embedded catalog's documented-legacy rows resolve deprecated —
+        // the same cross-reference `run` applies per fetched model.
+        let cat = tt_shared::pricing::catalog();
+        assert!(cat.is_deprecated("openai", "gpt-4o"));
+        assert!(!cat.is_deprecated("openai", "gpt-5.5"));
     }
 
     use httpmock::prelude::*;
