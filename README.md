@@ -7,7 +7,7 @@
 
 TokenTrimmer is four products that ship together:
 
-- **Gateway** — OpenAI-compatible HTTP proxy with rule-based routing, two-layer caching (L1 Redis exact-match + L2 pgvector semantic), cross-provider failover with circuit breakers, and per-request cost telemetry via `x-tokentrimmer-*` response headers.
+- **Gateway** — [OpenAI-compatible](COMPATIBILITY.md) HTTP proxy with rule-based routing, two-layer caching (L1 Redis exact-match + L2 pgvector semantic), cross-provider failover with circuit breakers, and per-request cost telemetry via `x-tokentrimmer-*` response headers.
 - **Inspect** — Static analyzer that scans Python, TypeScript, and JavaScript codebases for token-waste patterns (23 Tier-1 rules: oversized prompts, missing prompt caching, unbounded agent loops, flagship models on classification work, …).
 - **Plan** — Deterministic replay simulator that projects how a proposed config change would have affected cost, savings, and cache hit rate, with bootstrap confidence intervals.
 - **Reporting** — Dashboard, weekly digest, monthly PDF (closed-source, hosted-only).
@@ -23,6 +23,7 @@ Alpha. The open-source core is implemented and tested: the Gateway (routing, L1/
 Two things to know up front, so you don't find out the hard way:
 
 - **Rust crates are on crates.io; Python/npm packages are not yet.** `cargo install tt-cli` works, and the Rust SDK is published as [`tokentrimmer-client`](https://crates.io/crates/tokentrimmer-client) (the code still imports as `tt_client`; the crates.io name `tt-client` belongs to an unrelated project). The Python and TypeScript SDKs are not on PyPI/npm yet — install those from git.
+- **OpenAI compatibility is endpoint-scoped, not blanket.** "Point your OpenAI SDK at TokenTrimmer" works fully for chat completions, embeddings, and models. For Responses API (partial), audio, images, and other endpoints, see the [compatibility matrix](COMPATIBILITY.md) for exactly what is and isn't supported.
 - **The hosted gateway is not live.** Self-hosting is the supported path today.
 
 ## Quick start (self-host)
