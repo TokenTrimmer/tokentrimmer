@@ -231,6 +231,7 @@ impl TurnCompleter for GatewayCompleter<'_> {
         &self,
         mut req: ChatCompletionRequest,
         is_mechanical: bool,
+        turn_summary_evidence: Option<Option<f64>>,
     ) -> Result<(Message, RunUsage), ApiError> {
         Self::disable_cache(&mut req);
 
@@ -280,7 +281,7 @@ impl TurnCompleter for GatewayCompleter<'_> {
         };
 
         let request_started = std::time::Instant::now();
-        let prep = chat::prepare(
+        let mut prep = chat::prepare(
             self.state,
             &mut ctx,
             &mut req,
@@ -305,6 +306,14 @@ impl TurnCompleter for GatewayCompleter<'_> {
             self.identity.skip_shadow,
         )
         .await?;
+
+        // C01: stamp this turn's summarizer evidence onto the prepared request
+        // so the turn's request_logs row carries `summarizer_ran` (+ the
+        // metered tax fold). The loop computed this BEFORE the turn dispatch;
+        // the unmetered case (`Some(None)`) is ran-with-unknown-price — never
+        // coerced to a phantom $0 "free".
+        prep.summarizer_ran = turn_summary_evidence.is_some();
+        prep.summarizer_turn_tax_usd = turn_summary_evidence.flatten();
 
         // Every hosted provider attempt sees this run segment's clone-shared
         // `BudgetDispatchState`. The registry's provider decorator reserves the
@@ -1606,6 +1615,7 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _is_mechanical: bool,
+            _turn_summary_evidence: Option<Option<f64>>,
         ) -> Result<(Message, RunUsage), ApiError> {
             let mut s = self.script.lock().unwrap();
             Ok((
@@ -1634,6 +1644,7 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             is_mechanical: bool,
+            _turn_summary_evidence: Option<Option<f64>>,
         ) -> Result<(Message, RunUsage), ApiError> {
             self.mech.lock().unwrap().push(is_mechanical);
             Ok((
@@ -1660,6 +1671,7 @@ mod tests {
             &self,
             req: ChatCompletionRequest,
             _is_mechanical: bool,
+            _turn_summary_evidence: Option<Option<f64>>,
         ) -> Result<(Message, RunUsage), ApiError> {
             self.caps.lock().unwrap().push(req.max_tokens);
             Ok((assistant_final(), RunUsage::default()))
@@ -2981,6 +2993,7 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _is_mechanical: bool,
+            _turn_summary_evidence: Option<Option<f64>>,
         ) -> Result<(Message, RunUsage), ApiError> {
             Ok((
                 self.script.lock().unwrap().remove(0),
@@ -3003,6 +3016,7 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _is_mechanical: bool,
+            _turn_summary_evidence: Option<Option<f64>>,
         ) -> Result<(Message, RunUsage), ApiError> {
             Err(ApiError::Provider(
                 tt_shared::ProviderError::BudgetExceeded {

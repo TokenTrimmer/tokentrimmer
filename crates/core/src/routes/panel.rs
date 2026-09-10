@@ -2468,6 +2468,9 @@ pub(crate) async fn complete_panel(
             flex_saved_usd: 0.0,
             doc_compaction_saved_usd: 0.0,
             summarizer_tax_usd: 0.0,
+            // C01: the panel row inherits the request's summarizer evidence
+            // (a route-triggered panel can run inside an agent-loop turn).
+            summarizer_ran: prep.summarizer_ran,
             request_delta_evidence_state,
             // INVARIANT §2.1.5: every panel row is `cached = false` so the cloud
             // overage meter + month accumulator both count it.

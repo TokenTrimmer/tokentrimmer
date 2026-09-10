@@ -26,6 +26,11 @@ pub(super) async fn handle_streaming(
         matched_route_version_id,
         route_paused,
         route_decision_outcome,
+        // C01: the streaming path carries no summarizer evidence (agent-loop
+        // turns are non-streaming; the chat-path planner runs no summarizer
+        // call) — bound-but-unused here, stamped on the buffered row instead.
+        summarizer_ran: _,
+        summarizer_turn_tax_usd: _,
         requested_model,
         requested_pricing,
         model_was_rewritten,
@@ -646,6 +651,11 @@ async fn complete_once_with_retry_policy(
         matched_route_version_id,
         route_paused,
         route_decision_outcome,
+        // C01: the streaming path carries no summarizer evidence (agent-loop
+        // turns are non-streaming; the chat-path planner runs no summarizer
+        // call) — bound-but-unused here, stamped on the buffered row instead.
+        summarizer_ran: _,
+        summarizer_turn_tax_usd: _,
         requested_model,
         requested_pricing,
         // `complete_once` prices its baseline from `matched_route_id.is_some()`
@@ -1486,7 +1496,12 @@ async fn complete_once_with_retry_policy(
         // missing column. `summarizer_tax_usd` remains a tax, not saving.
         flex_saved_usd: cost_breakdown.flex_saved_usd,
         doc_compaction_saved_usd: cost_breakdown.doc_compaction_saved_usd,
-        summarizer_tax_usd: cost_breakdown.summarizer_tax_usd,
+        // C01: the row carries the summarizer-evidence pair — the pass-pipeline
+        // tax plus this turn's (agent-loop) metered tax, and the ran flag so a
+        // $0 tax on a ran row reads "unmetered", never "free".
+        summarizer_tax_usd: cost_breakdown.summarizer_tax_usd
+            + prep.summarizer_turn_tax_usd.unwrap_or(0.0),
+        summarizer_ran: prep.summarizer_ran,
         request_delta_evidence_state,
         cached: false,
         cache_layer: None,

@@ -137,6 +137,12 @@ pub trait TurnCompleter: Send + Sync {
         &self,
         req: ChatCompletionRequest,
         is_mechanical: bool,
+        // C01: this turn's summarizer evidence (None = the summarizer step
+        // did not run; `Some(tax)` = it ran — `Some(metered)` or `None`
+        // (unmetered) inside). The production completer stamps it onto the
+        // turn's `request_logs` row (`summarizer_ran` + the tax fold); test
+        // stubs accept-and-ignore.
+        turn_summary_evidence: Option<Option<f64>>,
     ) -> Result<(Message, RunUsage), ApiError>;
 }
 
@@ -401,12 +407,21 @@ pub(super) async fn run_loop_core_with_output_cap(
             });
         }
         emit(RunEvent::Turn { turn: turn + 1 }); // 1-indexed
-        if let Some(s) = summarizer {
-            let tax = s
-                .summarize_before_turn(&mut messages, &mut summarized_upto)
-                .await;
-            summarizer_tax = sum_metered(summarizer_tax, tax);
-        }
+                                                 // C01: this turn's summarizer-evidence cell, threaded into the turn's
+                                                 // request_logs row so the savings SQL can distinguish "ran and
+                                                 // metered" / "ran, price unknown" / "did not run" (migration 0051).
+                                                 // Outer `None` = the summarizer step did not run; `Some(tax)` = it ran
+                                                 // (`tax` is this turn's metered add, `None` inside = unmetered).
+        let turn_summary_evidence: Option<Option<f64>> = match summarizer {
+            Some(s) => {
+                let tax = s
+                    .summarize_before_turn(&mut messages, &mut summarized_upto)
+                    .await;
+                summarizer_tax = sum_metered(summarizer_tax, tax);
+                Some(tax)
+            }
+            None => None,
+        };
         let req = ChatCompletionRequest {
             model: model.clone(),
             messages: messages.clone(),
@@ -420,7 +435,10 @@ pub(super) async fn run_loop_core_with_output_cap(
         // already appended to `messages`). Computed from the transcript that is
         // about to be SENT — before this turn's assistant response is pushed.
         let is_mechanical = is_mechanical_continuation(&messages);
-        let (assistant, turn_usage) = match completer.complete(req, is_mechanical).await {
+        let (assistant, turn_usage) = match completer
+            .complete(req, is_mechanical, turn_summary_evidence)
+            .await
+        {
             Ok(x) => x,
             Err(e) => {
                 let budget_exhausted = matches!(

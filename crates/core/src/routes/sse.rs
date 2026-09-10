@@ -1398,6 +1398,10 @@ pub fn stream_response(
                     } else {
                         breakdown.summarizer_tax_usd
                     },
+                    // C01: agent-loop turns are non-streaming (stream:false), so
+                    // the streamed path never carries a transcript summarizer —
+                    // the chat-path planner runs no summarizer call either.
+                    summarizer_ran: false,
                     request_delta_evidence_state,
                     cached: false,
                     cache_layer: None,

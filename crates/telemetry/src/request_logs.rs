@@ -75,6 +75,13 @@ pub struct RequestLogRow {
     /// can reconcile without hiding the spend. `0.0` when no summarizer ran.
     #[serde(default)]
     pub summarizer_tax_usd: f64,
+    /// C01 (migration 0051): `true` when the summarizer step ran for this
+    /// request. Distinguishes "ran + measured" (`tax > 0`), "ran + unmetered"
+    /// (`ran && tax == 0` — billed, price unknown, never "free"), and
+    /// "did not run" (`false`). `false` for rows before migration 0051
+    /// (conservative default — no durable evidence the step ran).
+    #[serde(default)]
+    pub summarizer_ran: bool,
     /// Write-time provenance for the strict request-delta tuple. This closed
     /// state prevents reporting from treating an absent catalog price flattened
     /// to `$0` as a genuinely measured zero-price request. Historical rows and
@@ -538,6 +545,7 @@ pub mod postgres {
                       content_compress_saved_est_usd, content_compress_kind,
                       l2_matched_entry_id, l2_similarity, l2_verdict,
                       flex_saved_usd, doc_compaction_saved_usd, summarizer_tax_usd,
+                      summarizer_ran,
                       route_version_id, requested_model,
                       request_delta_evidence_state,
                       route_decision_outcome)
@@ -566,12 +574,13 @@ pub mod postgres {
                       $46, $47,
                       $48, $49, $50,
                       $51, $52, $53,
-                      $54, $55,
-                      $56, $57)"#;
+                      $54,
+                      $55, $56,
+                      $57, $58)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 57;
+    pub const INSERT_BIND_COUNT: usize = 58;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -630,10 +639,11 @@ pub mod postgres {
                 .bind(row.flex_saved_usd) // $51
                 .bind(row.doc_compaction_saved_usd) // $52
                 .bind(row.summarizer_tax_usd) // $53
-                .bind(row.route_version_id) // $54
-                .bind(row.requested_model.as_deref()) // $55
-                .bind(row.request_delta_evidence_state.as_str()) // $56
-                .bind(row.route_decision_outcome.as_deref()) // $57
+                .bind(row.summarizer_ran) // $54
+                .bind(row.route_version_id) // $55
+                .bind(row.requested_model.as_deref()) // $56
+                .bind(row.request_delta_evidence_state.as_str()) // $57
+                .bind(row.route_decision_outcome.as_deref()) // $58
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -727,6 +737,7 @@ mod tests {
             flex_saved_usd: 0.0,
             doc_compaction_saved_usd: 0.0,
             summarizer_tax_usd: 0.0,
+            summarizer_ran: false,
             request_delta_evidence_state: tt_shared::RequestDeltaEvidenceState::MissingEvidence,
             cached: false,
             cache_layer: None,
