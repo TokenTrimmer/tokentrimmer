@@ -2179,6 +2179,16 @@ fn redis_namespace(app_name: &str, component: &str) -> String {
     format!("tt:{app_name}:{component}")
 }
 
+/// S11: When `TT_REQUIRE_ENCRYPTED_CACHE=1` is set (the hosted role), the
+/// gateway refuses to start caches in plaintext mode — a missing `TT_MASTER_KEY`
+/// is a startup error, not a silent fallback. Self-hosted deployments leave
+/// this unset (labeled plaintext mode, backward-compatible).
+fn require_encrypted_cache() -> bool {
+    std::env::var("TT_REQUIRE_ENCRYPTED_CACHE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // Fail-closed bind decision, BEFORE any best-effort dependency connects:
     // a misconfigured public + unauthenticated gateway must not boot at all.
@@ -2263,8 +2273,20 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                                 as Arc<dyn tt_cache::L1Cache>)
                         }
                         Ok(None) => {
-                            tracing::info!("L1 cache enabled (plaintext — TT_MASTER_KEY unset)");
-                            Some(Arc::new(c) as Arc<dyn tt_cache::L1Cache>)
+                            // S11: TT_REQUIRE_ENCRYPTED_CACHE=1 refuses to
+                            // start the cache in plaintext. The hosted role
+                            // sets this so a missing key is a startup error,
+                            // not silent plaintext. Self-hosted deployments
+                            // may leave it unset (labeled plaintext mode).
+                            if crate::require_encrypted_cache() {
+                                tracing::error!(
+                                    "L1 cache disabled: TT_REQUIRE_ENCRYPTED_CACHE is set but TT_MASTER_KEY is not — refusing plaintext cached responses"
+                                );
+                                None
+                            } else {
+                                tracing::info!("L1 cache enabled (self-hosted plaintext — TT_MASTER_KEY unset; set TT_REQUIRE_ENCRYPTED_CACHE=1 to refuse)");
+                                Some(Arc::new(c) as Arc<dyn tt_cache::L1Cache>)
+                            }
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "TT_MASTER_KEY invalid — L1 cache disabled (refusing to serve plaintext under a misconfigured key)");
@@ -2540,10 +2562,19 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                         Some(tt_cache::PostgresL2Cache::new(pool.clone()).with_response_codec(codec))
                     }
                     Ok(None) => {
-                        tracing::info!(
-                            "L2 response encryption disabled (TT_MASTER_KEY unset — plaintext rows, back-compat)"
-                        );
-                        Some(tt_cache::PostgresL2Cache::new(pool.clone()))
+                        // S11: same posture as L1 — refuse plaintext under
+                        // TT_REQUIRE_ENCRYPTED_CACHE=1 (hosted role).
+                        if crate::require_encrypted_cache() {
+                            tracing::error!(
+                                "L2 cache disabled: TT_REQUIRE_ENCRYPTED_CACHE is set but TT_MASTER_KEY is not — refusing plaintext cached responses"
+                            );
+                            None
+                        } else {
+                            tracing::info!(
+                                "L2 response encryption disabled (self-hosted plaintext — TT_MASTER_KEY unset; set TT_REQUIRE_ENCRYPTED_CACHE=1 to refuse)"
+                            );
+                            Some(tt_cache::PostgresL2Cache::new(pool.clone()))
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "TT_MASTER_KEY invalid — L2 disabled (refusing to serve plaintext under a misconfigured key)");
@@ -4111,6 +4142,44 @@ mod readme_command_parity {
             "README.md command table is missing rows for: {missing:?} — keep it \
              in sync with COMMAND_GROUPS in crates/cli/src/main.rs (this test \
              is the drift gate)."
+        );
+    }
+}
+
+/// S11: the hosted gateway must be able to refuse plaintext cached responses.
+/// The `TT_REQUIRE_ENCRYPTED_CACHE` guard and the hosted manifest setting
+/// must stay synchronized: removing either breaks the hosted encryption
+/// posture without a test failure.
+#[cfg(test)]
+mod encrypted_cache_posture_tests {
+    /// The function must reference the documented env var and parse the
+    /// documented values ("1", "true", case-insensitive).
+    #[test]
+    fn require_encrypted_cache_reads_the_documented_env_var() {
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("TT_REQUIRE_ENCRYPTED_CACHE"),
+            "the encrypted-cache guard must use TT_REQUIRE_ENCRYPTED_CACHE"
+        );
+        // Both the L1 and L2 plaintext branches must check the guard.
+        assert!(
+            main.contains("L1 cache disabled: TT_REQUIRE_ENCRYPTED_CACHE"),
+            "L1 plaintext must be gated by TT_REQUIRE_ENCRYPTED_CACHE"
+        );
+        assert!(
+            main.contains("L2 cache disabled: TT_REQUIRE_ENCRYPTED_CACHE"),
+            "L2 plaintext must be gated by TT_REQUIRE_ENCRYPTED_CACHE"
+        );
+    }
+
+    /// The hosted manifest must set TT_REQUIRE_ENCRYPTED_CACHE so the
+    /// deployed gateway refuses plaintext when TT_MASTER_KEY is missing.
+    #[test]
+    fn hosted_gateway_manifest_sets_encrypted_cache_flag() {
+        let fly = include_str!("../../../fly.toml");
+        assert!(
+            fly.contains("TT_REQUIRE_ENCRYPTED_CACHE = \"true\""),
+            "fly.toml must set TT_REQUIRE_ENCRYPTED_CACHE=true for the hosted role"
         );
     }
 }
