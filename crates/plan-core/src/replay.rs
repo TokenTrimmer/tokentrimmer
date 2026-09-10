@@ -96,6 +96,7 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         projection.would_block,
         projection.action_projection_unavailable,
         projection.batch_deferred,
+        projection.batch_opportunity_usd,
         projection.batch_unpriced,
         projection.flex_applied,
         projection.flex_inapplicable,
@@ -227,13 +228,14 @@ struct Projection {
     /// rate AND that rate actually lowers the projection (heavy provider-cache
     /// traffic can be cheaper at the cache-discounted standard rate — those
     /// requests keep the standard figure and are not counted). Surfaced ONLY
-    /// as a caveat string (#21 over-ceiling precedent — no new serialized
-    /// field): the discount is ADVISORY today, the synchronous gateway defers
-    /// it until the async Batch Lane ships. Known over-projection: `RequestLog`
-    /// carries no streamed/interactive marker, so this projection cannot
-    /// exclude traffic the runtime gate would hard-clear as batch-ineligible —
-    /// the caveat wording discloses that.
+    /// as a caveat string: the discount is ADVISORY today, the synchronous
+    /// gateway defers it until the async Batch Lane ships.
     batch_deferred: u32,
+    /// Total HYPOTHETICAL USD savings if every Batch-eligible request were
+    /// migrated to the async Batch API. SEPARATE from
+    /// `projected_savings_usd` which contains only synchronous-gateway-realized
+    /// savings. The headline stays honest.
+    batch_opportunity_usd: f64,
     /// Requests matched by a `batch` route whose target has NO catalog batch
     /// rate — projected at the standard target cost (no fabricated 0.5×) and
     /// surfaced as a caveat.
@@ -284,6 +286,7 @@ fn project_requests(
     let mut latency_unprojected: u32 = 0;
     let mut would_block: u32 = 0;
     let mut batch_deferred: u32 = 0;
+    let mut batch_opportunity_usd: f64 = 0.0;
     let mut batch_unpriced: u32 = 0;
     let mut flex_applied: u32 = 0;
     let mut flex_inapplicable: u32 = 0;
@@ -403,7 +406,13 @@ fn project_requests(
                     if action.batch && !is_cache_hit && !blocked {
                         match cost::project_batch_cost(req, p) {
                             Some(b) if b.cost_usd < projected_cost => {
-                                projected_cost = b.cost_usd;
+                                // C03: the Batch discount is SEPARATED from the
+                                // executable headline. The standard rate stays
+                                // in `projected_cost` (the synchronous gateway
+                                // bills it). The delta is tracked as a
+                                // hypothetical opportunity, never folded into
+                                // `projected_savings_usd`.
+                                batch_opportunity_usd += projected_cost - b.cost_usd;
                                 batch_deferred += 1;
                             }
                             Some(_) => {} // batch rate delivers no discount — standard figure stands
@@ -517,6 +526,7 @@ fn project_requests(
         latency_unprojected,
         would_block,
         batch_deferred,
+        batch_opportunity_usd,
         batch_unpriced,
         flex_applied,
         flex_inapplicable,
@@ -570,6 +580,7 @@ fn aggregate(p: &Projection) -> Aggregates {
         total_projected_cost_usd: total_projected,
         projected_savings_usd: projected_savings,
         projected_savings_pct,
+        batch_opportunity_usd: p.batch_opportunity_usd,
         cache_hit_rate_projected: cache_hit_rate,
         p50_latency_ms_projected: p50_latency,
         p95_latency_ms_projected: p95_latency,
@@ -865,6 +876,7 @@ fn build_caveats(
     would_block: u32,
     action_projection_unavailable: u32,
     batch_deferred: u32,
+    batch_opportunity_usd: f64,
     batch_unpriced: u32,
     flex_applied: u32,
     flex_inapplicable: u32,
@@ -901,7 +913,7 @@ fn build_caveats(
     }
     if batch_deferred > 0 {
         caveats.push(format!(
-            "{batch_deferred} request(s) projected at the target's Batch API rate via a batch-eligibility route — advisory today: the synchronous gateway defers this discount until the async Batch Lane ships, and logs carry no streamed/interactive marker, so this count can include traffic the runtime gate would clear as batch-ineligible."
+            "{batch_deferred} request(s) carried a batch-eligibility route (${batch_opportunity_usd:.4} hypothetical batch-API savings, reported SEPARATELY from the executable savings above). The synchronous gateway does not realize this discount; it requires migrating to the async Batch API. Historical rows carry no streamed/interactive marker, so this count can include traffic the runtime gate would clear as batch-ineligible."
         ));
     }
     if batch_unpriced > 0 {

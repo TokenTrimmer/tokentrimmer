@@ -631,9 +631,18 @@ pub struct Aggregates {
     /// Sum of projected costs across all replayed requests.
     pub total_projected_cost_usd: f64,
     /// `max(0, baseline - projected)` — never negative.
+    /// Contains ONLY synchronous-gateway-realized savings — the hypothetical
+    /// Batch API opportunity is tracked separately in
+    /// `batch_opportunity_usd` (C03).
     pub projected_savings_usd: f64,
     /// `projected_savings_usd / total_baseline_cost_usd * 100` (0–100).
     pub projected_savings_pct: f64,
+    /// Total HYPOTHETICAL USD savings if every Batch-eligible request were
+    /// migrated to the async Batch API. SEPARATE from
+    /// `projected_savings_usd` (which contains only what the synchronous
+    /// gateway actually realizes). A batch-eligibility route cannot
+    /// increase this headline (C03).
+    pub batch_opportunity_usd: f64,
     /// Fraction of requests projected to be cache hits, 0–1.
     pub cache_hit_rate_projected: f64,
     /// p50 latency, ms — preserved from baseline in v1 (model swap latency

@@ -346,6 +346,7 @@ mod tests {
                 total_projected_cost_usd: 6.0,
                 projected_savings_usd: 4.0,
                 projected_savings_pct: 40.0,
+                batch_opportunity_usd: 0.0,
                 cache_hit_rate_projected: 0.0,
                 p50_latency_ms_projected: 100.0,
                 p95_latency_ms_projected: 250.0,
