@@ -33,7 +33,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use futures::stream::BoxStream;
 pub use tt_provider_compat::ClientConfig;
 use tt_provider_compat::{CompatConfig, OpenAICompatibleProvider};

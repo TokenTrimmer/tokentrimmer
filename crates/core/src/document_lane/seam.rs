@@ -819,6 +819,7 @@ mod tests {
             effective_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
+            verified_at: None,
         };
         let proj = tt_preview::document_projection::project(
             booking.raw_image_tokens,
