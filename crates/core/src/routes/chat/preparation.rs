@@ -55,7 +55,14 @@ pub(crate) async fn prepare(
     let requested_model = req.model.clone();
     let (mut judge_source_provider, mut judge_source_ctx, mut judge_original_req) =
         super::retrieval::capture_judge_inputs(state, &provider, ctx, req);
-    let route_match = apply_routing(state, ctx, req, forced_route.as_deref()).await?;
+    // The RouteApplication carries both the (optional) matched route and the
+    // bounded decision outcome (R02): the outcome is threaded to the
+    // request_logs row so a customer can see WHY routing did or didn't apply
+    // (wire names per migration 0052). `None` when no routing store was
+    // configured (dev/local / nil-org) — the column stays NULL, never guessed.
+    let route_application = apply_routing(state, ctx, req, forced_route.as_deref()).await?;
+    let route_decision_outcome = route_application.outcome;
+    let route_match = route_application.matched;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
     // This is the immutable ledger ID captured with the runtime route cache
     // refresh. It is nullable by design; never fall back to a mutable route
@@ -1302,6 +1309,7 @@ pub(crate) async fn prepare(
         matched_route_id,
         matched_route_version_id,
         route_paused,
+        route_decision_outcome,
         requested_model,
         requested_pricing,
         model_was_rewritten,

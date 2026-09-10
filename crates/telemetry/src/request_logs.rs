@@ -176,6 +176,15 @@ pub struct RequestLogRow {
     /// rows from before migration 0019 (mirror of `truncated`).
     #[serde(default)]
     pub route_paused: bool,
+    /// Bounded routing-decision outcome name (R02, migration 0052):
+    /// `no_match`, `forced_route_not_found`, `capability_suppressed`,
+    /// `paused`, or `accepted_for_action_pipeline`. `None` (SQL NULL) for
+    /// rows from before migration 0052 and requests with no routing store
+    /// configured (dev/local / nil-org synthetic contexts) — never a guessed
+    /// value. Lets a customer see WHY routing did or didn't apply without
+    /// reading server logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decision_outcome: Option<String>,
     /// ESTIMATED saving from minified-JSON output steering
     /// (`RouteAction::minify_json`, research Phase 3.1, migration 0020): the
     /// pretty-printed re-rendering of the emitted JSON re-tokenized with the
@@ -530,7 +539,8 @@ pub mod postgres {
                       l2_matched_entry_id, l2_similarity, l2_verdict,
                       flex_saved_usd, doc_compaction_saved_usd, summarizer_tax_usd,
                       route_version_id, requested_model,
-                      request_delta_evidence_state)
+                      request_delta_evidence_state,
+                      route_decision_outcome)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -557,11 +567,11 @@ pub mod postgres {
                       $48, $49, $50,
                       $51, $52, $53,
                       $54, $55,
-                      $56)"#;
+                      $56, $57)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 56;
+    pub const INSERT_BIND_COUNT: usize = 57;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -623,6 +633,7 @@ pub mod postgres {
                 .bind(row.route_version_id) // $54
                 .bind(row.requested_model.as_deref()) // $55
                 .bind(row.request_delta_evidence_state.as_str()) // $56
+                .bind(row.route_decision_outcome.as_deref()) // $57
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -736,6 +747,7 @@ mod tests {
             batch_eligible: false,
             batch_forgone_usd: 0.0,
             route_paused: false,
+            route_decision_outcome: None,
             minify_saved_est_usd: 0.0,
             format_switched: None,
             format_switch_saved_est_usd: 0.0,

@@ -666,6 +666,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused: false,
+        route_decision_outcome: None,
         minify_saved_est_usd: 0.0,
         format_switched: None,
         format_switch_saved_est_usd: 0.0,
@@ -761,6 +762,7 @@ async fn request_log_insert_round_trips_batch_columns() {
 
     let marked = RequestLogRow {
         route_paused: false,
+        route_decision_outcome: None,
         id: Uuid::now_v7(),
         org_id: Uuid::nil(),
         api_key_id: Uuid::nil(),
@@ -923,6 +925,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused: true,
+        route_decision_outcome: None,
         // Nonzero on purpose: pins the f64 → NUMERIC(12,6) encode of the NEW
         // 0020 column against real Postgres, not just the bind position.
         minify_saved_est_usd: 0.000412,
@@ -1126,6 +1129,7 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused: false,
+        route_decision_outcome: None,
         format_switched: Some("csv".into()),
         format_switch_saved_est_usd: 0.0042,
         diff_applied: true,

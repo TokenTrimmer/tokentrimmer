@@ -175,7 +175,7 @@ pub async fn handler(
         }],
         ..Default::default()
     };
-    let route_match = apply_routing(&state, &ctx, &mut synth, None).await?;
+    let route_match = apply_routing(&state, &ctx, &mut synth, None).await?.matched;
     req.model = synth.model; // adopt the routed model
     let matched = route_match.is_some();
     // The synthetic request is only for selection. Enforce privacy on the
