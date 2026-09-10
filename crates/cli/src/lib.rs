@@ -23,6 +23,7 @@ pub mod eval_shadow;
 pub mod execution_broker;
 pub mod harness;
 pub mod init;
+pub mod inspect_route_suggest;
 pub mod local_agent;
 pub mod local_audit;
 pub mod mcp_install;
