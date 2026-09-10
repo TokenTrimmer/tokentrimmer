@@ -1,6 +1,5 @@
 ---
 source: crates/plan-core/tests/replay.rs
-assertion_line: 1182
 expression: result
 ---
 {
@@ -14,6 +13,7 @@ expression: result
     "total_projected_cost_usd": 0.0062125,
     "projected_savings_usd": 0.0683375,
     "projected_savings_pct": 91.66666666666667,
+    "batch_opportunity_usd": 0.0,
     "cache_hit_rate_projected": 0.2,
     "p50_latency_ms_projected": 125.0,
     "p95_latency_ms_projected": 147.0,

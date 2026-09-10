@@ -20,22 +20,58 @@ pub struct ProjectedCost {
 /// Project the cost of one request under a different model + pricing entry.
 ///
 /// `target_model` is taken purely for traceability — the math uses
-/// `pricing` directly. Cached-token rate falls back to the non-cached
-/// input rate when the pricing entry doesn't advertise a discount.
+/// `pricing` directly.
+///
+/// Three-bucket cache model (C02):
+/// - **Non-cached input**: `input_per_million`
+/// - **Cache-read tokens**: `cached_input_per_million` (falls back to input rate)
+/// - **Cache-write tokens** (C02): `cache_write_per_million` (falls back to input rate)
+///
+/// When the new `cache_creation_input_tokens` / `cache_read_input_tokens` fields
+/// are present on the request, they take precedence over the legacy collapsed
+/// `cached_tokens` field. The total `input_tokens` is split across three buckets:
+/// cache-write + cache-read + non-cached = `input_tokens`.
+///
+/// When the new fields are `None` (legacy rows), the prior two-bucket model
+/// applies: `cached_tokens` are charged at the cached rate and the remainder at
+/// the input rate, with cache-write tokens priced at the ordinary input rate
+/// (the documented pre-C02 conservative fallback).
 #[must_use]
 pub fn project_cost(
     req: &RequestLog,
     _target_model: &str,
     pricing: &ModelPricing,
 ) -> ProjectedCost {
-    let cached = req.cached_tokens.min(req.input_tokens);
-    let non_cached_input = req.input_tokens.saturating_sub(cached);
     let cached_rate = pricing
         .cached_input_per_million
         .unwrap_or(pricing.input_per_million);
-    let cost = (f64::from(non_cached_input)) * pricing.input_per_million / 1_000_000.0
-        + (f64::from(cached)) * cached_rate / 1_000_000.0
-        + (f64::from(req.output_tokens)) * pricing.output_per_million / 1_000_000.0;
+    let cache_write_rate = pricing
+        .cache_write_per_million
+        .unwrap_or(pricing.input_per_million);
+
+    let cost = match (req.cache_creation_input_tokens, req.cache_read_input_tokens) {
+        // New three-bucket model: explicit cache-write and cache-read counts
+        // from the gateway's provider-native telemetry.
+        (Some(write), Some(read)) => {
+            let write = write.min(req.input_tokens);
+            let read = read.min(req.input_tokens.saturating_sub(write));
+            let non_cached = req.input_tokens.saturating_sub(write).saturating_sub(read);
+            f64::from(non_cached) * pricing.input_per_million / 1_000_000.0
+                + f64::from(read) * cached_rate / 1_000_000.0
+                + f64::from(write) * cache_write_rate / 1_000_000.0
+                + f64::from(req.output_tokens) * pricing.output_per_million / 1_000_000.0
+        }
+        // Legacy two-bucket model: `cached_tokens` collapses cache-read and
+        // cache-write into one number priced at the cached rate. Cache-write
+        // tokens priced at the ordinary input rate (pre-C02 behavior).
+        _ => {
+            let cached = req.cached_tokens.min(req.input_tokens);
+            let non_cached_input = req.input_tokens.saturating_sub(cached);
+            f64::from(non_cached_input) * pricing.input_per_million / 1_000_000.0
+                + f64::from(cached) * cached_rate / 1_000_000.0
+                + f64::from(req.output_tokens) * pricing.output_per_million / 1_000_000.0
+        }
+    };
     ProjectedCost { cost_usd: cost }
 }
 
@@ -96,6 +132,118 @@ mod tests {
     use chrono::TimeZone;
     use uuid::Uuid;
 
+    #[test]
+    fn cache_write_tokens_price_at_cache_write_rate() {
+        // A request with explicit cache-creation (write) and cache-read counts
+        // bills cache-write tokens at the (higher) cache-write rate.
+        let mut req = sample_request(1000, 100, 0);
+        req.cache_creation_input_tokens = Some(400);
+        req.cache_read_input_tokens = Some(300);
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: Some(0.1),
+            cache_write_per_million: Some(1.25),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+        };
+        let result = project_cost(&req, "target", &pricing);
+        // 300 non-cached + 300 cache-read + 400 cache-write + 100 output
+        let expected = 300.0 * 1.0 / 1e6 // non-cached at input rate
+            + 300.0 * 0.1 / 1e6 // cache-read at cached rate
+            + 400.0 * 1.25 / 1e6 // cache-write at WRITE rate (not input rate)
+            + 100.0 * 2.0 / 1e6; // output
+        assert!(
+            (result.cost_usd - expected).abs() < 1e-12,
+            "three-bucket: got {} want {}",
+            result.cost_usd,
+            expected
+        );
+    }
+
+    #[test]
+    fn cache_write_falls_back_to_input_rate_without_write_tier() {
+        // No cache_write_per_million → cache-write tokens price at the standard
+        // input rate (backwards-compatible pre-C02 behavior).
+        let mut req = sample_request(1000, 100, 0);
+        req.cache_creation_input_tokens = Some(400);
+        req.cache_read_input_tokens = Some(300);
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: Some(0.1),
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+        };
+        let result = project_cost(&req, "target", &pricing);
+        let expected = 300.0 * 1.0 / 1e6
+            + 300.0 * 0.1 / 1e6
+            + 400.0 * 1.0 / 1e6 // cache-write falls back to input rate
+            + 100.0 * 2.0 / 1e6;
+        assert!((result.cost_usd - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn legacy_rows_without_cache_fields_keep_two_bucket_pricing() {
+        // Legacy rows (cache_creation/read are None) use the prior
+        // two-bucket model exactly.
+        let req = sample_request(1000, 100, 400); // cached_tokens = 400
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: Some(0.1),
+            cache_write_per_million: Some(1.25), // present but unused (legacy row)
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+        };
+        let result = project_cost(&req, "target", &pricing);
+        let expected = 600.0 * 1.0 / 1e6 // non-cached at input rate
+            + 400.0 * 0.1 / 1e6 // cached_tokens at cached rate
+            + 100.0 * 2.0 / 1e6; // output
+        assert!(
+            (result.cost_usd - expected).abs() < 1e-12,
+            "legacy: got {} want {}",
+            result.cost_usd,
+            expected
+        );
+    }
+
+    #[test]
+    fn cache_write_plus_read_never_exceeds_input_tokens() {
+        // A malformed row where write+read > input_tokens is clamped to the
+        // total, never a negative non-cached count.
+        let mut req = sample_request(100, 0, 0);
+        req.cache_creation_input_tokens = Some(80);
+        req.cache_read_input_tokens = Some(50); // 80+50=130 > 100
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: Some(0.1),
+            cache_write_per_million: Some(1.25),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+        };
+        let result = project_cost(&req, "target", &pricing);
+        // write clamped to 80, read clamped to min(50, 100-80=20) = 20.
+        // non-cached = 100 - 80 - 20 = 0.
+        let expected = 0.0 * 1.0 / 1e6 + 20.0 * 0.1 / 1e6 + 80.0 * 1.25 / 1e6 + 0.0 * 2.0 / 1e6;
+        assert!(
+            (result.cost_usd - expected).abs() < 1e-12,
+            "clamped: got {} want {}",
+            result.cost_usd,
+            expected
+        );
+    }
+
     fn sample_request(input: u32, output: u32, cached: u32) -> RequestLog {
         RequestLog {
             id: Uuid::nil(),
@@ -107,6 +255,8 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: cached,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
             cost_usd: 0.0,
             baseline_cost_usd: 0.0,
             cached: false,
@@ -132,6 +282,7 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: None,
@@ -149,6 +300,7 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: None,
@@ -166,6 +318,7 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: None,
@@ -186,6 +339,7 @@ mod tests {
             input_per_million: 5.0,
             output_per_million: 30.0,
             cached_input_per_million: Some(0.5),
+            cache_write_per_million: None,
             batch_input_per_million: Some(2.50),
             batch_output_per_million: Some(15.00),
             flex_input_per_million: None,
@@ -217,6 +371,7 @@ mod tests {
             input_per_million: 5.0,
             output_per_million: 30.0,
             cached_input_per_million: Some(0.5),
+            cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: Some(2.50),
@@ -244,6 +399,7 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: None,

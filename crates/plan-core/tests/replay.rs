@@ -41,6 +41,8 @@ fn make_req(
         input_tokens,
         output_tokens,
         cached_tokens: 0,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
         cost_usd: baseline_cost,
         baseline_cost_usd: baseline_cost,
         cached,
@@ -67,6 +69,7 @@ fn pricing_with(provider: &str, model: &str, input: f64, output: f64) -> (String
             input_per_million: input,
             output_per_million: output,
             cached_input_per_million: Some(input * 0.1),
+            cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: None,
@@ -586,24 +589,30 @@ fn batch_route_projects_discount_and_caveats() {
 
     let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
     assert_eq!(result.aggregates.requests_rerouted, 1);
+    let standard_cost = 1000.0 * 0.25 / 1e6 + 100.0 * 1.25 / 1e6;
     let batch_cost = 1000.0 * 0.125 / 1e6 + 100.0 * 0.625 / 1e6;
     assert!(
-        (result.aggregates.total_projected_cost_usd - batch_cost).abs() < 1e-12,
-        "projected ({}) must be the batch-rate cost ({batch_cost})",
+        (result.aggregates.total_projected_cost_usd - standard_cost).abs() < 1e-12,
+        "projected ({}) must be the standard-rate cost ({standard_cost}) — C03 separates the batch discount",
         result.aggregates.total_projected_cost_usd
     );
     assert!(
-        (result.aggregates.projected_savings_usd - (0.0045 - batch_cost)).abs() < 1e-12,
-        "savings must include the batch delta"
+        (result.aggregates.batch_opportunity_usd - (standard_cost - batch_cost)).abs() < 1e-12,
+        "batch_opportunity_usd ({}) must be the hypothetical delta ({})",
+        result.aggregates.batch_opportunity_usd,
+        standard_cost - batch_cost
     );
-    let expected_caveat = "1 request(s) projected at the target's Batch API rate via a \
-                           batch-eligibility route — advisory today: the synchronous gateway \
-                           defers this discount until the async Batch Lane ships, and logs \
-                           carry no streamed/interactive marker, so this count can include \
-                           traffic the runtime gate would clear as batch-ineligible.";
     assert!(
-        result.caveats.iter().any(|c| c == expected_caveat),
-        "expected the advisory batch caveat, got: {:?}",
+        (result.aggregates.projected_savings_usd - (0.0045 - standard_cost)).abs() < 1e-12,
+        "savings must NOT include the batch delta (C03)"
+    );
+    let expected_caveat = "1 request(s) carried a batch-eligibility route";
+    assert!(
+        result
+            .caveats
+            .iter()
+            .any(|c| c.starts_with(expected_caveat)),
+        "expected a batch caveat, got: {:?}",
         result.caveats
     );
 }
@@ -723,11 +732,12 @@ fn batch_cache_hit_stays_zero_projected_without_counter() {
     input.config.l1_ttl_seconds = Some(3600);
     let result = replay(input).unwrap();
 
-    // Projected total = ONE batch-rate dispatch + one free cache hit.
-    let batch_cost = 1000.0 * 0.125 / 1e6 + 100.0 * 0.625 / 1e6;
+    // Projected total = ONE standard-rate dispatch + one free cache hit.
+    // C03: batch discount separated; standard rate stays in the headline.
+    let standard_cost = 1000.0 * 0.25 / 1e6 + 100.0 * 1.25 / 1e6;
     assert!(
-        (result.aggregates.total_projected_cost_usd - batch_cost).abs() < 1e-12,
-        "cache hit must project 0; got total {}",
+        (result.aggregates.total_projected_cost_usd - standard_cost).abs() < 1e-12,
+        "cache hit must project 0; got total {} (C03: standard rate, not batch)",
         result.aggregates.total_projected_cost_usd
     );
     // The caveat counts exactly 1 batch-deferred request — not the cache hit.
@@ -735,7 +745,7 @@ fn batch_cache_hit_stays_zero_projected_without_counter() {
         result
             .caveats
             .iter()
-            .any(|c| c.starts_with("1 request(s) projected at the target's Batch API rate")),
+            .any(|c| c.starts_with("1 request(s) carried a batch-eligibility route")),
         "cache hits must not increment the batch counter: {:?}",
         result.caveats
     );
@@ -1024,6 +1034,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: None,
@@ -1039,6 +1050,8 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             input_tokens,
             output_tokens,
             cached_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
             cost_usd: 0.0,
             baseline_cost_usd: 0.0,
             cached: i % 5 == 0,

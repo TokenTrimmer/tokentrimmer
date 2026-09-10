@@ -18,6 +18,10 @@ fn to_plan(p: &tt_shared::pricing::ModelPricing) -> ModelPricing {
         input_per_million: p.input_per_million,
         output_per_million: p.output_per_million,
         cached_input_per_million: p.cached_input_per_million,
+        // Real catalog cache-write rate (~1.25× base for Anthropic) — feeds
+        // the three-bucket cost model (C02): non-cached + cache-write +
+        // cache-read. `None` = no separate write tier; falls back to input rate.
+        cache_write_per_million: p.cache_write_per_million,
         // Real catalog Batch-API rates (None = no batch tier) — feed the
         // batch-eligibility route projection; never a fabricated 0.5×.
         batch_input_per_million: p.batch_input_per_million,
@@ -92,6 +96,21 @@ mod tests {
             .expect("groq:llama-3.1-8b-instant in catalog table");
         assert_eq!(groq.batch_input_per_million, None);
         assert_eq!(groq.batch_output_per_million, None);
+    }
+
+    #[test]
+    fn catalog_table_includes_cache_write_rates() {
+        let table = catalog_pricing_table();
+        // Anthropic models carry a cache-write rate (~1.25× input).
+        let claude = table
+            .get(&pricing_key("anthropic", "claude-sonnet-4-6"))
+            .expect("anthropic:claude-sonnet-4-6 in catalog");
+        assert_eq!(claude.cache_write_per_million, Some(3.75));
+        // Models without a cache-write tier map to None.
+        let groq = table
+            .get(&pricing_key("groq", "llama-3.1-8b-instant"))
+            .expect("groq:llama-3.1-8b-instant in catalog");
+        assert!(groq.cache_write_per_million.is_none());
     }
 
     #[test]
