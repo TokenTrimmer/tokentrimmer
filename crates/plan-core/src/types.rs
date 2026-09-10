@@ -46,6 +46,20 @@ pub struct RequestLog {
     pub output_tokens: u32,
     /// Of `input_tokens`, how many were cached (provider-native prompt cache).
     pub cached_tokens: u32,
+    /// Tokens written to the provider's prompt cache during this request
+    /// (Anthropic `cache_creation_input_tokens`). `None` on legacy/adapter
+    /// rows; when present, these tokens bill at the
+    /// [`ModelPricing::cache_write_per_million`](crate::types::ModelPricing) rate
+    /// rather than the standard input rate. NEW in C02 — serde `default` keeps
+    /// existing snapshots deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Tokens read from the provider's prompt cache (Anthropic
+    /// `cache_read_input_tokens`). When present, this supersedes
+    /// `cached_tokens` for cache-read pricing (which cannot distinguish reads
+    /// from the collapsed legacy `cached_tokens` count).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
     /// Cost the org actually paid for this request, USD.
     pub cost_usd: f64,
     /// Cost the org would have paid without any TokenTrimmer routing/caching
@@ -481,6 +495,14 @@ pub struct ModelPricing {
     /// USD per 1M cached input tokens. `None` means "no cache discount on
     /// this model"; the replay then charges cached input at the full rate.
     pub cached_input_per_million: Option<f64>,
+    /// USD per 1M prompt-cache **write** tokens (e.g. Anthropic's
+    /// cache-creation input, typically ~1.25× the base input rate).
+    /// `None` = no separate cache-write tier; the replay then charges
+    /// cache-write tokens at the standard `input_per_million` rate.
+    /// Mirrors `tt_shared::pricing::ModelPricing::cache_write_per_million`.
+    /// Skipped from JSON when `None` so existing snapshots stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_million: Option<f64>,
     /// USD per 1M batch (async Batch API) input tokens. `None` = no batch
     /// tier; a batch-eligibility route targeting such a model projects NO
     /// discount (never a fabricated 0.5×). Skipped from JSON when `None` so
