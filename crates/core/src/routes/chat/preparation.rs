@@ -1310,6 +1310,12 @@ pub(crate) async fn prepare(
         matched_route_version_id,
         route_paused,
         route_decision_outcome,
+        // C01 defaults: the chat-path planner runs no summarizer call (its
+        // sub-lever wiring is deferred), so the default prepared request
+        // carries did-not-run evidence. The agent-loop completer overwrites
+        // these below with the turn's transcript-summarizer outcome.
+        summarizer_ran: false,
+        summarizer_turn_tax_usd: None,
         requested_model,
         requested_pricing,
         model_was_rewritten,

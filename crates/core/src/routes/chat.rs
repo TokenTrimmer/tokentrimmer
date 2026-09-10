@@ -117,6 +117,17 @@ pub(crate) struct Prepared {
     pub matched_route_version_id: Option<i64>,
     /// Paused-route passthrough marker.
     pub route_paused: bool,
+    /// C01 (migration 0051): the summarizer step ran for the request whose row
+    /// this `Prepared` produces. `true` with a `$0` `summarizer_tax_usd` means
+    /// the call was unmetered (billed, price unknown) — never "free" — so the
+    /// savings SQL / dashboard can see incomplete auxiliary-cost coverage.
+    /// `false` on the default (un-opted) chat path.
+    pub summarizer_ran: bool,
+    /// C01: this turn's metered summarizer tax (the agent-loop transcript
+    /// summarizer), folded into the row's `summarizer_tax_usd` alongside the
+    /// pass-pipeline tax. `None` when the summarizer did not run OR ran
+    /// unmetered (the unpriced case is `summarizer_ran = true` + no fold).
+    pub summarizer_turn_tax_usd: Option<f64>,
     /// Bounded routing-decision outcome name (R02, migration 0052):
     /// `no_match`, `capability_suppressed`, `paused`, or
     /// `accepted_for_action_pipeline` — stamped on the request_logs row. Truly
@@ -1716,6 +1727,8 @@ fn request_log_for_l1_hit(
         flex_saved_usd: 0.0,
         doc_compaction_saved_usd: 0.0,
         summarizer_tax_usd: 0.0,
+        // C01: cache hits perform no summarizer dispatch — did-not-run.
+        summarizer_ran: false,
         request_delta_evidence_state: entry.request_delta_evidence_state,
         cached: true,
         cache_layer: Some("l1".into()),
@@ -1819,6 +1832,8 @@ fn request_log_for_l2_hit(
         flex_saved_usd: 0.0,
         doc_compaction_saved_usd: 0.0,
         summarizer_tax_usd: 0.0,
+        // C01: cache hits perform no summarizer dispatch — did-not-run.
+        summarizer_ran: false,
         request_delta_evidence_state,
         cached: true,
         cache_layer: Some("l2".into()),
@@ -5177,6 +5192,7 @@ mod telemetry_drain_tests {
             batch_forgone_usd: 0.0,
             route_paused: false,
             route_decision_outcome: None,
+            summarizer_ran: false,
             minify_saved_est_usd: 0.0,
             format_switched: None,
             format_switch_saved_est_usd: 0.0,
