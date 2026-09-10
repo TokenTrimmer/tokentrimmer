@@ -28,6 +28,12 @@ pub(crate) struct StoredRouting {
 pub(crate) struct SummarizeConfig {
     pub keep_recent_pairs: u32,
     pub clear_at_least_tokens: u32,
+    /// The matched route's `redact` guardrail (R5/S01): auxiliary summarizer
+    /// dispatches must strip PII/secrets from the tool-result bytes they send,
+    /// mirroring the chat escape hatch. Defaults false for runs persisted
+    /// before this field existed. SAFETY lever — never suppressed by a pause.
+    #[serde(default)]
+    pub redact: bool,
 }
 
 /// The full resumable run state persisted to the L1 store. NO secrets — only

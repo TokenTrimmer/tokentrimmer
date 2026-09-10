@@ -1250,6 +1250,7 @@ async fn dispatch_summary(
     class: &str,
     original: &str,
     deadline: std::time::Duration,
+    redact: bool,
 ) -> SummarizeCall {
     let Some(provider) = state.registry.resolve(summarizer_model) else {
         return SummarizeCall {
@@ -1270,7 +1271,14 @@ async fn dispatch_summary(
                 }
             }
         };
-    let req = build_summary_request(class, original, summarizer_model);
+    let mut req = build_summary_request(class, original, summarizer_model);
+    if redact {
+        // Same deterministic, fixed-regex pass the chat escape hatch runs —
+        // the summarizer is an auxiliary EGRESS path and must be covered by
+        // the same privacy guardrail as the main dispatch. Never fails the
+        // call: redaction is a best-effort strip of the outbound bytes.
+        let _ = crate::passes::RedactionPass::new().redact(&mut req);
+    }
     let res = crate::measurement::measured_single_dispatch(&provider, req, &ctx, deadline).await;
     summary_call_from_result(res)
 }
@@ -1335,6 +1343,10 @@ impl TranscriptSummarizer for GatewayTranscriptSummarizer<'_> {
                 &class,
                 &original,
                 self.deadline,
+                // SAFETY lever (R5/S01): the run's history holds pre-redaction
+                // tool bytes, so the summarizer's OWN provider dispatch must
+                // apply the route's redaction guardrail just like the turn dispatch.
+                self.cfg.redact,
             )
             .await;
             tax = crate::passes::agentic_budget::summarize_judge::sum_metered(tax, call.cost_usd);
@@ -1489,6 +1501,11 @@ async fn resolve_summarize_config(
     Some(SummarizeConfig {
         keep_recent_pairs: ab.keep_recent_pairs,
         clear_at_least_tokens: ab.clear_at_least_tokens,
+        // SAFETY lever: carry the route's redaction guardrail into every
+        // auxiliary summarizer dispatch — the run's conversation history holds
+        // PRE-redaction tool bytes (prepare redacts a per-turn CLONE), so the
+        // summarizer input would otherwise egress unredacted on a redact route.
+        redact: route_match.redact,
     })
 }
 
@@ -2506,6 +2523,178 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert!(matches!(req.messages[0], Message::System { .. }));
         assert!(matches!(req.messages[1], Message::User { .. }));
+    }
+
+    /// S01/R5: the summarizer dispatch is an auxiliary EGRESS path — with the
+    /// matched route's `redact` lever set, the tool bytes it ships to the
+    /// (third-party) summarizer model must be redacted exactly like the main
+    /// dispatch's escape hatch.
+    #[tokio::test]
+    async fn dispatch_summary_redacts_when_route_learns_redact() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use futures::stream::{BoxStream, StreamExt};
+        use serde_json::json;
+        use tt_auth::{
+            keys::{issue, Environment},
+            InMemoryKeyStore,
+        };
+        use tt_shared::{
+            context::{BudgetDispatchState, ProviderCredentials, SecretString},
+            pricing::Capability,
+            ChatCompletionChunk, ChatCompletionResponse, EmbeddingsRequest, EmbeddingsResponse,
+            ModelInfo, ModelPricing, Provider, ProviderError,
+        };
+        use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
+
+        let state = crate::AppState::new(crate::ProviderRegistry::new());
+        let keys = Arc::new(InMemoryKeyStore::new());
+        let key = issue(
+            keys.as_ref(),
+            &InMemoryAuditWriter::new(),
+            Uuid::now_v7(),
+            "summarizer-redact",
+            Environment::Live,
+            Actor::System,
+        )
+        .await
+        .unwrap()
+        .plaintext;
+        // A provider registered under the summarizer model name that records
+        // the request it is dispatched with.
+        #[derive(Default)]
+        struct RecordingProvider(Mutex<Vec<ChatCompletionRequest>>);
+        #[async_trait]
+        impl Provider for RecordingProvider {
+            fn id(&self) -> &'static str {
+                "summarizer-redact-test"
+            }
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![ModelInfo {
+                    id: "cheap-summarizer".into(),
+                    provider: self.id().into(),
+                    capabilities: vec![Capability::Text],
+                    max_input_tokens: 8192,
+                    max_output_tokens: 1024,
+                }]
+            }
+            fn pricing(&self, _: &str) -> Option<ModelPricing> {
+                None
+            }
+            async fn chat_completion(
+                &self,
+                req: ChatCompletionRequest,
+                _: &RequestContext,
+            ) -> Result<ChatCompletionResponse, ProviderError> {
+                self.0.lock().unwrap().push(req.clone());
+                Ok(serde_json::from_value(json!({
+                    "id": "redact-test", "object": "chat.completion", "created": 0, "model": req.model,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+                })).unwrap())
+            }
+            async fn chat_completion_stream(
+                &self,
+                _req: ChatCompletionRequest,
+                _: &RequestContext,
+            ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+            {
+                unreachable!("non-streaming measure path")
+            }
+            async fn embeddings(
+                &self,
+                _: EmbeddingsRequest,
+                _: &RequestContext,
+            ) -> Result<EmbeddingsResponse, ProviderError> {
+                unreachable!("no embeddings")
+            }
+        }
+        let provider = Arc::new(RecordingProvider::default());
+        let mut registry = crate::ProviderRegistry::new();
+        registry.register(provider.clone());
+        let keys = Arc::new(InMemoryKeyStore::new());
+        let key = issue(
+            keys.as_ref(),
+            &InMemoryAuditWriter::new(),
+            Uuid::now_v7(),
+            "summarizer-redact",
+            Environment::Live,
+            Actor::System,
+        )
+        .await
+        .unwrap()
+        .plaintext;
+        let state = crate::AppState::new(registry).with_key_store(keys);
+
+        let base_ctx = RequestContext {
+            trace_id: Uuid::now_v7(),
+            org_id: Uuid::now_v7(),
+            api_key_id: Uuid::now_v7(),
+            budget_dispatch: BudgetDispatchState::default(),
+            credentials: ProviderCredentials {
+                api_key: SecretString::new(key.clone()),
+                base_url: None,
+                extra_headers: Vec::new(),
+            },
+            tag: None,
+            deadline: Some(Duration::from_secs(10)),
+            run_id: None,
+            node_id: None,
+        };
+        let pii =
+            "contact jane.doe@example.com about sk-ant-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // redact=false (default): the raw bytes dispatch unredacted.
+        let call = dispatch_summary(
+            &state,
+            Uuid::now_v7(),
+            &key,
+            &base_ctx,
+            "cheap-summarizer",
+            "test_class",
+            pii,
+            Duration::from_secs(5),
+            false,
+        )
+        .await;
+        assert!(call.summary.is_some());
+        {
+            let calls = provider.0.lock().unwrap();
+            let wire = serde_json::to_string(&calls[0]).unwrap();
+            assert!(
+                wire.contains("jane.doe@example.com"),
+                "control case must see raw bytes"
+            );
+            assert!(wire.contains("sk-ant-aaaaaaaa"));
+        }
+
+        // redact=true: the SAME route (R5/S01) strips the PII/secrets.
+        let call = dispatch_summary(
+            &state,
+            Uuid::now_v7(),
+            &key,
+            &base_ctx,
+            "cheap-summarizer",
+            "test_class",
+            pii,
+            Duration::from_secs(5),
+            true,
+        )
+        .await;
+        assert!(call.summary.is_some());
+        {
+            let calls = provider.0.lock().unwrap();
+            let wire = serde_json::to_string(&calls[1]).unwrap();
+            assert!(
+                !wire.contains("jane.doe@example.com"),
+                "PII leaked to summarizer: {wire}"
+            );
+            assert!(
+                !wire.contains("sk-ant-aaaaaaaa"),
+                "secret leaked to summarizer: {wire}"
+            );
+        }
     }
 
     #[test]
