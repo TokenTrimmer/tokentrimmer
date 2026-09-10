@@ -48,6 +48,17 @@
 
 import OpenAI from 'openai';
 import type { ClientOptions } from 'openai';
+
+/**
+ * Extended client options that add TokenTrimmer-specific configuration.
+ * `defaultMaxTokens` (`number | undefined`): when set, the SDK injects this
+ * as `max_tokens` when the caller supplies no explicit output cap. This is
+ * OPT-IN: absent means no default is injected and the request goes to the
+ * gateway exactly as the caller wrote it (the provider's own default applies).
+ */
+export type TokenTrimmerClientOptions = ClientOptions & {
+  defaultMaxTokens?: number;
+};
 import type { APIPromise } from 'openai/core/api-promise';
 import { Stream } from 'openai/core/streaming';
 import type {
@@ -727,14 +738,18 @@ export class TokenTrimmer extends OpenAI {
   readonly agent: Agent;
   /** Bounded responder-scoped catalog, capability, and preflight operations. */
   readonly gateway: GatewayMetadata;
+  /** Optional opt-in default output cap for requests with no explicit limit. */
+  private readonly defaultMaxTokens: number | undefined;
 
-  constructor(options: ClientOptions = {}) {
+  constructor(options: TokenTrimmerClientOptions = {}) {
+    const { defaultMaxTokens, ...rest } = options;
     super({
-      ...options,
-      apiKey: options.apiKey ?? resolveApiKey(),
-      baseURL: options.baseURL ?? DEFAULT_BASE_URL,
+      ...rest,
+      apiKey: rest.apiKey ?? resolveApiKey(),
+      baseURL: rest.baseURL ?? DEFAULT_BASE_URL,
     });
 
+    this.defaultMaxTokens = defaultMaxTokens;
     this.agent = new Agent(this);
     this.gateway = new GatewayMetadata(this.baseURL, this.apiKey ?? '');
 
@@ -749,13 +764,18 @@ export class TokenTrimmer extends OpenAI {
       body: ChatCompletionCreateParamsBase & TokenTrimmerExtraParams,
       options: RequestOptions = {},
     ): Promise<ChatCompletionWithMeta | TokenTrimmerStream> => {
-      const { ttTag, ttCostLimit, ttCache, ...rest } = body;
-      const params: ChatCompletionCreateParamsBase = rest;
+      const { ttTag, ttCostLimit, ttCache, ...restBody } = body;
+      const params: ChatCompletionCreateParamsBase = restBody;
 
-      // Sensible default to prevent unbounded output. A user-provided
-      // max_tokens / max_completion_tokens wins.
-      if (params.max_tokens == null && params.max_completion_tokens == null) {
-        params.max_tokens = 4096;
+      // Explicit explicit opt-in cap: only inject when the caller configured
+      // `defaultMaxTokens` and supplied no explicit output limit.
+      // Absent means the request goes to the gateway as-is.
+      if (
+        this.defaultMaxTokens !== undefined &&
+        params.max_tokens == null &&
+        params.max_completion_tokens == null
+      ) {
+        params.max_tokens = this.defaultMaxTokens;
       }
 
       const headers = toHeaders(options.headers);

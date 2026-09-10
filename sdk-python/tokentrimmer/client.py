@@ -4,8 +4,10 @@ Wraps the official ``openai.OpenAI`` client. Override points:
 
 - Default ``base_url`` points at the hosted Gateway.
 - ``chat.completions.create`` is wrapped to:
-  - inject a default ``max_tokens=4096`` when the caller supplies no
-    ``max_tokens`` / ``max_completion_tokens`` / ``max_output_tokens``;
+  - inject the caller's explicit ``default_max_tokens`` (constructor option)
+    when the caller supplies no ``max_tokens`` / ``max_completion_tokens`` /
+    ``max_output_tokens``. When no default is configured, no cap is injected
+    — the request reaches the Gateway exactly as the caller wrote it;
   - lift ``tt_tag`` / ``tt_cost_limit`` / ``tt_cache`` keyword arguments into
     the matching ``X-TokenTrimmer-*`` request headers;
   - attach parsed ``X-TokenTrimmer-*`` response headers to the result as
@@ -241,8 +243,18 @@ class TokenTrimmer(OpenAI):
         self,
         api_key: Optional[str] = None,
         base_url: str = DEFAULT_BASE_URL,
+        *,
+        default_max_tokens: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
+        """Initialize the TokenTrimmer client.
+
+        ``default_max_tokens`` is an OPT-IN output cap: when set (and the
+        request supplies no explicit ``max_tokens`` / ``max_completion_tokens``
+        / ``max_output_tokens``), this value is injected. When ``None`` (the
+        default), no cap is injected — the request goes to the Gateway exactly
+        as the caller wrote it.
+        """
         # API-key precedence: explicit `api_key` arg > TOKENTRIMMER_API_KEY env >
         # the base OpenAI SDK's own OPENAI_API_KEY fallback (which kicks in when
         # we pass api_key=None). We only consult TOKENTRIMMER_API_KEY when the
@@ -250,6 +262,7 @@ class TokenTrimmer(OpenAI):
         if api_key is None:
             api_key = os.environ.get("TOKENTRIMMER_API_KEY")
         super().__init__(api_key=api_key, base_url=base_url, **kwargs)
+        self._default_max_tokens = default_max_tokens
         self._wrap_chat_completions()
         # Driver for the server-side agent loop (`POST /v1/agent/runs`). Reuses
         # this client's base URL / key / httpx transport. See agent.py.
@@ -283,13 +296,18 @@ class TokenTrimmer(OpenAI):
         raw_response_create = completions.with_raw_response.create
 
         def create(*args: Any, **kwargs: Any) -> Any:
-            # Sensible default to prevent unbounded output. User-provided
-            # max_tokens / max_completion_tokens / max_output_tokens win.
-            if not any(
-                k in kwargs
-                for k in ("max_tokens", "max_completion_tokens", "max_output_tokens")
+            # Explicit opt-in cap: only inject when the caller configured
+            # `default_max_tokens` AND supplied no explicit output limit.
+            # When `_default_max_tokens` is None (the default), no cap is
+            # injected — the request goes to the Gateway as-is.
+            if (
+                self._default_max_tokens is not None
+                and not any(
+                    k in kwargs
+                    for k in ("max_tokens", "max_completion_tokens", "max_output_tokens")
+                )
             ):
-                kwargs["max_tokens"] = 4096
+                kwargs["max_tokens"] = self._default_max_tokens
 
             extra_headers = dict(kwargs.pop("extra_headers", {}) or {})
             tt_tag = kwargs.pop("tt_tag", None)
