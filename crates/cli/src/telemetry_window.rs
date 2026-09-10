@@ -26,6 +26,8 @@ struct WindowRow {
     input_tokens: i32,
     output_tokens: i32,
     cached_tokens: i32,
+    cache_creation_input_tokens: Option<i32>,
+    cache_read_input_tokens: Option<i32>,
     cost_usd: f64,
     baseline_cost_usd: f64,
     cached: bool,
@@ -49,6 +51,8 @@ impl WindowRow {
             input_tokens: self.input_tokens.max(0) as u32,
             output_tokens: self.output_tokens.max(0) as u32,
             cached_tokens: self.cached_tokens.max(0) as u32,
+            cache_creation_input_tokens: self.cache_creation_input_tokens.map(|v| v.max(0) as u32),
+            cache_read_input_tokens: self.cache_read_input_tokens.map(|v| v.max(0) as u32),
             cost_usd: self.cost_usd,
             baseline_cost_usd: self.baseline_cost_usd,
             cached: self.cached,
@@ -92,6 +96,7 @@ pub async fn fetch_window(
     let rows = sqlx::query_as::<_, WindowRow>(
         "SELECT id, org_id, ts, provider, model, requested_model, input_tokens, output_tokens, \
                 cached_tokens, cost_usd::float8 AS cost_usd, \
+                cache_creation_input_tokens, cache_read_input_tokens, \
                 baseline_cost_usd::float8 AS baseline_cost_usd, cached, cache_layer, \
                 route_id, latency_ms, upstream_latency_ms, status, tag \
          FROM request_logs \

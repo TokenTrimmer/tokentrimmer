@@ -65,6 +65,7 @@ impl Provider for PricedMock {
                 flex_output_per_million: None,
                 prompt_cache_min_tokens: None,
                 effective_at: chrono::Utc::now(),
+                verified_at: None,
             })
         } else {
             None
@@ -319,6 +320,7 @@ impl Provider for PanicMock {
                 flex_output_per_million: None,
                 prompt_cache_min_tokens: None,
                 effective_at: chrono::Utc::now(),
+                verified_at: None,
             })
         } else {
             None

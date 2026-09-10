@@ -90,7 +90,8 @@ impl Provider for FlexRecordingProvider {
             flex_input_per_million: flex_in,
             flex_output_per_million: flex_out,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         })
     }
     async fn chat_completion(

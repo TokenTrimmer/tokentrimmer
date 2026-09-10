@@ -47,7 +47,8 @@ impl Provider for WarnMock {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         })
     }
     fn dropped_params(&self, req: &ChatCompletionRequest) -> Vec<String> {
@@ -146,7 +147,8 @@ impl Provider for ReasoningMock {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         })
     }
     fn dropped_params(&self, req: &ChatCompletionRequest) -> Vec<String> {
