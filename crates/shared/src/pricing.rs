@@ -53,6 +53,12 @@ pub struct ModelPricing {
     pub prompt_cache_min_tokens: Option<u32>,
     /// When this pricing took effect (for historical replay).
     pub effective_at: DateTime<Utc>,
+    /// C08: when this rate's correctness was last checked against the
+    /// provider's published pricing. Defaults to `effective_at` when no
+    /// explicit verification date is recorded. A new catalog entry does NOT
+    /// update this field for unrelated rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<DateTime<Utc>>,
 }
 
 /// Which cache-write TTL tier a prompt-cache write was billed at.
@@ -191,6 +197,15 @@ struct RawEntry {
     #[serde(default)]
     prompt_cache_min_tokens: Option<u32>,
     effective_at: DateTime<Utc>,
+    /// C08: when this rate's correctness was last checked against the
+    /// provider's published pricing. SEPARATE from `effective_at` (when the
+    /// rate took effect). An absent `verified_at` defaults to `effective_at`
+    /// (the catalog-entry introduction date) — it does NOT inherit freshness
+    /// from newer entries. A rate is fresh only when THIS row's `verified_at`
+    /// is recent, so a new catalog entry cannot make unrelated unverified
+    /// rates appear fresh.
+    #[serde(default)]
+    verified_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +242,7 @@ impl PricingCatalog {
                     flex_output_per_million: e.flex_output_per_million,
                     prompt_cache_min_tokens: e.prompt_cache_min_tokens,
                     effective_at: e.effective_at,
+                    verified_at: e.verified_at.or(Some(e.effective_at)),
                 });
         }
         // Sort each model's history ascending by effective_at so `latest` is

@@ -66,7 +66,8 @@ impl Provider for InvalidRequestProvider {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         })
     }
     async fn chat_completion(
@@ -126,7 +127,8 @@ impl Provider for RateLimitedProvider {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         })
     }
     async fn chat_completion(
@@ -188,7 +190,8 @@ impl Provider for ServerErrorProvider {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         })
     }
     async fn chat_completion(
@@ -541,7 +544,8 @@ async fn positive_cache_unaffected_by_negative_cache_logic() {
                 flex_input_per_million: None,
                 flex_output_per_million: None,
                 prompt_cache_min_tokens: None,
-                effective_at: Utc::now(),
+                effective_at: chrono::Utc::now(),
+                verified_at: None,
             })
         }
         async fn chat_completion(

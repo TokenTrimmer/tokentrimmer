@@ -189,6 +189,7 @@ impl DynamicCatalog {
                             flex_input_per_million: None,
                             flex_output_per_million: None,
                             effective_at,
+                            verified_at: None,
                         },
                     );
                 }

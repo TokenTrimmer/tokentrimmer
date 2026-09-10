@@ -114,6 +114,7 @@ impl Provider for MockProvider {
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
+            verified_at: None,
         })
     }
     async fn chat_completion(
@@ -164,6 +165,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
+            verified_at: None,
         }),
         baseline_pricing: Some(ModelPricing {
             input_per_million: 3.0,
@@ -176,6 +178,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
+            verified_at: None,
         }),
         route_id: None,
         route_version_id: None,
@@ -339,6 +342,7 @@ async fn sse_routed_stream_logs_baseline_against_original_model() {
         flex_output_per_million: None,
         prompt_cache_min_tokens: None,
         effective_at: chrono::Utc::now(),
+        verified_at: None,
     };
     let expensive = ModelPricing {
         input_per_million: 5.0,
@@ -351,6 +355,7 @@ async fn sse_routed_stream_logs_baseline_against_original_model() {
         flex_output_per_million: None,
         prompt_cache_min_tokens: None,
         effective_at: chrono::Utc::now(),
+        verified_at: None,
     };
     let mut ctx = make_log_ctx(Arc::clone(&writer));
     ctx.model = "gpt-4o-mini".into();

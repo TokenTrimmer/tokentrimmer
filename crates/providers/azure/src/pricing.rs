@@ -43,6 +43,7 @@ fn rate(
         flex_output_per_million: None,
         prompt_cache_min_tokens: None,
         effective_at: effective_at(),
+        verified_at: None,
     }
 }
 

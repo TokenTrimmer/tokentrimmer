@@ -2631,7 +2631,8 @@ mod l2_baseline_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         }
     }
 
@@ -2725,7 +2726,8 @@ mod cache_bust_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         }
     }
 
@@ -3188,7 +3190,8 @@ mod shape_cost_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         }
     }
 
@@ -3444,7 +3447,8 @@ mod fee_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         }
     }
 
@@ -3488,7 +3492,8 @@ mod fee_tests {
             flex_input_per_million: Some(5.0),
             flex_output_per_million: Some(15.0),
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         }
     }
 
@@ -3613,7 +3618,8 @@ mod cache_write_rate_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         }
     }
 
@@ -3629,7 +3635,8 @@ mod cache_write_rate_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         }
     }
 
@@ -3838,7 +3845,8 @@ mod provider_cache_attribution_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         }
     }
 
@@ -3895,7 +3903,8 @@ mod provider_cache_attribution_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         };
         let usage = Usage {
             prompt_tokens: 1_000_000,
@@ -4574,7 +4583,8 @@ mod output_shaping_tests {
             flex_input_per_million: None,
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
+            effective_at: chrono::Utc::now(),
+            verified_at: None,
         };
         let usage = Usage {
             prompt_tokens: 1000,

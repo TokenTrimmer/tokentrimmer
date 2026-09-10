@@ -566,6 +566,7 @@ mod tests {
             flex_output_per_million: None,
             prompt_cache_min_tokens: Some(8),
             effective_at: chrono::Utc::now(),
+            verified_at: None,
         };
         let cx = PassContext {
             provider_id: "openai",
