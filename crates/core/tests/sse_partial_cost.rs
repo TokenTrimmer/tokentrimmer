@@ -193,6 +193,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         span_ctx: None,
         traffic_split_arm: None,
         route_paused: false,
+        route_decision_outcome: None,
         panel: None,
     }
 }

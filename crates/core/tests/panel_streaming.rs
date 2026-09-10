@@ -671,6 +671,7 @@ fn panel_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         span_ctx: None,
         traffic_split_arm: None,
         route_paused: false,
+        route_decision_outcome: None,
         panel: Some(Arc::new(panel)),
     }
 }
@@ -926,6 +927,7 @@ fn panel_log_ctx_live(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext
         span_ctx: None,
         traffic_split_arm: None,
         route_paused: false,
+        route_decision_outcome: None,
         panel: Some(Arc::new(panel)),
     }
 }

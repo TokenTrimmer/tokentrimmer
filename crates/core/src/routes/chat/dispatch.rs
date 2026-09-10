@@ -25,6 +25,7 @@ pub(super) async fn handle_streaming(
         matched_route_id,
         matched_route_version_id,
         route_paused,
+        route_decision_outcome,
         requested_model,
         requested_pricing,
         model_was_rewritten,
@@ -104,6 +105,7 @@ pub(super) async fn handle_streaming(
                                     route_id: matched_route_id,
                                     route_version_id: matched_route_version_id,
                                     paused: route_paused,
+                                    outcome: route_decision_outcome,
                                 },
                                 retrieval_telemetry.tokens_saved,
                             ),
@@ -434,6 +436,8 @@ pub(super) async fn handle_streaming(
                 traffic_split_arm: traffic_split_arm_owned.clone(),
                 // Paused-route passthrough marker for the streamed row.
                 route_paused,
+                // Bounded routing-decision outcome for the streamed row (R02).
+                route_decision_outcome,
                 // Single-model streaming dispatch carries no panel context; the
                 // streaming-panel path (Phase 5 Task 6) sets this. Off-by-default.
                 panel: None,
@@ -641,6 +645,7 @@ async fn complete_once_with_retry_policy(
         matched_route_id,
         matched_route_version_id,
         route_paused,
+        route_decision_outcome,
         requested_model,
         requested_pricing,
         // `complete_once` prices its baseline from `matched_route_id.is_some()`
@@ -718,6 +723,7 @@ async fn complete_once_with_retry_policy(
                 matched_route_id,
                 matched_route_version_id,
                 route_paused,
+                route_decision_outcome,
                 retrieval_telemetry.tokens_saved,
                 route_matched_name.as_deref(),
             )
@@ -765,6 +771,7 @@ async fn complete_once_with_retry_policy(
                 matched_route_id,
                 matched_route_version_id,
                 route_paused,
+                route_decision_outcome,
                 retrieval_telemetry.tokens_saved,
                 route_matched_name.as_deref(),
                 &raw_bearer,
@@ -834,6 +841,7 @@ async fn complete_once_with_retry_policy(
                                                     route_id: matched_route_id,
                                                     route_version_id: matched_route_version_id,
                                                     paused: route_paused,
+                                                    outcome: route_decision_outcome,
                                                 },
                                                 retrieval_telemetry.tokens_saved,
                                             ),
@@ -1510,6 +1518,7 @@ async fn complete_once_with_retry_policy(
         batch_eligible: batch_marked,
         batch_forgone_usd: cost_breakdown.batch_forgone_usd,
         route_paused,
+        route_decision_outcome: route_decision_outcome.map(String::from),
         // ESTIMATED minify saving — own column (migration 0020),
         // never folded into cost/baseline/saved.
         minify_saved_est_usd: cost_breakdown.minify_saved_est_usd,

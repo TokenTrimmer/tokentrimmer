@@ -194,6 +194,34 @@ enum RouteApplicationOutcome {
     AcceptedForActionPipeline,
 }
 
+impl RouteApplicationOutcome {
+    /// The stable wire name persisted on the `request_logs.route_decision_outcome`
+    /// column (migration 0052) and consumed by cloud dashboards. Bounded,
+    /// value-free enum names ONLY — never request content.
+    pub(crate) fn wire_name(&self) -> &'static str {
+        match self {
+            Self::NoMatch => "no_match",
+            Self::ForcedRouteNotFound => "forced_route_not_found",
+            Self::CapabilitySuppressed => "capability_suppressed",
+            Self::Paused => "paused",
+            Self::AcceptedForActionPipeline => "accepted_for_action_pipeline",
+        }
+    }
+}
+
+/// What `apply_routing` decided for a request (R02). `outcome` is `None` when
+/// no routing store is configured (dev/local / nil-org synthetic contexts) —
+/// the request_logs column goes NULL, never a guessed value. On the
+/// forced-route-not-found path the call fails (`Err`) before a row is built,
+/// so the outcome never needs to travel outside the error body there.
+pub(crate) struct RouteApplication {
+    /// The matched route with its post-decision levers, or `None` for an
+    /// unrouted dispatch (which still carries the bounded `outcome`).
+    pub matched: Option<RouteMatch>,
+    /// Bounded routing-decision outcome name; see [`RouteApplicationOutcome::wire_name`].
+    pub outcome: Option<&'static str>,
+}
+
 #[derive(serde::Serialize)]
 struct RouteApplicationTrace<'a> {
     application_outcome: RouteApplicationOutcome,
@@ -232,10 +260,16 @@ fn record_route_application_trace(
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
 /// for an unforced request.
-fn forced_miss(forced: Option<&str>) -> ApiResult<Option<RouteMatch>> {
+fn forced_miss(forced: Option<&str>) -> ApiResult<RouteApplication> {
     match forced {
         Some(name) => Err(ApiError::InvalidRequest(format!("unknown route: {name}"))),
-        None => Ok(None),
+        // No store / nil org: the outcome is deliberately unrecorded (SQL NULL
+        // per migration 0052) — routing was never evaluated, so there is no
+        // honest decision to persist.
+        None => Ok(RouteApplication {
+            matched: None,
+            outcome: None,
+        }),
     }
 }
 
@@ -258,7 +292,7 @@ pub(crate) async fn apply_routing(
     ctx: &RequestContext,
     req: &mut ChatCompletionRequest,
     forced_route: Option<&str>,
-) -> ApiResult<Option<RouteMatch>> {
+) -> ApiResult<RouteApplication> {
     let Some(store) = state.routing_store.as_ref() else {
         return forced_miss(forced_route);
     };
@@ -349,7 +383,10 @@ pub(crate) async fn apply_routing(
             return Err(ApiError::InvalidRequest(format!("unknown route: {name}")));
         }
         record_route_application_trace(ctx.org_id, RouteApplicationOutcome::NoMatch, &trace);
-        return Ok(None);
+        return Ok(RouteApplication {
+            matched: None,
+            outcome: Some(RouteApplicationOutcome::NoMatch.wire_name()),
+        });
     };
     // The cached engine preserves the ledger ID that the store captured in the
     // same database snapshot as `m`. Missing ledger provenance stays NULL; a
@@ -380,12 +417,15 @@ pub(crate) async fn apply_routing(
         // passthroughs — embeddings has no warnings-header or request_logs
         // plumbing, so this counter is its only pause-visibility signal.
         crate::metrics::record_route_paused_passthrough(&m.name);
-        return Ok(Some(RouteMatch::safety_only(
-            m,
-            route_version_id,
-            &req.model,
-            input_tokens,
-        )));
+        return Ok(RouteApplication {
+            matched: Some(RouteMatch::safety_only(
+                m,
+                route_version_id,
+                &req.model,
+                input_tokens,
+            )),
+            outcome: Some(RouteApplicationOutcome::Paused.wire_name()),
+        });
     }
 
     let route_id = m.id;
@@ -452,12 +492,15 @@ pub(crate) async fn apply_routing(
                     reasons.join(", ")
                 )));
             }
-            return Ok(Some(RouteMatch::safety_only(
-                m,
-                route_version_id,
-                &req.model,
-                input_tokens,
-            )));
+            return Ok(RouteApplication {
+                matched: Some(RouteMatch::safety_only(
+                    m,
+                    route_version_id,
+                    &req.model,
+                    input_tokens,
+                )),
+                outcome: Some(RouteApplicationOutcome::CapabilitySuppressed.wire_name()),
+            });
         }
     }
 
@@ -484,38 +527,41 @@ pub(crate) async fn apply_routing(
         RouteApplicationOutcome::AcceptedForActionPipeline,
         &trace,
     );
-    Ok(Some(RouteMatch {
-        route_id,
-        route_version_id,
-        route_name,
-        paused: false,
-        fallbacks,
-        disable_cache,
-        max_cost_usd,
-        input_tokens_estimate: input_tokens,
-        flex,
-        batch,
-        compress,
-        doc_compaction,
-        content_compress,
-        document_lane,
-        redact,
-        format_switch,
-        diff,
-        traffic_pct,
-        shadow_model,
-        target_model: target_model_for_split,
-        minify_json,
-        reasoning_max_effort,
-        reasoning_budget_tokens,
-        agentic_budget,
-        // Active route's panel trigger (header-wins fallback, resolved in
-        // `prepare`). `m.then.panel` is `None` for the overwhelming majority of
-        // routes (no panel), so this clone is a cheap `None`.
-        panel: m.then.panel.clone(),
-        // Active route's workflow detour (CO-1). `m.then.workflow` is `None`
-        // for the overwhelming majority of routes (no workflow), so this clone
-        // is a cheap `None`. Resolved in `complete_once` before cache.
-        workflow: m.then.workflow.clone(),
-    }))
+    Ok(RouteApplication {
+        matched: Some(RouteMatch {
+            route_id,
+            route_version_id,
+            route_name,
+            paused: false,
+            fallbacks,
+            disable_cache,
+            max_cost_usd,
+            input_tokens_estimate: input_tokens,
+            flex,
+            batch,
+            compress,
+            doc_compaction,
+            content_compress,
+            document_lane,
+            redact,
+            format_switch,
+            diff,
+            traffic_pct,
+            shadow_model,
+            target_model: target_model_for_split,
+            minify_json,
+            reasoning_max_effort,
+            reasoning_budget_tokens,
+            agentic_budget,
+            // Active route's panel trigger (header-wins fallback, resolved in
+            // `prepare`). `m.then.panel` is `None` for the overwhelming majority of
+            // routes (no panel), so this clone is a cheap `None`.
+            panel: m.then.panel.clone(),
+            // Active route's workflow detour (CO-1). `m.then.workflow` is `None`
+            // for the overwhelming majority of routes (no workflow), so this clone
+            // is a cheap `None`. Resolved in `complete_once` before cache.
+            workflow: m.then.workflow.clone(),
+        }),
+        outcome: Some(RouteApplicationOutcome::AcceptedForActionPipeline.wire_name()),
+    })
 }

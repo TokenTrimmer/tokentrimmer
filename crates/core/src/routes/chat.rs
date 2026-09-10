@@ -117,6 +117,12 @@ pub(crate) struct Prepared {
     pub matched_route_version_id: Option<i64>,
     /// Paused-route passthrough marker.
     pub route_paused: bool,
+    /// Bounded routing-decision outcome name (R02, migration 0052):
+    /// `no_match`, `capability_suppressed`, `paused`, or
+    /// `accepted_for_action_pipeline` — stamped on the request_logs row. Truly
+    /// `None` only when no routing store was configured (the forced-not-found
+    /// outcome never reaches a row: it 400s before dispatch).
+    pub route_decision_outcome: Option<&'static str>,
     /// Originally-requested model (pre-routing) — `gen_ai.request.model`.
     pub requested_model: String,
     /// Pricing for the originally-requested model (baseline when rewritten).
@@ -1663,6 +1669,10 @@ struct RouteLogAttribution {
     route_id: Option<Uuid>,
     route_version_id: Option<i64>,
     paused: bool,
+    /// Bounded routing-decision outcome (R02): `no_match`/
+    /// `capability_suppressed`/`paused`/`accepted_for_action_pipeline`.
+    /// `None` when no routing store was configured.
+    outcome: Option<&'static str>,
 }
 
 fn request_log_for_l1_hit(
@@ -1718,6 +1728,7 @@ fn request_log_for_l1_hit(
         error_class: None,
         trace_id: Some(trace_id.to_string()),
         truncated: false,
+        route_decision_outcome: route.outcome.map(String::from),
         // A cache hit performs no live dispatch, so no shadow fires and the
         // canary arm is not re-derived here (the response is served from cache
         // regardless of arm). Columns stay NULL.
@@ -1781,6 +1792,7 @@ fn request_log_for_l2_hit(
     route_id: Option<Uuid>,
     route_version_id: Option<i64>,
     route_paused: bool,
+    route_decision_outcome: Option<&'static str>,
     baseline_cost_usd: f64,
     request_delta_evidence_state: RequestDeltaEvidenceState,
     retrieval_tokens_saved: i64,
@@ -1832,6 +1844,7 @@ fn request_log_for_l2_hit(
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused,
+        route_decision_outcome: route_decision_outcome.map(String::from),
         // TT cache hit — nothing dispatched, nothing minify-estimated.
         minify_saved_est_usd: 0.0,
         // TT cache hit — the serve performed no shaping dispatch; the
@@ -1964,6 +1977,7 @@ mod cache_header_tests {
                 route_id: Some(route_id),
                 route_version_id: Some(9_876_543_210),
                 paused: false,
+                outcome: Some("accepted_for_action_pipeline"),
             },
             0,
         );
@@ -2663,6 +2677,7 @@ mod l2_baseline_tests {
             Some(route_id),
             Some(9_876_543_210),
             false,
+            Some("accepted_for_action_pipeline"),
             0.0123,
             RequestDeltaEvidenceState::Measured,
             0,
@@ -5161,6 +5176,7 @@ mod telemetry_drain_tests {
             batch_eligible: false,
             batch_forgone_usd: 0.0,
             route_paused: false,
+            route_decision_outcome: None,
             minify_saved_est_usd: 0.0,
             format_switched: None,
             format_switch_saved_est_usd: 0.0,

@@ -721,6 +721,11 @@ pub struct StreamLogContext {
     /// `request_logs.route_paused` marker; `false` for unrouted/unpaused
     /// requests.
     pub route_paused: bool,
+    /// Bounded routing-decision outcome (R02, migration 0052) stamped on the
+    /// streamed `request_logs` row: `no_match`, `capability_suppressed`,
+    /// `paused`, or `accepted_for_action_pipeline`. `None` when no routing
+    /// store was configured.
+    pub route_decision_outcome: Option<&'static str>,
     /// Panel aggregate-billing context. `Some` rewrites the terminal
     /// [`DropGuard`] to write ONE `provider = "panel"` aggregate row (Σ legs +
     /// arbiter) plus the per-leg `panel_legs` rows, mirroring `complete_panel`.
@@ -1143,6 +1148,7 @@ pub fn stream_response(
             let span_ctx = ctx.span_ctx;
             let traffic_split_arm = ctx.traffic_split_arm.clone();
             let route_paused = ctx.route_paused;
+            let route_decision_outcome = ctx.route_decision_outcome;
             let retrieval_tokens_saved = ctx.retrieval_tokens_saved;
 
             let guard = DropGuard::new(move || {
@@ -1420,6 +1426,7 @@ pub fn stream_response(
                     batch_eligible: false,
                     batch_forgone_usd: 0.0,
                     route_paused,
+                    route_decision_outcome: route_decision_outcome.map(String::from),
                     // Streaming books $0 for the minify estimate in v1.
                     minify_saved_est_usd: 0.0,
                     // Output shaping never streams either — both planners

@@ -1492,8 +1492,8 @@ async fn resolve_summarize_config(
         identity.forced_route.as_deref(),
     )
     .await
-    .ok()
-    .flatten()?;
+    .ok()? // a poisoned store degrades to "no summarizer" (fail-safe)
+    .matched?;
     let ab = route_match.agentic_budget?;
     if !ab.elide_stale_tools {
         return None;

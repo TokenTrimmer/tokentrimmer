@@ -2496,6 +2496,7 @@ pub(crate) async fn complete_panel(
             batch_eligible: false,
             batch_forgone_usd: 0.0,
             route_paused: prep.route_paused,
+            route_decision_outcome: prep.route_decision_outcome.map(String::from),
             minify_saved_est_usd: 0.0,
             format_switched: None,
             format_switch_saved_est_usd: 0.0,
@@ -2840,6 +2841,7 @@ pub(crate) async fn complete_panel_streaming(
         // Panels never run the canary traffic-split lever.
         traffic_split_arm: None,
         route_paused: prep.route_paused,
+        route_decision_outcome: prep.route_decision_outcome,
         // The panel aggregate-billing context (off-by-default elsewhere).
         panel: Some(panel),
     };

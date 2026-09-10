@@ -67,6 +67,7 @@ impl Provider for FakeProvider {
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
+            verified_at: None,
         })
     }
     async fn chat_completion(
