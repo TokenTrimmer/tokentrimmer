@@ -206,6 +206,13 @@ struct RawEntry {
     /// rates appear fresh.
     #[serde(default)]
     verified_at: Option<DateTime<Utc>>,
+    /// C08: provenance of this rate — the pricing page (URL) or a stable
+    /// label (e.g. "2026-05 catalog snapshot") the rate was taken from.
+    /// Absent = no recorded provenance. Resolved per (provider, model) via
+    /// [`PricingCatalog::source_for`] on the LATEST entry; `verified_at`
+    /// answers "when", this answers "where".
+    #[serde(default)]
+    source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +226,11 @@ struct RawCatalog {
 #[derive(Debug)]
 pub struct PricingCatalog {
     by_model: HashMap<(String, String), Vec<ModelPricing>>,
+    /// C08 source tracking: the LATEST entry's `(effective_at, provenance)`
+    /// per (provider, model) — latest by EFFECTIVE DATE, not file order (the
+    /// price history is sorted; the source must resolve identically).
+    /// An absent provenance string = no recorded source.
+    sources: HashMap<(String, String), (DateTime<Utc>, Option<String>)>,
 }
 
 impl PricingCatalog {
@@ -227,7 +239,20 @@ impl PricingCatalog {
     pub fn parse(toml_text: &str) -> Result<Self, toml::de::Error> {
         let raw: RawCatalog = toml::from_str(toml_text)?;
         let mut by_model: HashMap<(String, String), Vec<ModelPricing>> = HashMap::new();
+        let mut sources: HashMap<(String, String), (DateTime<Utc>, Option<String>)> =
+            HashMap::new();
         for e in raw.entry {
+            // C08: keep the provenance of the entry with the LATEST
+            // effective_at (mirrors the price-history sort — file order is
+            // not authoritative).
+            sources
+                .entry((e.provider.clone(), e.model.clone()))
+                .and_modify(|slot| {
+                    if e.effective_at > slot.0 {
+                        *slot = (e.effective_at, e.source.clone());
+                    }
+                })
+                .or_insert_with(|| (e.effective_at, e.source.clone()));
             by_model
                 .entry((e.provider, e.model))
                 .or_default()
@@ -250,7 +275,7 @@ impl PricingCatalog {
         for history in by_model.values_mut() {
             history.sort_by_key(|p| p.effective_at);
         }
-        Ok(Self { by_model })
+        Ok(Self { by_model, sources })
     }
 
     /// The current (most recently effective) rate for `(provider, model)`,
@@ -260,6 +285,17 @@ impl PricingCatalog {
             .get(&(provider.to_string(), model.to_string()))?
             .last()
             .cloned()
+    }
+
+    /// C08: the recorded provenance (pricing page URL or stable snapshot
+    /// label) of the CURRENT rate for `(provider, model)` — the source of the
+    /// LATEST entry, NOT inherited from other models or older entries.
+    /// `None` when the model is unknown or no source was recorded (honest:
+    /// provenance absent, never guessed).
+    pub fn source_for(&self, provider: &str, model: &str) -> Option<&str> {
+        self.sources
+            .get(&(provider.to_string(), model.to_string()))
+            .and_then(|slot| slot.1.as_deref())
     }
 
     /// The rate that was in effect at `at` for `(provider, model)` — the most
@@ -390,6 +426,114 @@ mod catalog_tests {
             63,
             "unexpected catalog size — update if intentional"
         );
+    }
+
+    /// C08 source tracking: the verified flagship entries carry BOTH a
+    /// machine-readable verification date and a provenance source, and
+    /// `source_for` resolves the CURRENT entry's source. The May-2026
+    /// baseline snapshot rows stay unsourced (honest absence) — this test
+    /// pins the presence of provenance on the rows the header notes
+    /// documented as verified.
+    #[test]
+    fn verified_entries_carry_source_and_resolve() {
+        let c = catalog();
+        // The 2026-05-31 flagship verification pass (per the catalog header).
+        assert_eq!(
+            c.source_for("openai", "gpt-5.5"),
+            Some("developers.openai.com/api/docs/pricing")
+        );
+        assert_eq!(
+            c.source_for("anthropic", "claude-haiku-4-5"),
+            Some("platform.claude.com/docs/en/about-claude/pricing")
+        );
+        assert_eq!(
+            c.source_for("gemini", "gemini-3.1-pro"),
+            Some("ai.google.dev/gemini-api/docs/pricing")
+        );
+        // The 2026-08-16 refresh (OpenRouter list-price mirror convention).
+        assert_eq!(
+            c.source_for("openrouter", "qwen/qwen3.8-max"),
+            Some("openrouter.ai/models")
+        );
+        // Snapshot rows without recorded provenance resolve honestly to None
+        // — never a guessed source.
+        assert_eq!(c.source_for("groq", "llama-3.3-70b-versatile"), None);
+        // Unknown model: None.
+        assert_eq!(c.source_for("openai", "no-such-model"), None);
+        // verified_at was populated alongside source (C08 schema #414).
+        let pricing = c.latest("openai", "gpt-5.5").expect("gpt-5.5 priced");
+        assert_eq!(
+            pricing.verified_at.map(|v| v.to_rfc3339()),
+            Some("2026-05-31T00:00:00+00:00".to_string())
+        );
+    }
+
+    /// `source_for` resolves by the LATEST effective date, not file order: a
+    /// model whose rate was refreshed must report the NEW entry's provenance.
+    #[test]
+    fn source_for_prefers_the_latest_effective_entry() {
+        let toml = r#"
+            [[entry]]
+            provider = "x"
+            model = "m"
+            input_per_million = 1.0
+            output_per_million = 2.0
+            effective_at = "2026-05-01T00:00:00Z"
+            source = "oldest"
+
+            [[entry]]
+            provider = "x"
+            model = "m"
+            input_per_million = 1.5
+            output_per_million = 3.0
+            effective_at = "2026-08-01T00:00:00Z"
+            source = "newest"
+        "#;
+        let c = PricingCatalog::parse(toml).unwrap();
+        assert_eq!(c.source_for("x", "m"), Some("newest"));
+        // A file-ordered-last but DATE-OLDER entry must NOT win — like the
+        // price history, resolution is by effective date: the 08-01 entry
+        // (file-first) is current, so its "newest" source resolves.
+        let toml_reversed = r#"
+            [[entry]]
+            provider = "y"
+            model = "m"
+            input_per_million = 1.5
+            output_per_million = 3.0
+            effective_at = "2026-08-01T00:00:00Z"
+            source = "newest"
+
+            [[entry]]
+            provider = "y"
+            model = "m"
+            input_per_million = 1.0
+            output_per_million = 2.0
+            effective_at = "2026-05-01T00:00:00Z"
+            source = ""
+        "#;
+        let c2 = PricingCatalog::parse(toml_reversed).unwrap();
+        assert_eq!(c2.source_for("y", "m"), Some("newest"));
+        // An ENTRY ORDER check: newest effective wins even when listed first
+        // with an EMPTY source (a re-effecting without provenance marks the
+        // CURRENT rate unprovenanced — it does not inherit the old source).
+        let toml_unprovenanced = r#"
+            [[entry]]
+            provider = "z"
+            model = "m"
+            input_per_million = 1.5
+            output_per_million = 3.0
+            effective_at = "2026-08-01T00:00:00Z"
+
+            [[entry]]
+            provider = "z"
+            model = "m"
+            input_per_million = 1.0
+            output_per_million = 2.0
+            effective_at = "2026-05-01T00:00:00Z"
+            source = "old"
+        "#;
+        let c3 = PricingCatalog::parse(toml_unprovenanced).unwrap();
+        assert_eq!(c3.source_for("z", "m"), None);
     }
 
     /// The embedded catalog must carry at least one `effective_at` date and it
