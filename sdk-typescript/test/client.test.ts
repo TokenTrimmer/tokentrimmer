@@ -89,21 +89,62 @@ describe('TokenTrimmer TS SDK', () => {
     expect(res.tt.costUsd).toBeNull();
   });
 
-  it('injects max_tokens=4096 when absent and respects an explicit value', async () => {
+  it('injects max_tokens when defaultMaxTokens is configured and respects an explicit value', async () => {
+    // Default behavior: no cap is injected when defaultMaxTokens is absent.
     const a = stubFetch();
-    await client(a.fetchImpl).chat.completions.create({
+    await new TokenTrimmer({
+      apiKey: 'tt_test_x',
+      baseURL: 'http://gw.test/v1',
+      fetch: a.fetchImpl,
+    }).chat.completions.create({
       model: 'm',
       messages: [{ role: 'user', content: 'hi' }],
     });
-    expect(JSON.parse(a.calls.at(-1)!.init.body as string).max_tokens).toBe(4096);
+    expect(
+      (JSON.parse(a.calls.at(-1)!.init.body as string) as Record<string, unknown>).max_tokens,
+    ).toBeUndefined();
 
+    // Opt-in cap: injected when defaultMaxTokens is set and no explicit value.
     const b = stubFetch();
-    await client(b.fetchImpl).chat.completions.create({
+    await new TokenTrimmer({
+      apiKey: 'tt_test_x',
+      baseURL: 'http://gw.test/v1',
+      fetch: b.fetchImpl,
+      defaultMaxTokens: 4096,
+    }).chat.completions.create({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(JSON.parse(b.calls.at(-1)!.init.body as string).max_tokens).toBe(4096);
+
+    // An explicit value always wins over defaultMaxTokens.
+    const c = stubFetch();
+    await new TokenTrimmer({
+      apiKey: 'tt_test_x',
+      baseURL: 'http://gw.test/v1',
+      fetch: c.fetchImpl,
+      defaultMaxTokens: 4096,
+    }).chat.completions.create({
       model: 'm',
       messages: [{ role: 'user', content: 'hi' }],
       max_tokens: 128,
     });
-    expect(JSON.parse(b.calls.at(-1)!.init.body as string).max_tokens).toBe(128);
+    expect(JSON.parse(c.calls.at(-1)!.init.body as string).max_tokens).toBe(128);
+
+    // An explicit max_completion_tokens also wins over defaultMaxTokens.
+    const d = stubFetch();
+    await new TokenTrimmer({
+      apiKey: 'tt_test_x',
+      baseURL: 'http://gw.test/v1',
+      fetch: d.fetchImpl,
+      defaultMaxTokens: 4096,
+    }).chat.completions.create({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_completion_tokens: 256,
+    });
+    expect(JSON.parse(d.calls.at(-1)!.init.body as string).max_tokens).toBeUndefined();
+    expect(JSON.parse(d.calls.at(-1)!.init.body as string).max_completion_tokens).toBe(256);
   });
 
   it('lifts ttTag / ttCostLimit / ttCache into request headers', async () => {

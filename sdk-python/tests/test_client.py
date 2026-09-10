@@ -1,7 +1,7 @@
 """Tests for the TokenTrimmer Python SDK wrapper.
 
 All tests mock the gateway HTTP layer with respx so no network is used. They
-assert the four wrap behaviors: max_tokens default injection, the tt_* header
+assert the four wrap behaviors: opt-in max_tokens cap injection, the tt_* header
 lifts (+ validation), the parsed .tt metadata, race-free metadata under
 concurrency, and streaming pass-through.
 """
@@ -137,13 +137,29 @@ def test_non_numeric_cost_header_parses_to_none():
 
 
 @respx.mock
-def test_max_tokens_default_injected_when_absent():
+def test_no_max_tokens_injected_when_no_default_configured():
+    """By default, no cap is injected — the request goes to the Gateway as-is."""
     route = _completion_route()
     _client().chat.completions.create(
         model="m", messages=[{"role": "user", "content": "hi"}]
     )
-    sent = route.calls.last.request
-    body = json.loads(sent.content)
+    body = json.loads(route.calls.last.request.content)
+    assert "max_tokens" not in body
+
+
+@respx.mock
+def test_default_max_tokens_injected_when_configured():
+    """Opt-in cap: injected only when default_max_tokens is set."""
+    route = _completion_route()
+    client = TokenTrimmer(
+        api_key="tt_test",
+        base_url="http://gw.test/v1",
+        default_max_tokens=4096,
+    )
+    client.chat.completions.create(
+        model="m", messages=[{"role": "user", "content": "hi"}]
+    )
+    body = json.loads(route.calls.last.request.content)
     assert body["max_tokens"] == 4096
 
 
@@ -155,6 +171,25 @@ def test_explicit_max_tokens_wins():
     )
     body = json.loads(route.calls.last.request.content)
     assert body["max_tokens"] == 128
+
+
+@respx.mock
+def test_explicit_max_completion_tokens_wins_over_default():
+    """An explicit max_completion_tokens beats default_max_tokens."""
+    route = _completion_route()
+    client = TokenTrimmer(
+        api_key="tt_test",
+        base_url="http://gw.test/v1",
+        default_max_tokens=4096,
+    )
+    client.chat.completions.create(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        max_completion_tokens=256,
+    )
+    body = json.loads(route.calls.last.request.content)
+    assert body.get("max_tokens") is None
+    assert body["max_completion_tokens"] == 256
 
 
 @respx.mock
