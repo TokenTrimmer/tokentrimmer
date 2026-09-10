@@ -56,6 +56,7 @@ primary_region = "iad"
 [env]
   RUST_LOG  = "info,tt_core=info,tt_provider_openai=info"
   PORT      = "8080"
+  TT_REQUIRE_ENCRYPTED_CACHE = "true"
   TT_REQUIRE_METRICS_AUTH = "true"
   TT_CANONICAL_HOST = "api.tokentrimmer.com"
   TT_REQUIRE_SHARED_RATE_LIMIT = "true"

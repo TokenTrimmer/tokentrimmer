@@ -371,6 +371,8 @@ mod tests {
             input_tokens: 1000,
             output_tokens: 500,
             cached_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
             cost_usd: 0.005,
             baseline_cost_usd: 0.010,
             cached: false,
