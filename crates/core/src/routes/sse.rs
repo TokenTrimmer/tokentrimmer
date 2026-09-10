@@ -2098,6 +2098,7 @@ mod tests {
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
+            verified_at: None,
         }
     }
 
@@ -2698,6 +2699,7 @@ mod tests {
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
+            verified_at: None,
         };
         let usage = PartialUsage {
             input_tokens: 1_000,
@@ -2814,6 +2816,7 @@ mod tests {
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
+            verified_at: None,
         };
         let cost =
             crate::routes::chat::compute_cost(&partial_to_usage(&usage), Some(&pricing), None, 1.0)
@@ -2846,6 +2849,7 @@ mod tests {
             flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
+            verified_at: None,
         };
         let cost =
             crate::routes::chat::compute_cost(&partial_to_usage(&usage), Some(&pricing), None, 1.0)
