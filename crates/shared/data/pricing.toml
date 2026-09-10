@@ -27,6 +27,12 @@
 #                               (provider, model) via PricingCatalog::source_for
 #                               on the LATEST entry — verified_at answers
 #                               "when", this answers "where".
+#   deprecated               = true when the provider marked this model
+#                               deprecated (off the current pricing page /
+#                               announced shutdown). The row stays for
+#                               historical replay; PricingCatalog::is_deprecated
+#                               resolves it. Un-deprecating = a newer entry
+#                               without the flag.
 #
 # Price HISTORY: multiple entries for the same (provider, model) form a
 # time-series. Live pricing uses the most recent `effective_at`; historical
@@ -211,6 +217,7 @@ input_per_million = 2.50
 output_per_million = 10.00
 cached_input_per_million = 1.25
 effective_at = "2026-05-01T00:00:00Z"
+deprecated = true
 
 [[entry]]
 provider = "openai"
@@ -227,6 +234,7 @@ input_per_million = 60.00
 output_per_million = 240.00
 cached_input_per_million = 15.00
 effective_at = "2026-05-01T00:00:00Z"
+deprecated = true
 
 # Updated 2026-05-31 — o3's list price was cut sharply since the May snapshot.
 # Current OpenRouter list price: $2/$8, cache-read $0.50. Appended per the
@@ -238,6 +246,7 @@ input_per_million = 2.00
 output_per_million = 8.00
 cached_input_per_million = 0.50
 effective_at = "2026-05-31T00:00:00Z"
+deprecated = true
 
 [[entry]]
 provider = "openai"
@@ -246,6 +255,7 @@ input_per_million = 1.10
 output_per_million = 4.40
 cached_input_per_million = 0.275
 effective_at = "2026-05-01T00:00:00Z"
+deprecated = true
 
 # Embedding models — no completion tokens, so output rate is 0.
 [[entry]]
@@ -254,6 +264,7 @@ model = "text-embedding-3-small"
 input_per_million = 0.02
 output_per_million = 0.00
 effective_at = "2026-05-01T00:00:00Z"
+deprecated = true
 
 [[entry]]
 provider = "openai"
@@ -261,6 +272,7 @@ model = "text-embedding-3-large"
 input_per_million = 0.13
 output_per_million = 0.00
 effective_at = "2026-05-01T00:00:00Z"
+deprecated = true
 
 # ── Anthropic ───────────────────────────────────────────────────────────────
 # cached_input_per_million is the cache-READ rate (~10% of standard input).
