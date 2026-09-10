@@ -128,6 +128,9 @@ struct CountedMock {
     /// When `true`, `chat_completion` returns a 503 error instead of a
     /// successful response. Used to manufacture quorum-unmet scenarios.
     fail: bool,
+    /// When `true`, the model advertises `Capability::Streaming` so streaming
+    /// variants pass the capability gate and reach the gate under test.
+    streamable: bool,
 }
 
 impl CountedMock {
@@ -137,6 +140,17 @@ impl CountedMock {
             model,
             calls,
             fail: false,
+            streamable: false,
+        }
+    }
+
+    fn streamable(id: &'static str, model: &'static str, calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            id,
+            model,
+            calls,
+            fail: false,
+            streamable: true,
         }
     }
 
@@ -146,6 +160,7 @@ impl CountedMock {
             model,
             calls,
             fail: true,
+            streamable: false,
         }
     }
 }
@@ -159,7 +174,11 @@ impl Provider for CountedMock {
         vec![ModelInfo {
             id: self.model.into(),
             provider: self.id.into(),
-            capabilities: vec![Capability::Text],
+            capabilities: if self.streamable {
+                vec![Capability::Text, Capability::Streaming]
+            } else {
+                vec![Capability::Text]
+            },
             max_input_tokens: 8192,
             max_output_tokens: 8192,
         }]
@@ -339,17 +358,19 @@ async fn missing_verified_org_arbiter_credential_fails_before_buffered_or_stream
     let calls_b = Arc::new(AtomicUsize::new(0));
     let calls_c = Arc::new(AtomicUsize::new(0));
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(CountedMock::new(
+    // Streamable so the streaming variant passes the capability gate and
+    // reaches the CREDENTIAL gate this test exercises.
+    registry.register(Arc::new(CountedMock::streamable(
         "vendor-a",
         "model-a",
         Arc::clone(&calls_a),
     )));
-    registry.register(Arc::new(CountedMock::new(
+    registry.register(Arc::new(CountedMock::streamable(
         "vendor-b",
         "model-b",
         Arc::clone(&calls_b),
     )));
-    registry.register(Arc::new(CountedMock::new(
+    registry.register(Arc::new(CountedMock::streamable(
         "vendor-c",
         "model-arb",
         Arc::clone(&calls_c),
