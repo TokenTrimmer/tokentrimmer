@@ -184,11 +184,12 @@ fn corpus() -> ParityCorpus {
 // overlap" — the fail-closed contract.
 // ---------------------------------------------------------------------------
 
-const CLOSED_CONDITION_KEYS: [&str; 13] = [
+const CLOSED_CONDITION_KEYS: [&str; 14] = [
     "model_in",
     "input_tokens_lt",
     "input_tokens_gt",
     "tag_equals",
+    "workload",
     "has_images",
     "has_audio",
     "has_documents",
@@ -755,7 +756,7 @@ fn corpus_pins_the_closed_condition_field_set_in_canonical_order() {
         pinned, canonical,
         "the pinned condition-field set must equal RouteConditionField::ALL in wire declaration order"
     );
-    assert_eq!(canonical.len(), 13);
+    assert_eq!(canonical.len(), 14);
     assert_eq!(
         CLOSED_CONDITION_KEYS.as_slice(),
         canonical,

@@ -22,6 +22,8 @@ pub enum RouteConditionField {
     InputTokensGt,
     /// Exact request tag.
     TagEquals,
+    /// Trusted workload name (R07 reserved metadata namespace).
+    Workload,
     /// Image-input presence.
     HasImages,
     /// Audio-input presence.
@@ -44,11 +46,12 @@ pub enum RouteConditionField {
 
 impl RouteConditionField {
     /// Every canonical condition field, in `RouteConditions` wire order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::ModelIn,
         Self::InputTokensLt,
         Self::InputTokensGt,
         Self::TagEquals,
+        Self::Workload,
         Self::HasImages,
         Self::HasAudio,
         Self::HasDocuments,
@@ -68,6 +71,7 @@ impl RouteConditionField {
             Self::InputTokensLt => "input_tokens_lt",
             Self::InputTokensGt => "input_tokens_gt",
             Self::TagEquals => "tag_equals",
+            Self::Workload => "workload",
             Self::HasImages => "has_images",
             Self::HasAudio => "has_audio",
             Self::HasDocuments => "has_documents",
@@ -217,6 +221,7 @@ pub struct RouteFeatureSnapshot {
     observed_p95_ms: Observation<u32>,
     is_reasoning_class: Observation<bool>,
     tag: Observation<Option<String>>,
+    workload: Observation<Option<String>>,
     has_images: Observation<bool>,
     has_audio: Observation<bool>,
     has_documents: Observation<bool>,
@@ -322,6 +327,9 @@ impl RouteFeatureSnapshot {
             observed_p95_ms: observed_p95_ms.map_or(Observation::Unavailable, Observation::exact),
             is_reasoning_class: Observation::exact(is_reasoning_class),
             tag: Observation::exact(ctx.tag.clone()),
+            workload: Observation::exact(tt_shared::reserved_metadata::trusted_workload_from(
+                &ctx.tag,
+            )),
             has_images: requirements
                 .has_images
                 .then(|| tt_shared::capability_check::request_has_images(req))
@@ -376,7 +384,8 @@ impl RouteFeatureSnapshot {
             estimated_cost_usd: Observation::Unavailable,
             observed_p95_ms: Observation::Unavailable,
             is_reasoning_class: Observation::Unavailable,
-            tag: Observation::exact(tag),
+            tag: Observation::exact(tag.clone()),
+            workload: Observation::exact(tt_shared::reserved_metadata::trusted_workload_from(&tag)),
             has_images: Observation::Unavailable,
             has_audio: Observation::Unavailable,
             has_documents: Observation::Unavailable,
@@ -439,6 +448,15 @@ impl RouteFeatureSnapshot {
     #[must_use]
     pub fn with_reasoning_class(mut self, is_reasoning_class: bool) -> Self {
         self.is_reasoning_class = Observation::exact(is_reasoning_class);
+        self
+    }
+
+    /// Add the exact trusted-workload observation (R07). Callers derive it
+    /// ONLY from the reserved metadata namespace; `None` means observed with
+    /// no trusted workload (distinct from an unavailable feature).
+    #[must_use]
+    pub fn with_workload(mut self, workload: Option<String>) -> Self {
+        self.workload = Observation::exact(workload);
         self
     }
 }
@@ -511,6 +529,14 @@ fn condition_result(
             .map_or(ConditionResult::inactive(), |tag| {
                 f.tag.evaluate(|observed| observed.as_ref() == Some(tag))
             }),
+        RouteConditionField::Workload => {
+            c.workload
+                .as_ref()
+                .map_or(ConditionResult::inactive(), |wanted| {
+                    f.workload
+                        .evaluate(|observed| observed.as_ref() == Some(wanted))
+                })
+        }
         RouteConditionField::HasImages => observed_optional_bool(c.has_images, &f.has_images),
         RouteConditionField::HasAudio => observed_optional_bool(c.has_audio, &f.has_audio),
         RouteConditionField::HasDocuments => {
@@ -624,6 +650,7 @@ mod tests {
             input_tokens_lt: Some(500),
             input_tokens_gt: Some(10),
             tag_equals: Some("production".into()),
+            workload: Some("support-summary".into()),
             has_images: Some(false),
             has_audio: Some(false),
             has_documents: Some(false),
@@ -644,7 +671,8 @@ mod tests {
         .with_content_type(Some("code".into()))
         .with_input_text("Please REFACTOR this")
         .with_observed_p95_ms(300)
-        .with_reasoning_class(false);
+        .with_reasoning_class(false)
+        .with_workload(Some("support-summary".into()));
         let evaluation = evaluate_route_conditions(&conditions, &snapshot);
 
         assert!(evaluation.matches());
