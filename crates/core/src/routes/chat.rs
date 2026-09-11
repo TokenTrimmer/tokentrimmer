@@ -457,10 +457,22 @@ pub async fn handler(
         org_id,
         api_key_id,
         credentials,
-        tag: headers
-            .get("x-tokentrimmer-tag")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from),
+        // R07: bounded caller tags (invalid tags DROP to None, never a hard
+        // failure — attribution is best-effort) + the trusted workload
+        // channel. `X-TokenTrimmer-Workload` is the AUTHENTICATED surface's
+        // key: the org-scoped policy registry validates it (cloud); the
+        // gateway-side contract here only enforces the reserved namespace
+        // grammar so an invalid workload can never reach the routing engine.
+        tag: tt_shared::reserved_metadata::combine_tags(
+            tt_shared::reserved_metadata::caller_tag_from_header(
+                headers
+                    .get("x-tokentrimmer-tag")
+                    .and_then(|v| v.to_str().ok()),
+            ),
+            headers
+                .get("x-tokentrimmer-workload")
+                .and_then(|v| v.to_str().ok()),
+        ),
         deadline: request_timeout,
         run_id: None,
         node_id: None,

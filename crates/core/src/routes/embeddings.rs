@@ -152,10 +152,11 @@ pub async fn handler(
         org_id,
         api_key_id,
         credentials,
-        tag: headers
-            .get("x-tokentrimmer-tag")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from),
+        tag: tt_shared::reserved_metadata::caller_tag_from_header(
+            headers
+                .get("x-tokentrimmer-tag")
+                .and_then(|v| v.to_str().ok()),
+        ),
         deadline: timeout_ms_from_header(&headers).map(std::time::Duration::from_millis),
         run_id: None,
         node_id: None,

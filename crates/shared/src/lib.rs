@@ -21,6 +21,7 @@ pub mod providers;
 pub mod request_delta;
 pub mod request_delta_backfill;
 pub mod request_preflight;
+pub mod reserved_metadata;
 pub mod url_guard;
 pub mod usage;
 

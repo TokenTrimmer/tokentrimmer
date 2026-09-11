@@ -176,10 +176,11 @@ impl RunIdentity {
             skip_shadow,
             raw_bearer,
             trace_id,
-            tag: headers
-                .get("x-tokentrimmer-tag")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from),
+            tag: tt_shared::reserved_metadata::caller_tag_from_header(
+                headers
+                    .get("x-tokentrimmer-tag")
+                    .and_then(|v| v.to_str().ok()),
+            ),
             request_timeout: chat::timeout_ms_from_header(&headers)
                 .map(std::time::Duration::from_millis),
             provider_pin: chat::provider_override_from_header(&headers),

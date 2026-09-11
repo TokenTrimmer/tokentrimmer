@@ -16,6 +16,10 @@ pub const PAUSE_MIN_VERDICTS_MAX: u32 = 100;
 // rejected f64; no caller relied on `Eq`.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ValidationError {
+    #[error("`workload` condition value `{value}` is not a valid workload name (lowercase slug, 2-63 chars)")]
+    InvalidWorkloadName { value: String },
+    #[error("`tag_equals` condition value `{value}` uses the reserved `{prefix}` namespace; caller tags can never carry it (use the workload condition)")]
+    ReservedTagNamespace { value: String, prefix: &'static str },
     #[error("target_model `{target}` is missing the `{capability}` capability required by this route's content-type condition")]
     MissingCapability {
         target: String,
@@ -220,6 +224,32 @@ pub fn validate_workflow(then: &RouteAction) -> Result<(), ValidationError> {
         }
         if then.target_model.is_some() {
             return Err(ValidationError::WorkflowConflict("target_model"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the workload/tag condition contracts (R07):
+/// - `workload` must be a valid workload name (bounded lowercase slug) so
+///   the value sorts stably and cannot smuggle wildcards/control characters;
+/// - `tag_equals` must NOT reference the reserved namespace — a caller tag
+///   matching it is structurally impossible (entry points drop such tags),
+///   so a route keyed on it is dead configuration at best and a misleading
+///   governance signal at worst.
+pub fn validate_conditions(when: &RouteConditions) -> Result<(), ValidationError> {
+    if let Some(workload) = when.workload.as_deref() {
+        if !tt_shared::reserved_metadata::valid_workload_name(workload) {
+            return Err(ValidationError::InvalidWorkloadName {
+                value: workload.to_string(),
+            });
+        }
+    }
+    if let Some(tag) = when.tag_equals.as_deref() {
+        if tag.starts_with(tt_shared::reserved_metadata::RESERVED_PREFIX) {
+            return Err(ValidationError::ReservedTagNamespace {
+                value: tag.to_string(),
+                prefix: tt_shared::reserved_metadata::RESERVED_PREFIX,
+            });
         }
     }
     Ok(())
@@ -869,5 +899,45 @@ mod tests {
 
         // Some target + nothing else → Ok (the rewrite is the effect).
         assert!(validate_route_has_effect(&action("gpt-4o")).is_ok());
+    }
+    #[test]
+    fn workload_condition_requires_a_valid_name() {
+        let when = crate::RouteConditions {
+            workload: Some("support-summary".into()),
+            ..Default::default()
+        };
+        assert!(super::validate_conditions(&when).is_ok());
+        for bad in ["UPPER", "x", "with space", "dot.name", &"a".repeat(64)] {
+            let when = crate::RouteConditions {
+                workload: Some(bad.into()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    super::validate_conditions(&when),
+                    Err(super::ValidationError::InvalidWorkloadName { .. })
+                ),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_equals_cannot_reference_the_reserved_namespace() {
+        let plain = crate::RouteConditions {
+            tag_equals: Some("background".into()),
+            ..Default::default()
+        };
+        assert!(super::validate_conditions(&plain).is_ok());
+        for reserved in ["tt.workload:support-summary", "tt.anything"] {
+            let when = crate::RouteConditions {
+                tag_equals: Some(reserved.into()),
+                ..Default::default()
+            };
+            assert!(matches!(
+                super::validate_conditions(&when),
+                Err(super::ValidationError::ReservedTagNamespace { .. })
+            ));
+        }
     }
 }

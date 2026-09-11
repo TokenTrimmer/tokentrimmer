@@ -17,6 +17,9 @@ const CORPUS: &str = include_str!(
 const V2_CORPUS: &str = include_str!(
     "../../../docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json"
 );
+const V3_CORPUS: &str = include_str!(
+    "../../../docs/route-preview-contract/tokentrimmer.route-preview-coverage.v3.corpus.json"
+);
 const CORPUS_FORMAT_ID: &str = "tokentrimmer.route-preview-coverage-corpus";
 const CORPUS_FORMAT_VERSION: u32 = 1;
 
@@ -186,20 +189,97 @@ const V2_EXPECTED_CONDITIONS: [(&str, CoverageClassification, &str); 13] = [
     ),
 ];
 
+/// v3 (R07): adds the trusted `workload` condition (exact — the retained tag
+/// slot carries the reserved `tt.workload:<name>` form and the matcher derives
+/// the workload from it, so historical replay covers it exactly).
+const V3_EXPECTED_CONDITIONS: [(&str, CoverageClassification, &str); 14] = [
+    (
+        "model_in",
+        CoverageClassification::Exact,
+        "requested_model_snapshot_retained",
+    ),
+    (
+        "input_tokens_lt",
+        CoverageClassification::Approximate,
+        "realized_input_tokens_not_gateway_estimate",
+    ),
+    (
+        "input_tokens_gt",
+        CoverageClassification::Approximate,
+        "realized_input_tokens_not_gateway_estimate",
+    ),
+    ("tag_equals", CoverageClassification::Exact, "tag_retained"),
+    (
+        "workload",
+        CoverageClassification::Exact,
+        "trusted_workload_derived_from_retained_tag",
+    ),
+    (
+        "has_images",
+        CoverageClassification::Unavailable,
+        "image_presence_not_retained",
+    ),
+    (
+        "has_audio",
+        CoverageClassification::Unavailable,
+        "audio_presence_not_retained",
+    ),
+    (
+        "has_documents",
+        CoverageClassification::Unavailable,
+        "document_presence_not_retained",
+    ),
+    (
+        "content_type",
+        CoverageClassification::Unavailable,
+        "content_type_not_retained",
+    ),
+    (
+        "prompt_contains_any_of",
+        CoverageClassification::Unavailable,
+        "prompt_content_not_retained",
+    ),
+    (
+        "estimated_cost_gt",
+        CoverageClassification::Unavailable,
+        "gateway_cost_estimate_not_retained",
+    ),
+    (
+        "estimated_cost_lt",
+        CoverageClassification::Unavailable,
+        "gateway_cost_estimate_not_retained",
+    ),
+    (
+        "upstream_latency_ms_p95_gt",
+        CoverageClassification::Unavailable,
+        "live_latency_not_retained",
+    ),
+    (
+        "not_reasoning_class",
+        CoverageClassification::Unavailable,
+        "reasoning_classification_not_retained",
+    ),
+];
+
 #[test]
 fn v1_corpus_covers_each_canonical_route_condition_once() {
-    assert_corpus(CORPUS, CORPUS_FORMAT_VERSION, EXPECTED_CONDITIONS);
+    assert_corpus(CORPUS, CORPUS_FORMAT_VERSION, &EXPECTED_CONDITIONS);
 }
 
 #[test]
 fn v2_corpus_covers_each_canonical_route_condition_once() {
-    assert_corpus(V2_CORPUS, 2, V2_EXPECTED_CONDITIONS);
+    assert_corpus(V2_CORPUS, 2, &V2_EXPECTED_CONDITIONS);
+}
+
+#[test]
+fn v3_corpus_covers_each_canonical_route_condition_once() {
+    assert_corpus(V3_CORPUS, 3, &V3_EXPECTED_CONDITIONS);
 }
 
 fn assert_corpus(
     raw: &str,
     expected_version: u32,
-    expected_conditions: [(&str, CoverageClassification, &str); 13],
+    expected_conditions: &[(&str, CoverageClassification, &str)],
 ) {
     let corpus: RoutePreviewCoverageCorpus =
         serde_json::from_str(raw).expect("route-preview coverage corpus must remain valid JSON");
@@ -216,8 +296,10 @@ fn assert_corpus(
 
     let canonical_fields = canonical_route_condition_fields();
     let mut seen_fields = HashSet::new();
-    for (actual, (field, classification, reason_id)) in
-        corpus.conditions.iter().zip(expected_conditions)
+    for (actual, (field, classification, reason_id)) in corpus
+        .conditions
+        .iter()
+        .zip(expected_conditions.iter().map(|(f, c, r)| (*f, *c, *r)))
     {
         assert!(
             seen_fields.insert(actual.field.as_str()),
@@ -249,9 +331,22 @@ fn assert_corpus(
         .iter()
         .map(|condition| condition.field.clone())
         .collect();
+    // Historical corpora (v1/v2) predate the R07 `workload` condition; each
+    // covers exactly the canonical fields that existed at its version. The
+    // DIFFERENCE must be exactly {workload} (a new condition forces a corpus
+    // bump — the lockstep guard), never anything else.
+    let historical_allowance: HashSet<String> = if expected_version < 3 {
+        ["workload".to_string()].into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+    let expected_for_version: HashSet<String> = canonical_fields
+        .difference(&historical_allowance)
+        .cloned()
+        .collect();
     assert_eq!(
-        covered_fields, canonical_fields,
-        "every canonical RouteConditions field must have exactly one coverage entry"
+        covered_fields, expected_for_version,
+        "the corpus must cover exactly the canonical fields of its version"
     );
 }
 
@@ -263,6 +358,7 @@ fn canonical_route_condition_fields() -> HashSet<String> {
         input_tokens_lt: Some(1_000),
         input_tokens_gt: Some(10),
         tag_equals: Some("preview-tag".to_owned()),
+        workload: Some("support-summary".to_owned()),
         has_images: Some(true),
         has_audio: Some(false),
         has_documents: Some(true),

@@ -17,8 +17,8 @@ pub mod cache;
 pub mod catalog;
 pub mod contract;
 pub mod latency;
-pub mod policy;
 mod matcher;
+pub mod policy;
 pub mod store;
 pub mod validate;
 
@@ -124,6 +124,15 @@ pub struct RouteConditions {
     /// Match only if `ctx.tag == Some(this)`.
     #[serde(default)]
     pub tag_equals: Option<String>,
+    /// Match only when the request's TRUSTED workload name equals this (R07).
+    /// The workload rides the RESERVED metadata namespace from
+    /// [`tt_shared::reserved_metadata`]: it is set only by the authenticated
+    /// workload-policy surface (a keyed request header validated against the
+    /// org's registered workload policies) — never by the free-form
+    /// `X-TokenTrimmer-Tag`, and never influenced by prompt text. A caller
+    /// cannot self-select into a workload route by editing a prompt or tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
     /// Match only if the request carries at least one image input part
     /// (`ContentPart::ImageUrl`). `Some(false)` requires no image; `None` ignores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1689,6 +1698,56 @@ mod tests {
         assert!(eng
             .evaluate(&make_req("gpt-4o"), &make_ctx(None), 1500)
             .is_some());
+    }
+
+    #[test]
+    fn workload_condition_matches_only_the_trusted_reserved_channel() {
+        // R07: a workload route must NOT be reachable by a plain caller tag,
+        // a prompt keyword, or a forged reserved-key string in the tag slot
+        // whose name fails validation. Only the authenticated channel's
+        // valid name matches.
+        let route = Route {
+            when: RouteConditions {
+                workload: Some("support-summary".into()),
+                ..Default::default()
+            },
+            ..make_route("wl", 10, vec![], "cheap-model")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        // Plain caller tag with the same TEXT: no match.
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(Some("support-summary")), 100)
+            .is_none());
+        // The reserved form with a VALID name: match.
+        assert!(eng
+            .evaluate(
+                &make_req("gpt-4o"),
+                &make_ctx(Some("tt.workload:support-summary")),
+                100
+            )
+            .is_some());
+        // The reserved form with an INVALID name (fails the slug rule): no
+        // match — fail closed.
+        assert!(eng
+            .evaluate(
+                &make_req("gpt-4o"),
+                &make_ctx(Some("tt.workload:UPPER!")),
+                100
+            )
+            .is_none());
+        // Plain tag slot can't smuggle another workload.
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(Some("extraction2")), 100)
+            .is_none());
+        // Prompt text cannot self-select into the workload route.
+        let mut req = make_req("gpt-4o");
+        req.messages = vec![tt_shared::messages::Message::User {
+            content: tt_shared::messages::MessageContent::Text(
+                "tt.workload:support-summary".into(),
+            ),
+            name: None,
+        }];
+        assert!(eng.evaluate(&req, &make_ctx(None), 100).is_none());
     }
 
     #[test]
