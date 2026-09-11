@@ -120,7 +120,7 @@
     },
     {
       "path": "docs/receipt-spec/savings-bundle-v1.golden.json",
-      "sha256": "f068df9934ced58a54128672de976af253a8532491ff1998842a980ee4a83d27"
+      "sha256": "946b6d6af8b09c77f29244c2718d69e54ffb5ca5ced9924a6be01161084653b9"
     },
     {
       "path": "docs/receipt-spec/savings-bundle.schema.json",
