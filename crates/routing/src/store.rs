@@ -104,6 +104,19 @@ pub trait RoutingStore: Send + Sync + std::fmt::Debug {
             .collect())
     }
 
+    /// The org's ENABLED workload names (R07), captured in the same refresh
+    /// as the runtime routes so the trusted workload channel is
+    /// registry-bound. Default empty: stores without a registry have no
+    /// authoritative workload source, and their trusted channel fails
+    /// closed. A registry-backed store that cannot read its workload table
+    /// should treat that as an ERROR, not an empty set.
+    async fn enabled_workloads_for_org(
+        &self,
+        _org_id: Uuid,
+    ) -> Result<Vec<String>, RoutingStoreError> {
+        Ok(Vec::new())
+    }
+
     /// Legacy typed management accessor: all canonical routes, including
     /// disabled ones. Because its `Route` return type cannot represent a
     /// malformed persisted row, HTTP/admin callers must use
@@ -406,6 +419,9 @@ pub struct InMemoryRoutingStore {
     /// `resumed == true` mirrors a row with `resumed_at` stamped: no longer an
     /// active pause, retained as the resume watermark / historical record.
     pauses: RwLock<HashMap<Uuid, PauseEntry>>,
+    /// `org_id → enabled workload names` (R07 test/dev mirror of the cloud
+    /// `workload_policies` registry).
+    workloads: RwLock<HashMap<Uuid, std::collections::HashSet<String>>>,
 }
 
 /// In-memory mirror of one `route_pauses` row.
@@ -456,6 +472,19 @@ impl InMemoryRoutingStore {
         }
     }
 
+    /// Replace the org's ENABLED workload names (R07): the test/dev mirror
+    /// of the cloud workload-policy registry that gates the trusted
+    /// `X-TokenTrimmer-Workload` channel.
+    pub fn set_enabled_workloads(&self, org_id: Uuid, workloads: &[&str]) {
+        self.workloads
+            .write()
+            .expect("inmemory workload registry poisoned")
+            .insert(
+                org_id,
+                workloads.iter().map(|name| name.to_string()).collect(),
+            );
+    }
+
     /// Overlay the pause map onto a route list (keeps a directly-planted
     /// `paused: true` as well). Only ACTIVE pauses count — a resumed entry is
     /// a retained watermark, not a pause.
@@ -504,6 +533,21 @@ impl InMemoryRoutingStore {
 
 #[async_trait]
 impl RoutingStore for InMemoryRoutingStore {
+    async fn enabled_workloads_for_org(
+        &self,
+        org_id: Uuid,
+    ) -> Result<Vec<String>, RoutingStoreError> {
+        Ok(self
+            .workloads
+            .read()
+            .expect("inmemory workload registry poisoned")
+            .get(&org_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect())
+    }
+
     async fn list_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
         let routes = {
             let g = self.inner.read().expect("inmemory routing store poisoned");
@@ -841,6 +885,34 @@ mod pg {
                 .into_iter()
                 .filter_map(RouteRow::into_runtime_route)
                 .collect())
+        }
+
+        async fn enabled_workloads_for_org(
+            &self,
+            org_id: Uuid,
+        ) -> Result<Vec<String>, RoutingStoreError> {
+            // The cloud-owned workload registry (R07). Same tolerance shape
+            // as the ledger join: a gateway released before the cloud
+            // workload migration serves route traffic normally, and the
+            // trusted channel fails closed (NONE minted) until the table
+            // exists — never a wildcard match.
+            match sqlx::query_scalar::<_, String>(
+                "SELECT workload FROM workload_policies WHERE org_id = $1 AND enabled = TRUE",
+            )
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(workloads) => Ok(workloads),
+                Err(error) if route_versions_table_is_absent(&error) => {
+                    tracing::warn!(
+                        org_id = %org_id,
+                        "workload policy table is unavailable; the trusted workload channel stays disabled for this refresh"
+                    );
+                    Ok(Vec::new())
+                }
+                Err(error) => Err(RoutingStoreError::Backend(error.to_string())),
+            }
         }
 
         async fn list_all_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {

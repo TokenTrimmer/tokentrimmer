@@ -311,6 +311,30 @@ pub(crate) async fn apply_routing(
         }
     };
 
+    // R07 trust boundary: if the request carries a trusted workload, the
+    // engine's same-refresh registry snapshot decides whether it is honored.
+    // An unknown or DISABLED workload fails closed here: the reserved namespace
+    // is stripped from a LOCAL evaluation copy of the context (the caller's
+    // context object is untouched), so no workload route can match a name the
+    // org has not registered — and ordinary routes still evaluate with any
+    // plain caller tag intact. (Registry-backed stores capture enabled
+    // workloads with the routes; stores without a registry carry an empty
+    // set, so their trusted channel never mints.)
+    let mut evaluation_ctx: std::borrow::Cow<'_, RequestContext> = std::borrow::Cow::Borrowed(ctx);
+    if let Some(workload) = tt_shared::reserved_metadata::trusted_workload_from(&ctx.tag) {
+        if !engine.workload_enabled(&workload) {
+            tracing::info!(
+                org_id = %ctx.org_id,
+                workload = %workload,
+                "unregistered_or_disabled_workload: trusted channel fails closed; routing proceeds without the workload key"
+            );
+            // The trusted form replaces any caller tag by construction
+            // (combine_tags), so clearing the slot loses nothing else.
+            evaluation_ctx.to_mut().tag = None;
+        }
+    }
+    let ctx = evaluation_ctx.as_ref();
+
     // Input-tokens estimate for the route conditions. Counts the ENTIRE prompt
     // (system + every turn) via the shared `message_text_for_estimation` helper —
     // the SAME text live dispatch and the capability guard below tokenize, so a
