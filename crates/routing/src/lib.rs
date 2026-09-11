@@ -668,6 +668,12 @@ pub struct RoutingEngine {
     /// Kept out of [`Route`] so route JSON / callers retain their established
     /// public shape; only the gateway execution path consumes it.
     route_version_ids: std::collections::HashMap<Uuid, Option<i64>>,
+    /// The org's ENABLED workload names captured in the same runtime refresh
+    /// (R07). The trusted `X-TokenTrimmer-Workload` channel may mint the
+    /// reserved namespace ONLY when the name appears here; unknown or
+    /// disabled workloads fail closed at the entry points. Empty for stores
+    /// with no registry (OSS in-memory / a DB without the cloud table).
+    enabled_workloads: std::collections::HashSet<String>,
 }
 
 /// Why one route candidate was or was not selected during priority evaluation.
@@ -763,6 +769,19 @@ impl RoutingEngine {
     /// provenance. The IDs are captured together by the backing store; this
     /// method merely preserves that association through the cache/engine.
     pub fn with_runtime_routes(routes: impl IntoIterator<Item = RuntimeRoute>) -> Self {
+        Self {
+            enabled_workloads: Default::default(),
+            ..Self::with_runtime_routes_and_workloads(routes, std::iter::empty())
+        }
+    }
+
+    /// Like [`Self::with_runtime_routes`], carrying the org's ENABLED workload
+    /// names captured in the same refresh (stores with a workload registry
+    /// use this so the trusted channel is registry-bound).
+    pub fn with_runtime_routes_and_workloads(
+        routes: impl IntoIterator<Item = RuntimeRoute>,
+        workloads: impl IntoIterator<Item = String>,
+    ) -> Self {
         let mut route_version_ids = std::collections::HashMap::new();
         let mut v = Vec::new();
         for RuntimeRoute {
@@ -777,7 +796,18 @@ impl RoutingEngine {
         Self {
             routes: v,
             route_version_ids,
+            enabled_workloads: workloads.into_iter().collect(),
         }
+    }
+
+    /// R07: whether `workload` is a REGISTERED, ENABLED workload in the
+    /// engine's captured org snapshot. Entry points gate the trusted
+    /// `X-TokenTrimmer-Workload` channel on this: unknown/disabled names
+    /// fail closed. `false` is also correct for stores with no registry —
+    /// the workload channel requires an authoritative policy source.
+    #[must_use]
+    pub fn workload_enabled(&self, workload: &str) -> bool {
+        self.enabled_workloads.contains(workload)
     }
 
     /// Add a route in-place and re-sort. Hot-path callers should prefer

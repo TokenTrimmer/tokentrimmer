@@ -75,7 +75,12 @@ impl CachingRoutingStore {
         // inside the cached engine; do not re-read a mutable route revision on
         // individual requests.
         let routes = self.inner.list_runtime_for_org(org_id).await?;
-        let engine = Arc::new(RoutingEngine::with_runtime_routes(routes));
+        // Same-refresh capture of the org's enabled workloads: the trusted
+        // channel and the routes share one policy snapshot.
+        let workloads = self.inner.enabled_workloads_for_org(org_id).await?;
+        let engine = Arc::new(RoutingEngine::with_runtime_routes_and_workloads(
+            routes, workloads,
+        ));
         let mut g = self.cache.write().await;
         g.insert(
             org_id,

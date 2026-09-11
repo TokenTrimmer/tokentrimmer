@@ -31,7 +31,7 @@ use tt_auth::{
 };
 use tt_cache::memory::InMemoryL1Cache;
 use tt_core::{build_router, AppState, ProviderRegistry};
-use tt_routing::{CachingRoutingStore, Route, RouteAction, RoutingStore};
+use tt_routing::{CachingRoutingStore, Route, RouteAction};
 use tt_shared::{
     pricing::Capability, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
     EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError,
@@ -105,13 +105,13 @@ impl Provider for RecordingProvider {
     }
 }
 
-#[derive(Debug)]
-struct FixedStore(Route);
-#[async_trait]
-impl RoutingStore for FixedStore {
-    async fn list_for_org(&self, _: Uuid) -> Result<Vec<Route>, tt_routing::RoutingStoreError> {
-        Ok(vec![self.0.clone()])
-    }
+/// The org fixed per harness (the in-memory registry is org-keyed).
+const WORKLOAD_ORG: uuid::Uuid = uuid::uuid!("00000000-0000-0000-0000-00000000e507");
+
+fn store_with(workloads: &[&str]) -> Arc<tt_routing::InMemoryRoutingStore> {
+    let store = Arc::new(tt_routing::InMemoryRoutingStore::new());
+    store.set_enabled_workloads(WORKLOAD_ORG, workloads);
+    store
 }
 
 /// One workload-gated cost route: expensive-model → cheap-model, keyed only
@@ -142,8 +142,10 @@ struct Harness {
 }
 
 impl Harness {
-    async fn new() -> Self {
-        let org = Uuid::now_v7();
+    /// `workloads`: the org's REGISTERED workload names (the registry that
+    /// gates the trusted channel — R07 part B).
+    async fn new_with_workloads(workloads: &[&str]) -> Self {
+        let org = WORKLOAD_ORG;
         let keys = Arc::new(InMemoryKeyStore::new());
         let key = issue(
             keys.as_ref(),
@@ -159,10 +161,9 @@ impl Harness {
         let provider = Arc::new(RecordingProvider::default());
         let mut registry = ProviderRegistry::new();
         registry.register(provider.clone());
-        let routing = Arc::new(CachingRoutingStore::with_ttl(
-            Arc::new(FixedStore(workload_route())),
-            Duration::ZERO,
-        ));
+        let backing = store_with(workloads);
+        backing.set_routes(org, vec![workload_route()]);
+        let routing = Arc::new(CachingRoutingStore::with_ttl(backing, Duration::ZERO));
         let app = build_router(
             AppState::new(registry)
                 .with_key_store(keys)
@@ -170,6 +171,16 @@ impl Harness {
                 .with_l1(Arc::new(InMemoryL1Cache::new()), None),
         );
         Self { app, key, provider }
+    }
+
+    /// The registered default: `support-summary` is a known workload.
+    async fn new() -> Self {
+        Self::new_with_workloads(&["support-summary"]).await
+    }
+
+    /// A registry WITHOUT any workload: the trusted channel must fail closed.
+    async fn new_unregistered() -> Self {
+        Self::new_with_workloads(&[]).await
     }
 
     fn request(&self, tag: Option<&str>, workload: Option<&str>) -> Request<Body> {
@@ -282,6 +293,28 @@ async fn invalid_workload_header_fails_closed_but_serves_the_callers_model() {
         h.dispatched_model().await,
         "expensive-model",
         "an invalid workload name must fail closed for routing"
+    );
+}
+
+#[tokio::test]
+async fn an_unregistered_workload_fails_closed_at_the_registry_boundary() {
+    // R07 part B: the header carries a VALID name the ORG HAS NOT
+    // REGISTERED. The gateway strips the trusted key before evaluation —
+    // the workload route cannot match, and the caller's own model is
+    // served. (The registry snapshot is captured with the routes in the
+    // same refresh; a disabled workload behaves identically.)
+    let h = Harness::new_unregistered().await;
+    let r = h
+        .app
+        .clone()
+        .oneshot(h.request(None, Some("support-summary")))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        h.dispatched_model().await,
+        "expensive-model",
+        "a workload the org has not registered must fail closed at the registry boundary"
     );
 }
 
