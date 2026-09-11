@@ -37,6 +37,15 @@ pub struct RequiredCapabilities {
     pub tools: bool,
     /// `response_format.type` is `"json_object"` or `"json_schema"`.
     pub json_mode: bool,
+    /// `response_format.type` is `"json_schema"` AND the envelope carries
+    /// `strict: true` (S02). A strict structured-output request must not be
+    /// rewritten to a model that only promises the loose `json_object` shape:
+    /// the dispatch-time downgrade warning fires AFTER the rewrite committed,
+    /// which is exactly the silently-changed-output-contract failure the
+    /// review named. Suppressed at selection instead; unknown models stay
+    /// permissive per the module's unknown-metadata policy (the downgrade
+    /// warning remains the backstop there).
+    pub strict_json_schema: bool,
     /// `stream` is true; models explicitly lacking Streaming cannot serve.
     pub streaming: bool,
 }
@@ -55,6 +64,12 @@ impl RequiredCapabilities {
         if let Some(rf) = &req.response_format {
             if rf.r#type == "json_object" || rf.r#type == "json_schema" {
                 caps.json_mode = true;
+            }
+            // S02: a STRICT structured-output request (json_schema envelope
+            // with strict: true) additionally requires the strict capability
+            // so selection cannot rewrite it onto a json_object-only model.
+            if rf.r#type == "json_schema" && schema_envelope_is_strict(&rf.json_schema) {
+                caps.strict_json_schema = true;
             }
         }
 
@@ -120,6 +135,9 @@ impl RequiredCapabilities {
         if self.json_mode && !info.capabilities.contains(&Capability::JsonMode) {
             return false;
         }
+        if self.strict_json_schema && !info.capabilities.contains(&Capability::StrictJsonSchema) {
+            return false;
+        }
         if self.streaming && !info.capabilities.contains(&Capability::Streaming) {
             return false;
         }
@@ -127,6 +145,21 @@ impl RequiredCapabilities {
             return false;
         }
         true
+    }
+
+    /// S02 evidence policy for the guard: what was checked against positive
+    /// catalog knowledge vs. what was assumed. Unknown models are PERMISSIVE
+    /// (dispatch may still work; the dispatch-time downgrade warnings remain
+    /// the backstop), and token/media counts are ESTIMATES — this enum lets
+    /// callers label route decisions with that uncertainty instead of
+    /// presenting an approximate guard as an exact one.
+    #[must_use]
+    pub fn evidence_policy(info_known: bool) -> &'static str {
+        if info_known {
+            "catalog_verified"
+        } else {
+            "unknown_model_permissive"
+        }
     }
 
     /// Human-readable list of the reasons a candidate was skipped, for use in
@@ -145,6 +178,9 @@ impl RequiredCapabilities {
         if self.json_mode && !info.capabilities.contains(&Capability::JsonMode) {
             reasons.push("json_mode_not_supported");
         }
+        if self.strict_json_schema && !info.capabilities.contains(&Capability::StrictJsonSchema) {
+            reasons.push("strict_json_schema_not_supported");
+        }
         if self.streaming && !info.capabilities.contains(&Capability::Streaming) {
             reasons.push("streaming_not_supported");
         }
@@ -153,6 +189,25 @@ impl RequiredCapabilities {
         }
         reasons
     }
+}
+
+/// True when the OpenAI `response_format.json_schema` envelope carries
+/// `strict: true`. Mirrors `unwrap_schema_envelope` in the core shaping
+/// module (`{"name", "strict", "schema"}` envelope, accepting a bare
+/// schema as non-strict) without a cross-crate dependency — keep the two in
+/// sync. A bare schema without the envelope is deliberately NOT strict: the
+/// absence of the flag is not evidence of a grammar-locked output contract.
+fn schema_envelope_is_strict(raw: &Option<serde_json::Value>) -> bool {
+    raw.as_ref()
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get("schema").filter(|s| s.is_object()))
+        .is_some_and(|_| {
+            raw.as_ref()
+                .and_then(|v| v.as_object())
+                .and_then(|obj| obj.get("strict"))
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false)
+        })
 }
 
 /// Concatenate all message text parts from a request for token estimation.
@@ -645,6 +700,127 @@ mod tests {
         }];
         assert!(!request_has_documents(&req));
         assert!(request_has_images(&req));
+    }
+
+    #[test]
+    fn strict_schema_request_requires_the_strict_capability() {
+        let mut req = base_req();
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".into(),
+            json_schema: Some(serde_json::json!({
+                "name": "receipt",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {"total": {"type": "number"}},
+                    "required": ["total"],
+                    "additionalProperties": false
+                }
+            })),
+        });
+        let caps = RequiredCapabilities::from_request(&req);
+        assert!(
+            caps.json_mode,
+            "a json_schema request still needs json_mode"
+        );
+        assert!(
+            caps.strict_json_schema,
+            "strict envelope must set the strict cap"
+        );
+
+        // A json_object-only model (JsonMode but no StrictJsonSchema) cannot serve.
+        let json_object_only = ModelInfo {
+            id: "json-object-only".into(),
+            provider: "mock".into(),
+            capabilities: vec![Capability::Text, Capability::JsonMode],
+            max_input_tokens: 8192,
+            max_output_tokens: 1024,
+        };
+        assert!(
+            !caps.satisfied_by(&json_object_only, 0),
+            "a strict-schema request must not be rewritten onto a json_object-only model"
+        );
+        assert!(caps
+            .skip_reasons(&json_object_only, 0)
+            .contains(&"strict_json_schema_not_supported"));
+
+        // A model with the strict capability can serve.
+        let strict_capable = ModelInfo {
+            id: "strict-capable".into(),
+            provider: "mock".into(),
+            capabilities: vec![
+                Capability::Text,
+                Capability::JsonMode,
+                Capability::StrictJsonSchema,
+            ],
+            max_input_tokens: 8192,
+            max_output_tokens: 1024,
+        };
+        assert!(caps.satisfied_by(&strict_capable, 0));
+    }
+
+    #[test]
+    fn non_strict_schema_request_only_needs_json_mode() {
+        // A json_schema envelope WITHOUT strict:true (or a bare schema) must
+        // only demand json_mode — the loose-shape contract downgrades safely
+        // at dispatch with the existing warning.
+        for envelope in [
+            serde_json::json!({
+                "name": "receipt",
+                "strict": false,
+                "schema": {"type": "object", "properties": {}}
+            }),
+            serde_json::json!({"schema": {"type": "object"}}),
+            serde_json::json!({"type": "object"}),
+        ] {
+            let mut req = base_req();
+            req.response_format = Some(ResponseFormat {
+                r#type: "json_schema".into(),
+                json_schema: Some(envelope.clone()),
+            });
+            let caps = RequiredCapabilities::from_request(&req);
+            assert!(caps.json_mode);
+            assert!(
+                !caps.strict_json_schema,
+                "envelope without strict:true must not demand the strict cap: {envelope}"
+            );
+
+            let json_object_only = ModelInfo {
+                id: "json-object-only".into(),
+                provider: "mock".into(),
+                capabilities: vec![Capability::Text, Capability::JsonMode],
+                max_input_tokens: 8192,
+                max_output_tokens: 1024,
+            };
+            assert!(
+                caps.satisfied_by(&json_object_only, 0),
+                "a non-strict schema request may still route to a json_object model"
+            );
+        }
+    }
+
+    #[test]
+    fn json_object_request_never_demands_strict_schema() {
+        let mut req = base_req();
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_object".into(),
+            json_schema: None,
+        });
+        let caps = RequiredCapabilities::from_request(&req);
+        assert!(caps.json_mode);
+        assert!(!caps.strict_json_schema);
+    }
+
+    #[test]
+    fn evidence_policy_names_the_guard_basis_honestly() {
+        assert_eq!(
+            RequiredCapabilities::evidence_policy(true),
+            "catalog_verified"
+        );
+        assert_eq!(
+            RequiredCapabilities::evidence_policy(false),
+            "unknown_model_permissive"
+        );
     }
 
     #[test]

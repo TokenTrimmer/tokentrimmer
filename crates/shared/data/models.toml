@@ -9,7 +9,12 @@
 #   max_input_tokens  = context window (input) upper bound
 #   max_output_tokens = completion upper bound (0 for embedding models)
 #   capabilities      = snake_case Capability names: text, vision, audio, tools,
-#                       json_mode, streaming, reasoning, prompt_caching
+#                       json_mode, strict_json_schema, streaming, reasoning,
+#                       prompt_caching. strict_json_schema (S02) marks models
+#                       documented to honor response_format: json_schema with
+#                       strict semantics; list it ONLY with provider-documented
+#                       structured outputs. A strict-schema request cannot be
+#                       rewritten onto a model without it.
 #
 # V4b-1 covers the native adapters (openai, anthropic, gemini); compat providers
 # (mistral, groq, together, openrouter) are added in V4b-2.
@@ -20,14 +25,14 @@ provider = "openai"
 model = "gpt-5.5"
 max_input_tokens = 1050000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "openai"
 model = "gpt-5.5-pro"
 max_input_tokens = 1050000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "reasoning"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "reasoning"]
 
 
 [[model]]
@@ -35,54 +40,54 @@ provider = "openai"
 model = "gpt-5.6-sol"
 max_input_tokens = 1050000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "openai"
 model = "gpt-5.6-terra"
 max_input_tokens = 1050000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "openai"
 model = "gpt-5.6-luna"
 max_input_tokens = 1050000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "openai"
 model = "gpt-4.1"
 max_input_tokens = 1047576
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "openai"
 model = "gpt-4.1-mini"
 max_input_tokens = 1047576
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 [[model]]
 provider = "openai"
 model = "gpt-5.4"
 max_input_tokens = 1050000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "openai"
 model = "gpt-5.4-mini"
 max_input_tokens = 200000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 [[model]]
 provider = "openai"
 model = "gpt-5.4-pro"
 max_input_tokens = 1050000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "reasoning"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "reasoning"]
 
 
 [[model]]
@@ -90,28 +95,28 @@ provider = "openai"
 model = "gpt-4o"
 max_input_tokens = 128000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "openai"
 model = "gpt-4o-mini"
 max_input_tokens = 128000
 max_output_tokens = 16000
-capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+capabilities = ["text", "vision", "tools", "json_mode", "strict_json_schema", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "openai"
 model = "o3"
 max_input_tokens = 200000
 max_output_tokens = 100000
-capabilities = ["text", "tools", "json_mode", "reasoning", "streaming"]
+capabilities = ["text", "tools", "json_mode", "strict_json_schema", "reasoning", "streaming"]
 
 [[model]]
 provider = "openai"
 model = "o4-mini"
 max_input_tokens = 200000
 max_output_tokens = 100000
-capabilities = ["text", "tools", "json_mode", "reasoning", "streaming"]
+capabilities = ["text", "tools", "json_mode", "strict_json_schema", "reasoning", "streaming"]
 
 [[model]]
 provider = "openai"
