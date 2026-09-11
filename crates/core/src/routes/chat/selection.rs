@@ -476,6 +476,7 @@ pub(crate) async fn apply_routing(
                 route_id = %route_id,
                 model = %effective_target,
                 reasons = ?reasons,
+                evidence = %tt_shared::RequiredCapabilities::evidence_policy(true),
                 "route_skipped_capability: target lacks required capabilities; privacy effects remain required"
             );
             record_route_application_trace(

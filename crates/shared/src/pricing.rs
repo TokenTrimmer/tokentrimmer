@@ -166,6 +166,14 @@ pub enum Capability {
     Audio,
     Tools,
     JsonMode,
+    /// The model honors `response_format: json_schema` (structured outputs)
+    /// up to the provider's strict-schema semantics — distinct from
+    /// [`Capability::JsonMode`], which covers the looser `json_object` shape.
+    /// Catalog maintainers list this ONLY where the provider documents
+    /// structured-output support for that model; a strict-schema request
+    /// routed to a `json_object`-only model is suppressed at selection
+    /// (S02) instead of silently downgraded at dispatch.
+    StrictJsonSchema,
     Streaming,
     Reasoning,
     PromptCaching,

@@ -178,6 +178,7 @@ enum Overlap {
 /// - `max_input_tokens` (both `input_tokens_gt`/`lt` forms shared as their
 ///   bounds) — identical mandatory bounds overlap; a non-identical pair is
 ///   reported undecidable (the ranges may still intersect).
+///
 /// Any DERIVED condition (prompt-keyword, cost, latency, media) present on
 /// the INVARIANT route makes the whole pair undecidable (its true traffic
 /// shape is runtime-only).

@@ -520,6 +520,7 @@ pub async fn dispatch_with_failover(
                     tracing::info!(
                         model = %model,
                         reasons = ?reasons,
+                        evidence = %tt_shared::RequiredCapabilities::evidence_policy(true),
                         "route_skipped_capability: failover candidate lacks required capabilities"
                     );
                     cost_exhaustion.record_non_cost_skip();
@@ -689,6 +690,7 @@ pub async fn dispatch_stream_with_failover(
                     tracing::info!(
                         model = %model,
                         reasons = ?reasons,
+                        evidence = %tt_shared::RequiredCapabilities::evidence_policy(true),
                         "route_skipped_capability: failover stream candidate lacks required capabilities"
                     );
                     cost_exhaustion.record_non_cost_skip();
