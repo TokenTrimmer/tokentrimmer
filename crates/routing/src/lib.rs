@@ -17,6 +17,7 @@ pub mod cache;
 pub mod catalog;
 pub mod contract;
 pub mod latency;
+pub mod policy;
 mod matcher;
 pub mod store;
 pub mod validate;
