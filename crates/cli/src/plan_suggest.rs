@@ -135,6 +135,31 @@ pub fn build_plan_input_json_inner(
         }
     }
 
+    // G06: fold in inspect-rule-driven routes — the same tier-1 scan `tt
+    // inspect` runs maps actionable findings (flagship-for-classification,
+    // extraction, reasoning-effort-defaults-high) to cheaper-model rewrites
+    // via `inspect_route_suggest`. Deduplicated by (source, target) against
+    // the pricing-catalog routes already collected above, so a model both
+    // engines flag produces one route, not two.
+    let covered: std::collections::HashSet<(String, String)> = proposed_routes
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.when.model_in.first()?.clone(),
+                r.then.target_model.clone()?,
+            ))
+        })
+        .collect();
+    for route in finding_routes_from_scan(path) {
+        let key = (
+            route.when.model_in[0].clone(),
+            route.then.target_model.clone().unwrap_or_default(),
+        );
+        if !covered.contains(&key) {
+            proposed_routes.push(route);
+        }
+    }
+
     let plan_id = Uuid::new_v4();
 
     // Build the pricing table for every target model referenced.
@@ -177,6 +202,40 @@ pub fn build_plan_input_json_inner(
     });
 
     serde_json::to_string_pretty(&plan_input).map_err(|e| anyhow::anyhow!("serialize: {e}"))
+}
+
+/// Run the inspect tier-1 rule scan over `path` and convert its actionable
+/// findings to `ProposedRoute`s (G06). Each suggestion becomes one route:
+/// `when.model_in` = the expensive model the finding detected, `then.target_model`
+/// = the cheaper rewrite, `name` = a `swap-<source>-to-<target>` slug. Priority
+/// starts at 50 (below the catalog-priced preview routes at 100-10N) so the
+/// preview engine's cheapest-first ordering wins ties; finding routes fill the
+/// gaps the pricing catalog alone cannot see (rule-detected workloads).
+fn finding_routes_from_scan(path: &str) -> Vec<ProposedRoute> {
+    let mut engine = tt_inspect_core::Engine::new();
+    for rule in tt_inspect_rules_tier1::all_rules() {
+        engine.add_rule(rule);
+    }
+    let findings = engine.scan(std::path::Path::new(path));
+    let suggestions = crate::inspect_route_suggest::route_suggestions_from_findings(&findings);
+    suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| ProposedRoute {
+            id: Uuid::new_v4(),
+            name: format!("swap-{}-to-{}", s.source_model, s.target_model),
+            priority: 50u32.saturating_sub(i as u32),
+            enabled: true,
+            when: RouteConditions {
+                model_in: vec![s.source_model.clone()],
+                ..Default::default()
+            },
+            then: RouteAction {
+                target_model: Some(s.target_model.clone()),
+                ..Default::default()
+            },
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -407,5 +466,89 @@ mod tests {
         assert_eq!(parsed.org_id, Uuid::from_u128(7));
         assert_eq!(parsed.requests.len(), 1);
         assert_eq!(parsed.requests[0].model, "gpt-4o");
+    }
+    // (g) G06: the inspect-rule scan folds finding-driven routes into the
+    //     plan input. A flagship model the pricing CATALOG does not price
+    //     (the preview loop warns and skips it) still yields a route when the
+    //     classification rule detects it — the rule engine sees what the
+    //     catalog cannot.
+    #[test]
+    fn finding_scan_adds_route_for_unpriced_flagship_model() {
+        let dir = std::env::temp_dir().join(format!("tt-g06-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("moderator.ts");
+        std::fs::write(
+            &file,
+            r#"const classify = async (text: string) => {
+  const resp = await client.chat.completions.create({
+    model: "gpt-4-turbo",
+    messages: [{ role: "user", content: `Label the sentiment of: ${text}` }],
+  });
+  return resp.choices[0].message.content;
+};"#,
+        )
+        .expect("fixture");
+
+        let json = build_plan_input_json(dir.to_str().unwrap()).expect("plan input");
+        let parsed: PlanInput = serde_json::from_str(&json).expect("deserialize");
+
+        let finding_route = parsed
+            .proposed_routes
+            .iter()
+            .find(|r| r.name == "swap-gpt-4-turbo-to-gpt-4o-mini");
+        let route = finding_route
+            .expect("the unpriced-but-rule-flagged gpt-4-turbo must yield a finding-driven route");
+        assert_eq!(route.when.model_in, vec!["gpt-4-turbo"]);
+        assert_eq!(route.then.target_model.as_deref(), Some("gpt-4o-mini"));
+        // The pricing table carries the TARGET model so the plan is runnable.
+        assert!(
+            json.contains("\"openai:gpt-4o-mini\""),
+            "the target's rate table must be included: {json}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // (h) G06: dedup — when the pricing catalog ALREADY suggested the same
+    //     (source, target) pair, the finding does not duplicate it.
+    #[test]
+    fn finding_scan_dedups_against_the_catalog_routes() {
+        let dir = std::env::temp_dir().join(format!("tt-g06-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // gpt-4o on classification work: flagged by the rule AND priced by
+        // the preview catalog (which will suggest gpt-4o-mini among others).
+        let file = dir.join("classifier.py");
+        std::fs::write(
+            &file,
+            "def f(text):
+    return client.chat.completions.create(
+        model=\"gpt-4o\",
+        messages=[{\"role\": \"user\", \"content\": f\"Classify the intent of: {text}\"}],
+    )
+",
+        )
+        .expect("fixture");
+
+        let json = build_plan_input_json(dir.to_str().unwrap()).expect("plan input");
+        let parsed: PlanInput = serde_json::from_str(&json).expect("deserialize");
+        // Exactly ONE route rewrites gpt-4o to gpt-4o-mini (the preview
+        // engine's suggestion at prio 90; the finding route is deduped).
+        let pair_routes: Vec<_> = parsed
+            .proposed_routes
+            .iter()
+            .filter(|r| {
+                r.when.model_in.first().map(String::as_str) == Some("gpt-4o")
+                    && r.then.target_model.as_deref() == Some("gpt-4o-mini")
+            })
+            .collect();
+        assert_eq!(
+            pair_routes.len(),
+            1,
+            "the (gpt-4o -> gpt-4o-mini) pair must be suggested exactly once: {:?}",
+            pair_routes
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
