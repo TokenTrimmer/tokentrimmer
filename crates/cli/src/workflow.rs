@@ -117,17 +117,80 @@ fn print_estimate(est: &tt_core::workflow::estimate::WorkflowEstimate) {
     );
 
     if !est.per_node.is_empty() {
-        let mut table = ui::table(&["NODE", "MODEL", "COST (USD)"], console::colors_enabled());
+        let mut table = ui::table(
+            &[
+                "NODE",
+                "MODEL",
+                "COST (USD)",
+                "FLEX TIER",
+                "BATCH TIER",
+                "WARM PREFIX −",
+            ],
+            console::colors_enabled(),
+        );
         for n in &est.per_node {
+            let (flex, batch, warm) = match &n.levers {
+                None => ("-".to_string(), "-".to_string(), "-".to_string()),
+                Some(levers) => (
+                    levers
+                        .flex_cost_usd
+                        .map(|c| format!("${c:.8}"))
+                        .unwrap_or_else(|| "—".to_string()),
+                    levers
+                        .batch_cost_usd
+                        .map(|c| format!("${c:.8}"))
+                        .unwrap_or_else(|| "—".to_string()),
+                    levers
+                        .warm_prefix_saved_usd
+                        .map(|c| format!("-${c:.8}"))
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+            };
             table.add_row(vec![
                 n.node_id.clone(),
                 n.model.as_deref().unwrap_or("-").to_string(),
                 n.cost_usd
                     .map(|c| format!("${c:.8}"))
                     .unwrap_or_else(|| "-".to_string()),
+                flex,
+                batch,
+                warm,
             ]);
         }
         println!("{table}");
+    }
+
+    // R08 task-lever totals: the offline task-cost comparison (each arm sums
+    // only the nodes whose catalog row carries the tier).
+    if est.task_levers.flex_nodes > 0 || est.task_levers.batch_nodes > 0 {
+        ui::heading("Task-rate comparison (admission estimates)");
+        if est.task_levers.flex_nodes > 0 {
+            println!(
+                "  flex tier:  ${:.8}  ({} node{}; non-interactive, no per-node deadline)",
+                est.task_levers.flex_total_usd,
+                est.task_levers.flex_nodes,
+                if est.task_levers.flex_nodes == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
+        if est.task_levers.batch_nodes > 0 {
+            println!(
+                "  batch tier: ${:.8}  ({} node{}; async ≤24h window)",
+                est.task_levers.batch_total_usd,
+                est.task_levers.batch_nodes,
+                if est.task_levers.batch_nodes == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
+        for note in &est.task_lever_notes {
+            ui::note(note);
+        }
     }
 
     for w in &est.warnings {

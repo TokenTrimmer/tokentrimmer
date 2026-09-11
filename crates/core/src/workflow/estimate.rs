@@ -241,6 +241,47 @@ pub struct NodeEstimate {
     /// Projected cost for this node. `None` when the model is unknown/dynamic
     /// or not present in the pricing catalog.
     pub cost_usd: Option<f64>,
+    /// R08 task-lever breakdown for this node. `None` exactly when
+    /// [`Self::cost_usd`] is `None` (an unprojected node has no lever math
+    /// either). All figures are ADMISSION ESTIMATES at catalog list rates —
+    /// never reservations, settlements, or invoice guarantees (the money
+    /// contract M7 wording applies).
+    #[serde(default)]
+    pub levers: Option<NodeLeverEstimate>,
+}
+
+/// R08: the per-node lever-adjusted task-cost breakdown (offline advisory).
+///
+/// The review's ask: "Compare expected full-task costs including output
+/// length, retries, warm/cold prefix reuse, evaluation overhead and
+/// deadlines... Start with offline recommendations." This is the first
+/// deliverable: the catalog-level lever deltas a task planner can compare —
+/// a Flex-tier variant (non-interactive, no deadline) and a Batch-tier
+/// variant (async-eligible, ≤24h window) against the standard-rate base.
+///
+/// HONESTY: each variant is its own figure labeled with its tier; none is
+/// summed into `cost_usd` (the base estimate). Prefix-reuse and retry
+/// inflation are workload-history facts the static estimator cannot know —
+/// they stay [`None`]-by-omission rather than guessed (see
+/// [`WorkflowEstimate::task_lever_notes`]).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct NodeLeverEstimate {
+    /// The FLEX-tier projected cost for this node's token profile, when the
+    /// model carries a catalog Flex rate (`None` = not flex-eligible).
+    pub flex_cost_usd: Option<f64>,
+    /// The BATCH-tier projected cost for the same profile, when the model
+    /// carries a catalog Batch rate (`None` = no batch tier). Advisory: a
+    /// Batch job is async (≤24h window) — only deadline-tolerant tasks may
+    /// act on this figure.
+    pub batch_cost_usd: Option<f64>,
+    /// Estimated provider prompt-cache SAVINGS when the model's catalog row
+    /// pins a cache minimum AND the node's input could reuse a warm prefix.
+    /// The static estimator cannot know actual warm/cold reuse, so this uses
+    /// the catalog's cached-input rate against the input-token estimate
+    /// assuming a FULL warm prefix — the OPTIMISTIC bound a planner compares
+    /// against, labelled by `task_lever_notes`; realized savings are the
+    /// request row's `provider_cache_saved_usd` (never this figure).
+    pub warm_prefix_saved_usd: Option<f64>,
 }
 
 /// Top-level pre-run cost projection.
@@ -252,6 +293,31 @@ pub struct WorkflowEstimate {
     pub per_node: Vec<NodeEstimate>,
     /// Human-readable warnings (e.g. un-projectable nodes).
     pub warnings: Vec<String>,
+    /// R08: the sum of every node's lever variants. Each arm sums only the
+    /// nodes whose model carries that tier (`None` arms stay excluded, never
+    /// treated as the standard rate). Like the node figures: admission
+    /// estimates for offline task planning, never settlements.
+    #[serde(default)]
+    pub task_levers: TaskLeverTotals,
+    /// R08: the honest-scope notes for the lever figures (constant, value-free).
+    #[serde(default)]
+    pub task_lever_notes: Vec<String>,
+}
+
+/// R08: workflow-total lever variants (see [`NodeLeverEstimate`]).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct TaskLeverTotals {
+    /// Sum of every node's `flex_cost_usd` that carries a Flex tier.
+    pub flex_total_usd: f64,
+    /// How many projected nodes contributed to [`Self::flex_total_usd`].
+    pub flex_nodes: u32,
+    /// Sum of every node's `batch_cost_usd` that carries a Batch tier.
+    pub batch_total_usd: f64,
+    pub batch_nodes: u32,
+    /// Sum of every node's optimistic warm-prefix saving (catalog cached-input
+    /// rate over the input estimate).
+    pub warm_prefix_total_usd: f64,
+    pub warm_prefix_nodes: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +371,9 @@ pub fn estimate_workflow_with_variables(
                     content: MessageContent::Text(subst),
                     name: None,
                 };
+                // R08 task levers: the Flex/Batch/warm-prefix variants for the
+                // same token profile, computed before the base-estimate move.
+                let levers = node_lever_estimate(model, &[msg.clone()], max_output_tokens);
                 match estimate_next_turn_cost(model, &[msg], max_output_tokens) {
                     Some(c) => {
                         projected_cost_usd += c;
@@ -312,6 +381,7 @@ pub fn estimate_workflow_with_variables(
                             node_id: node.id.clone(),
                             model: Some(model.clone()),
                             cost_usd: Some(c),
+                            levers,
                         });
                     }
                     None => {
@@ -323,6 +393,7 @@ pub fn estimate_workflow_with_variables(
                             node_id: node.id.clone(),
                             model: Some(model.clone()),
                             cost_usd: None,
+                            levers: None,
                         });
                     }
                 }
@@ -336,7 +407,28 @@ pub fn estimate_workflow_with_variables(
                     node_id: node.id.clone(),
                     model: None,
                     cost_usd: None,
+                    levers: None,
                 });
+            }
+        }
+    }
+
+    // R08: aggregate the tier arms over the projected nodes and attach the
+    // honest-scope notes.
+    let mut task_levers = TaskLeverTotals::default();
+    for node in &per_node {
+        if let Some(levers) = &node.levers {
+            if let Some(flex) = levers.flex_cost_usd {
+                task_levers.flex_total_usd += flex;
+                task_levers.flex_nodes += 1;
+            }
+            if let Some(batch) = levers.batch_cost_usd {
+                task_levers.batch_total_usd += batch;
+                task_levers.batch_nodes += 1;
+            }
+            if let Some(warm) = levers.warm_prefix_saved_usd {
+                task_levers.warm_prefix_total_usd += warm;
+                task_levers.warm_prefix_nodes += 1;
             }
         }
     }
@@ -345,7 +437,93 @@ pub fn estimate_workflow_with_variables(
         projected_cost_usd,
         per_node,
         warnings,
+        task_levers,
+        task_lever_notes: TASK_LEVER_NOTES.iter().map(|s| (*s).to_string()).collect(),
     }
+}
+
+/// The constant, value-free honesty notes attached to every lever estimate.
+/// Each sentence is a binding scope statement (money contract M7 wording).
+const TASK_LEVER_NOTES: &[&str] = &[
+    "lever figures are admission estimates at published catalog list rates — never reservations, settlements, or invoice guarantees",
+    "flex assumes a non-interactive task with no per-node deadline (the ~50% tier); batch assumes an async ≤24h window — only deadline-tolerant tasks may act on either",
+    "warm_prefix_saved_usd is the OPTIMISTIC full-warm bound (catalog cached-input rate over the input estimate) for planning comparisons; realized savings are the request rows' provider_cache_saved_usd",
+    "nodes whose model lacks a tier are excluded from that arm's total (never priced at the standard rate as a stand-in)",
+];
+
+/// R08: compute the lever variants for one node's model + token profile.
+///
+/// Mirrors `estimate_next_turn_cost`'s method (a one-element transcript through
+/// the preview token estimator) so the lever figures price the EXACT same
+/// token counts the base estimate used. `None` arms follow the catalog:
+/// no Flex rate ⇒ no flex figure; no Batch tier ⇒ no batch figure; and the
+/// warm-prefix saving appears only when the model's catalog row pins a
+/// prompt-cache minimum (a cache without a pinned minimum cannot be planned
+/// against — honesty over optimism).
+fn node_lever_estimate(
+    model: &str,
+    messages: &[Message],
+    max_output_tokens: Option<u32>,
+) -> Option<NodeLeverEstimate> {
+    // The preview lookup resolves the owning provider (including the
+    // OpenAI-compatible probe path the shared catalog cannot); the catalog's
+    // LATEST row for (provider, model) carries the tier + cache rates.
+    let lookup = tt_preview::pricing::lookup(model).ok()?;
+    let pricing = tt_shared::pricing::catalog().latest(lookup.provider, model)?;
+
+    // Re-estimate the exact token profile (same path as the base estimate):
+    // flatten the node's prompt text into a preview message.
+    let preview_messages: Vec<tt_preview::types::Message> = messages
+        .iter()
+        .map(|m| {
+            let text = match &m {
+                Message::User {
+                    content: MessageContent::Text(t),
+                    ..
+                } => t.clone(),
+                _ => String::new(),
+            };
+            tt_preview::types::Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(text),
+            }
+        })
+        .collect();
+    let model_max_output = tt_shared::model_catalog()
+        .model_info(lookup.provider, model)
+        .map(|mi| u32::try_from(mi.max_output_tokens).unwrap_or(u32::MAX));
+    let est = tt_preview::token_estimator::estimate(
+        lookup.provider,
+        &preview_messages,
+        max_output_tokens,
+        model_max_output,
+    );
+    let input_tokens = f64::from(est.input_tokens);
+    let output_tokens = f64::from(est.output_tokens);
+
+    let flex_cost_usd = pricing
+        .flex_rates_per_million()
+        .map(|(fi, fo)| (input_tokens * fi + output_tokens * fo) / 1_000_000.0);
+    let batch_cost_usd = pricing
+        .batch_rates_per_million()
+        .map(|(bi, bo)| (input_tokens * bi + output_tokens * bo) / 1_000_000.0);
+    // The warm-prefix bound: the delta between the standard and cached-input
+    // rates over the input estimate, only for rows that pin a cache minimum.
+    let warm_prefix_saved_usd = match (
+        pricing.prompt_cache_min_tokens,
+        pricing.cached_input_per_million,
+    ) {
+        (Some(min_tokens), Some(cached_rate)) if est.input_tokens >= min_tokens => {
+            Some((input_tokens * (pricing.input_per_million - cached_rate)) / 1_000_000.0)
+        }
+        _ => None,
+    };
+
+    Some(NodeLeverEstimate {
+        flex_cost_usd,
+        batch_cost_usd,
+        warm_prefix_saved_usd,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,5 +1178,117 @@ mod tests {
             round_tripped.warnings, est.warnings,
             "warnings round-trip mismatch"
         );
+    }
+
+    // ---- R08: task-lever breakdown ----------------------------------------
+
+    /// A one-node def pinned to gpt-5.5 — the catalog row carrying all three
+    /// levers (batch 2.50/15, flex 2.50/15, prompt_cache_min_tokens 1024).
+    fn tiered_single_model_def() -> WorkflowDefinition {
+        WorkflowDefinition {
+            triggers: vec![],
+            id: Uuid::nil(),
+            version: 1,
+            name: "estimate_tier_test".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "m1".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "gpt-5.5".into(),
+                        },
+                        prompt: "Summarize: {{input}}".into(),
+                        max_output_tokens: Some(64),
+                        max_cost_usd: None,
+                    },
+                },
+            ],
+            edges: vec![Edge {
+                from: "t".into(),
+                to: "m1".into(),
+                map: None,
+            }],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: Vec::new(),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn lever_breakdown_prices_catalog_tiers_for_pinned_models() {
+        let def = tiered_single_model_def();
+        let est = estimate_workflow(&def, &json!("hello world"));
+
+        let node = est
+            .per_node
+            .iter()
+            .find(|n| n.cost_usd.is_some())
+            .expect("the projected gpt-5.5 node");
+        let levers = node.levers.as_ref().expect("the lever breakdown");
+        // gpt-5.5 carries both a Flex and a Batch tier in the catalog.
+        let flex = levers.flex_cost_usd.expect("flex figure");
+        let batch = levers.batch_cost_usd.expect("batch figure");
+        // Both are discounted rates over the SAME token profile: strictly
+        // below the standard figure (5/30 vs 2.5/15).
+        assert!(flex < node.cost_usd.unwrap(), "flex={flex}");
+        assert!(batch < node.cost_usd.unwrap(), "batch={batch}");
+        // Flex and batch sit at the SAME catalog rates for gpt-5.5.
+        assert!((flex - batch).abs() < 1e-12);
+
+        // The totals aggregate the single node.
+        assert_eq!(est.task_levers.flex_nodes, 1);
+        assert_eq!(est.task_levers.batch_nodes, 1);
+        assert!(est.task_levers.flex_total_usd < est.projected_cost_usd);
+        // The honesty notes are attached (each figure an admission estimate).
+        assert!(est
+            .task_lever_notes
+            .iter()
+            .any(|n| n.contains("admission estimates")));
+    }
+
+    #[test]
+    fn warm_prefix_bound_requires_a_pinned_cache_minimum() {
+        // Same catalog (min 1024) but a tiny prompt estimating far below the
+        // threshold: NO warm-prefix claim (never an optimistic saving the
+        // prefix cannot reach).
+        let def = tiered_single_model_def();
+        let est = estimate_workflow(&def, &json!("hi"));
+        let node = est
+            .per_node
+            .iter()
+            .find(|n| n.cost_usd.is_some())
+            .expect("the projected node");
+        let levers = node.levers.as_ref().unwrap();
+        assert!(
+            levers.warm_prefix_saved_usd.is_none(),
+            "below the cache minimum there is no warm-prefix bound: {levers:?}"
+        );
+        assert_eq!(est.task_levers.warm_prefix_nodes, 0);
+    }
+
+    #[test]
+    fn lever_breakdown_is_none_for_unprojected_nodes() {
+        let mut def = tiered_single_model_def();
+        if let Node {
+            kind: NodeKind::Model { selection, .. },
+            ..
+        } = &mut def.nodes[1]
+        {
+            *selection = ModelSelection::Route {
+                route_ref: "r".into(),
+            };
+        }
+        let est = estimate_workflow(&def, &json!("x"));
+        let route_node = est
+            .per_node
+            .iter()
+            .find(|n| n.cost_usd.is_none())
+            .expect("the route node");
+        assert!(route_node.levers.is_none());
     }
 }
