@@ -359,20 +359,25 @@ pub(crate) async fn apply_routing(
         .and_then(|p| p.pricing(&req.model))
         .map(|pr| estimate_cost_usd(&pr, input_tokens, req.max_tokens));
 
-    // Live, gateway-observed p95 upstream latency for the originally-requested
-    // `(provider, model)`, feeding the `upstream_latency_ms_p95_gt` condition.
-    // `None` until the in-process rolling window has enough samples for this key
-    // (cold start) — which makes the latency condition FALSE, never a fabricated
-    // match. Computed once here (all routes evaluate the same requested model).
-    let observed_p95_ms = if provider_id.is_empty() {
+    // Compare the incoming operation with its own local history. Buffered
+    // completion is not stream establishment; cold/expired evidence must not
+    // borrow another population. Compute one snapshot for the decision and log.
+    let latency_operation = tt_routing::LatencyOperation::for_streaming(req.stream);
+    let latency_evidence = if provider_id.is_empty() {
         None
     } else {
-        state.latency_tracker.p95(
-            provider_id,
-            &req.model,
-            tt_routing::LatencyOperation::StreamEstablishment,
-        )
+        state
+            .latency_tracker
+            .evidence(provider_id, &req.model, latency_operation)
     };
+    let observed_p95_ms = latency_evidence.as_ref().and_then(|e| e.p95_ms);
+    tracing::debug!(
+        provider = provider_id,
+        latency_operation = latency_operation.as_str(),
+        latency_scope = "instance",
+        latency_evidence = ?latency_evidence,
+        "latency routing evidence: successful direct dispatch groups; first-token and timeout coverage unmeasured"
+    );
 
     // Forced routing has its own trace mode: it does not evaluate conditions or
     // imply that condition/priority selected the named route. Normal routing

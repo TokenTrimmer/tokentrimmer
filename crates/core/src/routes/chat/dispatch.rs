@@ -220,8 +220,8 @@ pub(super) async fn handle_streaming(
                 .await;
                 let __elapsed = __started.elapsed();
                 crate::metrics::record_provider_latency(provider.id(), "chat_stream", __elapsed);
-                // Feed the rolling p95 window on successful stream establishment
-                // (time-to-first-byte). See the non-streaming hook above.
+                // Stream-handle readiness includes retries/backoff, not first
+                // output token. Buffered completion has a separate population.
                 if __stream_result.is_ok() {
                     let __ms = u32::try_from(__elapsed.as_millis()).unwrap_or(u32::MAX);
                     state.latency_tracker.record(
@@ -917,10 +917,9 @@ async fn complete_once_with_retry_policy(
                 with_retry(retry_policy, || provider.chat_completion(req.clone(), ctx)).await;
             let __elapsed = __started.elapsed();
             crate::metrics::record_provider_latency(provider.id(), "chat", __elapsed);
-            // Feed the rolling p95 window (the live signal behind the
-            // `upstream_latency_ms_p95_gt` route condition) on success only —
-            // errored/short-circuited dispatches aren't representative
-            // upstream latency. Keyed by the served `(provider, model)`.
+            // Successful direct-dispatch duration includes retries/backoff.
+            // Errors/timeouts and failover paths are not in this population;
+            // this conditional p95 is not an all-attempt latency/SLO measure.
             if __dispatch.is_ok() {
                 let __ms = u32::try_from(__elapsed.as_millis()).unwrap_or(u32::MAX);
                 state.latency_tracker.record(
