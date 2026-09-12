@@ -39,64 +39,11 @@ use chrono::{DateTime, Utc};
 use tt_shared::{ChatCompletionRequest, ContentPart, Message, MessageContent};
 use uuid::Uuid;
 
-use crate::response_codec::{L2Open, ResponseCodec};
+use crate::response_codec::ResponseCodec;
 use crate::CacheError;
 
-// ---------------------------------------------------------------------------
-// At-rest response encoding (SEC-2)
-// ---------------------------------------------------------------------------
-
-/// Encode a plaintext response payload into the `serde_json::Value` that goes
-/// into the L2 `response` column.
-///
-/// - With a wired [`ResponseCodec`], returns a self-describing **encrypted
-///   envelope** value bound to `org_id` + the row `id` (the embedding and all
-///   other columns stay plaintext).
-/// - Without a codec, parses the bytes into the plaintext JSON value exactly as
-///   the cache always has (fully back-compat).
-fn encode_response_value(
-    codec: Option<&ResponseCodec>,
-    org_id: Uuid,
-    id: Uuid,
-    response: &[u8],
-) -> Result<serde_json::Value, CacheError> {
-    match codec {
-        Some(codec) => Ok(codec.seal_response_json(org_id, id, response)?),
-        None => serde_json::from_slice::<serde_json::Value>(response).map_err(CacheError::Serde),
-    }
-}
-
-/// Decode the stored `response` value back into plaintext response bytes,
-/// honoring an optional at-rest codec.
-///
-/// Returns `None` to signal the entry must be **skipped** (treated as a cache
-/// miss): an encrypted envelope that does not authenticate (wrong key/org/row),
-/// or an encrypted row read by a cache with no codec wired. A legacy plaintext
-/// row is always readable (fail-open) whether or not a codec is wired.
-fn decode_response_value(
-    codec: Option<&ResponseCodec>,
-    org_id: Uuid,
-    id: Uuid,
-    stored: &serde_json::Value,
-) -> Option<Vec<u8>> {
-    match codec {
-        Some(codec) => match codec.open_response_json(org_id, id, stored) {
-            L2Open::Decrypted(plain) => Some(plain),
-            // Not an envelope → a pre-codec plaintext row: read it as-is.
-            L2Open::Plaintext => serde_json::to_vec(stored).ok(),
-            // Sealed but unreadable → skip rather than serve garbage.
-            L2Open::Undecryptable => None,
-        },
-        None => {
-            if ResponseCodec::is_encrypted_json(stored) {
-                // Encrypted at rest but no codec wired to open it → unservable.
-                None
-            } else {
-                serde_json::to_vec(stored).ok()
-            }
-        }
-    }
-}
+mod response_storage;
+use response_storage::{decode_response_bytes, decode_response_value, encode_response_value};
 
 // ---------------------------------------------------------------------------
 // Per-task-class thresholds
@@ -975,8 +922,8 @@ impl InMemoryL2Cache {
 
     /// Enable at-rest response encryption (SEC-2): cached responses are sealed
     /// with `codec` on insert and opened on lookup. The embedding stays
-    /// plaintext (similarity is unaffected) and legacy plaintext rows stay
-    /// readable. Default (un-wired) is plaintext, identical to today.
+    /// plaintext (similarity is unaffected). Legacy reads follow codec policy;
+    /// a strict codec rejects them as misses. Un-wired defaults remain plaintext.
     #[must_use]
     pub fn with_response_codec(mut self, codec: ResponseCodec) -> Self {
         self.response_codec = Some(codec);
@@ -1055,20 +1002,12 @@ impl L2Cache for InMemoryL2Cache {
         let Some((entry, sim)) = best else {
             return Ok(None);
         };
-        // No codec wired → today's behavior exactly: return the stored bytes
-        // unchanged (never round-trip through serde, never skip).
-        let Some(codec) = self.response_codec.as_ref() else {
-            return Ok(Some((entry.clone(), sim)));
-        };
-        // Reverse at-rest encryption (SEC-2). A sealed row that cannot be opened
-        // (wrong key/org) is skipped as a miss; a legacy plaintext row reads back
-        // as-is.
-        let stored: serde_json::Value = match serde_json::from_slice(&entry.response) {
-            Ok(v) => v,
-            // Non-JSON stored bytes can't be an envelope → treat as plaintext.
-            Err(_) => return Ok(Some((entry.clone(), sim))),
-        };
-        let Some(plain) = decode_response_value(Some(codec), org_id, entry.id, &stored) else {
+        let Some(plain) = decode_response_bytes(
+            self.response_codec.as_ref(),
+            org_id,
+            entry.id,
+            &entry.response,
+        ) else {
             return Ok(None);
         };
         let mut decoded = entry.clone();
@@ -1318,9 +1257,9 @@ impl PostgresL2Cache {
     /// Enable at-rest response encryption (SEC-2): the `cache_entries.response`
     /// JSONB is sealed with `codec` (a self-describing per-org envelope) on
     /// insert and opened on lookup. The embedding vector and every other column
-    /// stay plaintext, so pgvector similarity is unaffected. Pre-codec plaintext
-    /// rows stay readable (fail-open) and an undecryptable row is skipped as a
-    /// miss, so the codec can be turned on against a live cache.
+    /// stay plaintext, so pgvector similarity is unaffected. Legacy reads follow
+    /// codec policy. A rejected nearest candidate is a miss, not an automatic
+    /// purge or retry of another candidate; plan the TTL/purge rollout.
     ///
     /// Default (un-wired) is the historical plaintext behavior. Wiring this ON
     /// at the gateway cache-construction site is a one-line follow-up
@@ -1508,7 +1447,7 @@ impl L2Cache for PostgresL2Cache {
 
         // Reverse at-rest encryption (SEC-2). A sealed row that cannot be opened
         // (wrong key/org, or encrypted with no codec wired) is skipped as a cache
-        // miss; a pre-codec plaintext row reads back as-is.
+        // miss; legacy plaintext is readable only if codec policy allows it.
         let Some(response_bytes) =
             decode_response_value(self.response_codec.as_ref(), org_id, id, &response_json)
         else {

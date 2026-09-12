@@ -95,8 +95,7 @@ impl Default for InMemoryL1Cache {
 impl L1Cache for InMemoryL1Cache {
     /// Retrieve a cached value.  Expired entries are evicted and `None` is
     /// returned. With a wired codec, decrypts the value (a sealed value that
-    /// does not authenticate is a miss; a legacy plaintext value is returned
-    /// as-is).
+    /// does not authenticate is a miss; legacy plaintext follows codec policy).
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
         let org_id = org_from_l1_key(key);
         let purge_guard = self
@@ -124,7 +123,7 @@ impl L1Cache for InMemoryL1Cache {
             return Ok(None);
         };
         let Some(codec) = self.response_codec.as_ref() else {
-            return Ok(Some(bytes));
+            return Ok((!ResponseCodec::is_encrypted_l1(&bytes)).then_some(bytes));
         };
         match codec.open_l1_value(org_from_l1_key(key), key, &bytes) {
             L1Open::Plaintext => Ok(Some(bytes)),
