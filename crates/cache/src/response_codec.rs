@@ -24,17 +24,19 @@
 //! Only the **response payload** is encrypted. The L2 **embedding vector stays
 //! plaintext** — cosine similarity must still work — as do the embedding model,
 //! token counts, costs, and the 64-bit lexical sketch. The encrypted blob is the
-//! same data the verbatim response already exposed; the metadata columns were
-//! never the sensitive surface.
+//! response data is protected, not every cache field. Metadata and embeddings
+//! can still reveal sensitive information; this is not anonymization.
 //!
-//! # Back-compat / fail-open on legacy plaintext
+//! # Read policy and legacy data
 //!
-//! Both seal formats are self-describing, so a codec-enabled cache reads a
-//! pre-codec **plaintext** row transparently (it is not an envelope → returned
-//! as-is). A blob that IS an envelope but fails to decrypt (wrong key / wrong
-//! org) is treated as a cache MISS rather than served as garbage — the lookup
-//! skips it. Turning the codec OFF again leaves legacy plaintext readable and
-//! simply stops decrypting (encrypted rows become misses until they expire).
+//! Explicit `new` codecs retain self-hosted legacy-plaintext compatibility.
+//! `from_env` rejects plaintext reads when `TT_REQUIRE_ENCRYPTED_CACHE=1/true`;
+//! programmatic callers can opt into `reject_legacy_plaintext` as well. Rejected
+//! legacy entries become misses, not automatically encrypted or erased. Plan
+//! a bounded refill/TTL/purge rollout and its possible inference-cost increase.
+//! Marked malformed/unsupported envelopes always miss, even in compatibility
+//! mode. Disabling the codec does not make ciphertext readable. Ciphertext
+//! formats, tenant/context binding and encryption-on-write remain unchanged.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -62,6 +64,8 @@ const AAD_MAGIC: &[u8] = b"tt-cache:response:v1";
 /// always begins with `{` (`0x7b`); the leading `0x00` here can never collide,
 /// so a reader distinguishes an envelope from legacy bytes by this prefix alone.
 const L1_ENVELOPE_MAGIC: &[u8] = b"\x00tt-l1-enc:v1\x00";
+/// Reserve the namespace even for malformed/future L1 versions.
+const L1_ENVELOPE_PREFIX: &[u8] = b"\x00tt-l1-enc:";
 
 /// JSON key marking the **L2** envelope object. A legacy plaintext response is a
 /// `ChatCompletionResponse` object, which never carries this key, so a reader
@@ -83,25 +87,38 @@ pub enum ResponseCodecError {
 }
 
 /// Per-org at-rest encryption for cached responses. Cheap to clone; holds only
-/// the 32-byte master key. See the module docs for the at-rest posture.
+/// the master key and read policy. See the module docs for the at-rest posture.
 #[derive(Clone)]
 pub struct ResponseCodec {
     master_key: [u8; 32],
+    reject_legacy_plaintext: bool,
 }
 
 impl std::fmt::Debug for ResponseCodec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResponseCodec")
             .field("master_key", &"[REDACTED]")
+            .field("reject_legacy_plaintext", &self.reject_legacy_plaintext)
             .finish()
     }
 }
 
 impl ResponseCodec {
-    /// Build from a raw 32-byte master key.
+    /// Build from a raw key with self-hosted legacy-read compatibility.
     #[must_use]
     pub fn new(master_key: [u8; 32]) -> Self {
-        Self { master_key }
+        Self {
+            master_key,
+            reject_legacy_plaintext: false,
+        }
+    }
+
+    /// Refuse legacy plaintext as a cache miss; this does not purge or rewrite
+    /// existing entries. Encrypted writes are unchanged in either read policy.
+    #[must_use]
+    pub fn reject_legacy_plaintext(mut self) -> Self {
+        self.reject_legacy_plaintext = true;
+        self
     }
 
     /// Build from `TT_MASTER_KEY` (the same root key body-capture uses). Missing
@@ -109,9 +126,18 @@ impl ResponseCodec {
     /// behavior); malformed means an operator tried to enable it with an unusable
     /// root key (`Err`). The derived per-org cache key uses a cache-specific KDF
     /// domain, so it is independent of the body-capture key for the same org.
+    /// With a key, the gateway's existing TT_REQUIRE_ENCRYPTED_CACHE flag also
+    /// rejects legacy reads. Missing keys still return None; gateway wiring
+    /// disables unencrypted caches in the required-encryption role.
     pub fn from_env() -> Result<Option<Self>, ResponseCodecError> {
-        let Ok(hex_key) = std::env::var("TT_MASTER_KEY") else {
-            return Ok(None);
+        let hex_key = match std::env::var("TT_MASTER_KEY") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ResponseCodecError::BadMasterKey(
+                    "expected 32 hex-encoded bytes".into(),
+                ))
+            }
         };
         let bytes = hex::decode(hex_key.trim()).map_err(|_| {
             ResponseCodecError::BadMasterKey("expected 32 hex-encoded bytes".into())
@@ -119,7 +145,18 @@ impl ResponseCodec {
         let master_key: [u8; 32] = bytes.try_into().map_err(|_| {
             ResponseCodecError::BadMasterKey("expected 32 hex-encoded bytes".into())
         })?;
-        Ok(Some(Self { master_key }))
+        let codec = Self::new(master_key);
+        let required = std::env::var("TT_REQUIRE_ENCRYPTED_CACHE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        Ok(Some(if required {
+            codec.reject_legacy_plaintext()
+        } else {
+            codec
+        }))
+    }
+
+    pub(crate) fn allows_legacy_plaintext(&self) -> bool {
+        !self.reject_legacy_plaintext
     }
 
     // -- Low-level AEAD ------------------------------------------------------
@@ -215,19 +252,27 @@ impl ResponseCodec {
     }
 
     /// Outcome of inspecting an L2 `response` JSONB value with a codec.
-    /// [`Plaintext`](L2Open::Plaintext) means it is not our envelope (a legacy
-    /// row) — use the value as-is; [`Decrypted`](L2Open::Decrypted) carries the
-    /// recovered plaintext; [`Undecryptable`](L2Open::Undecryptable) means it IS
-    /// our envelope but did not authenticate (wrong key/org/row) — skip it.
+    /// Plaintext is returned only when legacy reads are allowed. Marked objects
+    /// must have the exact supported shape/version and authenticate; malformed,
+    /// unsupported, unauthentic or policy-rejected values are Undecryptable.
     pub fn open_response_json(&self, org_id: Uuid, id: Uuid, value: &Value) -> L2Open {
-        let Some(hex_blob) = value
+        let Some(object) = value
             .as_object()
             .filter(|o| o.contains_key(L2_ENVELOPE_KEY))
-            .and_then(|o| o.get("blob"))
-            .and_then(Value::as_str)
         else {
-            // Not our envelope → a legacy plaintext response row.
-            return L2Open::Plaintext;
+            return if self.reject_legacy_plaintext {
+                L2Open::Undecryptable
+            } else {
+                L2Open::Plaintext
+            };
+        };
+        // Recognize the marker BEFORE validating fields: a malformed marked
+        // object must never be downgraded to legacy plaintext.
+        if object.len() != 2 || object.get(L2_ENVELOPE_KEY).and_then(Value::as_u64) != Some(1) {
+            return L2Open::Undecryptable;
+        }
+        let Some(hex_blob) = object.get("blob").and_then(Value::as_str) else {
+            return L2Open::Undecryptable;
         };
         let Ok(blob) = hex::decode(hex_blob) else {
             return L2Open::Undecryptable;
@@ -266,20 +311,23 @@ impl ResponseCodec {
         Ok(out)
     }
 
-    /// `true` when `bytes` carry the L1 envelope magic prefix (an encrypted L1
-    /// value). Legacy plaintext L1 values are JSON and never start with the magic.
+    /// Recognizes the reserved L1 envelope namespace, including unsupported or
+    /// truncated versions. Legacy plaintext L1 JSON never starts with this prefix.
     #[must_use]
     pub fn is_encrypted_l1(bytes: &[u8]) -> bool {
-        bytes.starts_with(L1_ENVELOPE_MAGIC)
+        bytes.starts_with(L1_ENVELOPE_PREFIX)
     }
 
-    /// Inspect stored L1 bytes. Not an envelope → [`L1Open::Plaintext`] (legacy
-    /// row, return as-is). An envelope that authenticates → [`L1Open::Decrypted`];
-    /// one that does not → [`L1Open::Undecryptable`] (treat as a miss).
+    /// Inspect L1 bytes under the configured legacy-read policy. Unknown or
+    /// malformed reserved versions always miss; only v1 is decrypted.
     #[must_use]
     pub fn open_l1_value(&self, org_id: Uuid, key: &str, bytes: &[u8]) -> L1Open {
         let Some(body) = bytes.strip_prefix(L1_ENVELOPE_MAGIC) else {
-            return L1Open::Plaintext;
+            return if self.reject_legacy_plaintext || Self::is_encrypted_l1(bytes) {
+                L1Open::Undecryptable
+            } else {
+                L1Open::Plaintext
+            };
         };
         match self.open_raw(org_id, key.as_bytes(), body) {
             Ok(plain) => L1Open::Decrypted(plain),
@@ -295,7 +343,7 @@ pub enum L2Open {
     Plaintext,
     /// The envelope authenticated; carries the recovered response bytes.
     Decrypted(Vec<u8>),
-    /// The value is an envelope but did not authenticate (wrong key/org/row).
+    /// Malformed/unsupported/unauthentic envelope, or disallowed plaintext.
     Undecryptable,
 }
 
@@ -306,7 +354,7 @@ pub enum L1Open {
     Plaintext,
     /// The envelope authenticated; carries the recovered L1 value bytes.
     Decrypted(Vec<u8>),
-    /// The bytes are an envelope but did not authenticate.
+    /// Malformed/unsupported/unauthentic envelope, or disallowed plaintext.
     Undecryptable,
 }
 

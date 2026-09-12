@@ -2180,9 +2180,9 @@ fn redis_namespace(app_name: &str, component: &str) -> String {
 }
 
 /// S11: When `TT_REQUIRE_ENCRYPTED_CACHE=1` is set (the hosted role), the
-/// gateway refuses to start caches in plaintext mode — a missing `TT_MASTER_KEY`
-/// is a startup error, not a silent fallback. Self-hosted deployments leave
-/// this unset (labeled plaintext mode, backward-compatible).
+/// gateway disables keyless response caches rather than falling back to plaintext.
+/// With a codec, the same flag also rejects legacy plaintext reads. Unset keeps
+/// explicit self-hosted plaintext/legacy compatibility; it is not a purge.
 fn require_encrypted_cache() -> bool {
     std::env::var("TT_REQUIRE_ENCRYPTED_CACHE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2275,8 +2275,8 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                         Ok(None) => {
                             // S11: TT_REQUIRE_ENCRYPTED_CACHE=1 refuses to
                             // start the cache in plaintext. The hosted role
-                            // sets this so a missing key is a startup error,
-                            // not silent plaintext. Self-hosted deployments
+                            // sets this so a missing key disables this cache,
+                            // not silently enables plaintext. Self-hosted deployments
                             // may leave it unset (labeled plaintext mode).
                             if crate::require_encrypted_cache() {
                                 tracing::error!(

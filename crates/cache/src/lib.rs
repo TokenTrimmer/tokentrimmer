@@ -22,9 +22,10 @@
 //! builder on [`PostgresL2Cache`] / [`InMemoryL2Cache`] / [`RedisL1Cache`] /
 //! [`InMemoryL1Cache`] switches that tier to **encrypted-at-rest** (per-org
 //! XChaCha20-Poly1305, key derived from `TT_MASTER_KEY`); the embedding vector
-//! stays plaintext so similarity search is unaffected. Legacy plaintext rows
-//! stay readable (fail-open), so the codec can be enabled on a live cache. See
-//! [`response_codec`] for the format and the back-compat contract.
+//! stays plaintext so similarity search is unaffected. Legacy reads follow the
+//! codec policy: the gateway's required-encryption role refuses plaintext,
+//! while explicit self-hosted compatibility remains available. This does not
+//! purge old data. See [`response_codec`] for formats and rollout boundaries.
 //!
 //! [`ChatCompletionRequest`]: tt_shared::messages::ChatCompletionRequest
 //! [`RedisL1Cache`]: redis_impl::RedisL1Cache
