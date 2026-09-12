@@ -34,6 +34,9 @@ use uuid::Uuid;
 
 use crate::{CredentialError, ProviderCredentialStore};
 
+mod rotation;
+pub use rotation::CredentialRotationStats;
+
 /// Length of the XChaCha20-Poly1305 nonce (extended-nonce ChaCha20).
 const NONCE_LEN: usize = 24;
 
@@ -77,11 +80,14 @@ pub enum CredentialStoreError {
     #[error("invalid credential: {0}")]
     Invalid(String),
 
-    /// A rotation's compare-and-swap on a row found the ciphertext changed
-    /// mid-pass (S05). The transaction is rolled back — nothing was lost; the
-    /// operator re-runs the rotation, which is resumable by construction.
+    /// A rotation's compare-and-swap did not update exactly one row. The
+    /// current transaction rolls back; earlier batched commits remain resumable.
     #[error("credential row changed during rotation (concurrent update)")]
     ConcurrentModification,
+
+    /// Rotation batches must be bounded before any database work starts.
+    #[error("rotation batch size must be between 1 and 1000")]
+    InvalidRotationBatchSize,
 }
 
 /// Validate caller-supplied credential inputs before persisting. Rejects a
@@ -317,75 +323,6 @@ impl PostgresProviderCredentialStore {
             .decrypt(nonce, payload)
             .map_err(|_| CredentialStoreError::Decrypt)?;
         String::from_utf8(plain).map_err(|_| CredentialStoreError::Decrypt)
-    }
-
-    /// Re-encrypt every stored credential from this store's (current/OLD) master
-    /// key to `new_master_key`. Run this BEFORE promoting a new `TT_MASTER_KEY`:
-    /// build the store with the current key, call `reencrypt_all(&new_key)`,
-    /// then swap the env var and restart. Each row is decrypted under its old
-    /// per-row derived key and re-sealed under the new one (fresh nonce, same
-    /// `(org_id, provider)` AAD). Returns the number of rows re-encrypted.
-    /// This is the tooling the secret-rotation runbook (`docs/SECRETS.md`)
-    /// requires before a master-key swap.
-    ///
-    /// S05 concurrency: the scan and every re-encrypt UPDATE share ONE
-    /// transaction, and the rows are locked with `SELECT … FOR UPDATE` inside
-    /// it, so a concurrent [`Self::put`] blocks on the row lock and lands
-    /// AFTER the rotation commits (its write is preserved, under the NEW key —
-    /// see the read-modify-write note below). The earlier read-then-overwrite
-    /// shape read `secret_enc` before the transaction began and then updated
-    /// by bare id: a concurrent `put` between the read and the UPDATE was
-    /// silently clobbered with the OLD credential re-sealed under the new key
-    /// — a lost customer update. The UPDATE additionally guards on the exact
-    /// scanned ciphertext as a belt-and-braces compare-and-swap; a
-    /// rows_affected count other than 1 (impossible while the row lock is
-    /// held, since id is the PK) means the row changed under us and is
-    /// surfaced as an error rather than retried into data loss.
-    pub async fn reencrypt_all(
-        &self,
-        new_master_key: &[u8; 32],
-    ) -> Result<usize, CredentialStoreError> {
-        let mut tx = self.pool.begin().await?;
-        // FOR UPDATE inside the SAME transaction as the scan: no window
-        // between read and write. A concurrent `put`/`delete` on any row
-        // blocks here (upsert/insert paths write `secret_enc`) and therefore
-        // serializes after the rotation commit.
-        let rows: Vec<(Uuid, Uuid, String, Vec<u8>)> = sqlx::query_as(
-            r#"SELECT id, org_id, provider, secret_enc FROM provider_credentials
-               ORDER BY id FOR UPDATE"#,
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let mut count = 0usize;
-        for (id, org_id, provider, blob) in rows {
-            // Decrypt under the OLD master, re-seal under the NEW one. A bad row
-            // (truncated / wrong key) aborts the whole transaction — rotation is
-            // all-or-nothing so we never leave a half-rotated table.
-            let plain = decrypt_blob(&self.master_key, org_id, &provider, &blob)?;
-            let new_blob = encrypt_blob(new_master_key, org_id, &provider, &plain)?;
-            let updated = sqlx::query(
-                r#"UPDATE provider_credentials
-                   SET secret_enc = $1, rotated_at = now()
-                   WHERE id = $2 AND secret_enc = $3"#,
-            )
-            .bind(&new_blob)
-            .bind(id)
-            .bind(&blob)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            if updated != 1 {
-                // Unreachable while the row lock is held (this transaction owns
-                // the row), but a poisoned/stale plan or a future refactor that
-                // drops the lock must fail loudly instead of silently losing a
-                // concurrent credential update.
-                return Err(CredentialStoreError::ConcurrentModification);
-            }
-            count += 1;
-        }
-        tx.commit().await?;
-        Ok(count)
     }
 }
 
@@ -1760,15 +1697,9 @@ mod tests {
         let old_master = [5u8; 32];
         let new_master = [6u8; 32];
         let store = PostgresProviderCredentialStore::new(pool.clone(), old_master);
-        // reencrypt_all is a FULL-TABLE pass (by design — it is the runbook's
-        // whole-store rotation tool). A prior FAILED run of this very test can
-        // leave cohorts in a mixed key state (some rows already rotated to
-        // new masters from earlier run attempts with different masters), so
-        // start from a clean table and leave it clean even on panic paths via
-        // the start-of-test sweep here. Production never has mixed keys
-        // because the runbook performs exactly one rotation pass before
-        // promoting TT_MASTER_KEY; resumable batch rotation across mixed
-        // generations is tracked as the remaining S05 scope in the ledger.
+        // Legacy reencrypt_all retains its all-or-nothing full-table contract.
+        // This older fixture owns the disposable public table. New batched
+        // acceptance uses isolated schemas in tests/credential_rotation.rs.
         sqlx::query("DELETE FROM provider_credentials")
             .execute(&pool)
             .await
@@ -1795,8 +1726,8 @@ mod tests {
         assert_eq!(count, 2, "both rows rotated");
         // Both rows decrypt under the NEW master with the same values.
         for (org, secret) in [(org_a, "sk-a"), (org_b, "sk-b")] {
-            // Row-level claim (the read path is generation-aware at the
-            // CALLER — see the KeyGeneration envelope — so assert raw bytes):
+            // Ordinary reads still use ONE root, not a KeyGeneration ring.
+            // Verify the rotated bytes under the explicitly selected new root:
             let (blob,): (Vec<u8>,) = sqlx::query_as(
                 "SELECT secret_enc FROM provider_credentials WHERE org_id = $1 AND provider = 'openai'",
             )

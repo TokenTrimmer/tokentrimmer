@@ -59,7 +59,7 @@ import type { ClientOptions } from 'openai';
 export type TokenTrimmerClientOptions = ClientOptions & {
   defaultMaxTokens?: number;
 };
-import type { APIPromise } from 'openai/core/api-promise';
+import { APIPromise } from 'openai/core/api-promise';
 import { Stream } from 'openai/core/streaming';
 import type {
   ChatCompletion,
@@ -345,11 +345,15 @@ interface TokenTrimmerCreate {
   (
     body: ChatCompletionCreateParamsNonStreaming & TokenTrimmerExtraParams,
     options?: RequestOptions,
-  ): Promise<ChatCompletionWithMeta>;
+  ): APIPromise<ChatCompletionWithMeta>;
   (
     body: ChatCompletionCreateParamsStreaming & TokenTrimmerExtraParams,
     options?: RequestOptions,
-  ): Promise<TokenTrimmerStream>;
+  ): APIPromise<TokenTrimmerStream>;
+  (
+    body: ChatCompletionCreateParamsBase & TokenTrimmerExtraParams,
+    options?: RequestOptions,
+  ): APIPromise<ChatCompletionWithMeta | TokenTrimmerStream>;
   // Inherited OpenAI overloads (fallback):
   (body: ChatCompletionCreateParamsNonStreaming, options?: RequestOptions): APIPromise<ChatCompletion>;
   (
@@ -743,6 +747,9 @@ export class TokenTrimmer extends OpenAI {
 
   constructor(options: TokenTrimmerClientOptions = {}) {
     const { defaultMaxTokens, ...rest } = options;
+    if (defaultMaxTokens !== undefined && (!Number.isSafeInteger(defaultMaxTokens) || defaultMaxTokens <= 0)) {
+      throw new Error('defaultMaxTokens must be a positive safe integer');
+    }
     super({
       ...rest,
       apiKey: rest.apiKey ?? resolveApiKey(),
@@ -760,59 +767,61 @@ export class TokenTrimmer extends OpenAI {
     const completions = this.chat.completions as unknown as OpenAI.Chat.Completions;
     const originalCreate = completions.create.bind(completions);
 
-    const wrapped = async (
+    const wrapped = (
       body: ChatCompletionCreateParamsBase & TokenTrimmerExtraParams,
       options: RequestOptions = {},
-    ): Promise<ChatCompletionWithMeta | TokenTrimmerStream> => {
-      const { ttTag, ttCostLimit, ttCache, ...restBody } = body;
-      const params: ChatCompletionCreateParamsBase = restBody;
+    ): APIPromise<ChatCompletionWithMeta | TokenTrimmerStream> => {
+      try {
+        const { ttTag, ttCostLimit, ttCache, ...restBody } = body;
+        const params: ChatCompletionCreateParamsBase = restBody;
 
-      // Explicit explicit opt-in cap: only inject when the caller configured
-      // `defaultMaxTokens` and supplied no explicit output limit.
-      // Absent means the request goes to the gateway as-is.
-      if (
-        this.defaultMaxTokens !== undefined &&
-        params.max_tokens == null &&
-        params.max_completion_tokens == null
-      ) {
-        params.max_tokens = this.defaultMaxTokens;
-      }
-
-      const headers = toHeaders(options.headers);
-      if (ttTag !== undefined) headers.set('X-TokenTrimmer-Tag', ttTag);
-      if (ttCostLimit !== undefined) {
-        if (!Number.isFinite(ttCostLimit) || ttCostLimit <= 0) {
-          throw new Error(
-            `ttCostLimit must be a positive finite number; got ${String(ttCostLimit)}`,
-          );
+        // Only fill omitted limits. Explicit null is also caller intent, not
+        // permission to replace the provider's own default with our cap.
+        if (
+          this.defaultMaxTokens !== undefined &&
+          params.max_tokens === undefined &&
+          params.max_completion_tokens === undefined
+        ) {
+          params.max_tokens = this.defaultMaxTokens;
         }
-        headers.set('X-TokenTrimmer-Cost-Limit-Usd', String(ttCostLimit));
-      }
-      if (ttCache !== undefined) {
-        if (!VALID_CACHE_OVERRIDES.has(ttCache)) {
-          throw new Error(
-            `ttCache must be one of ${[...VALID_CACHE_OVERRIDES].join(', ')}; got ${String(ttCache)}`,
-          );
+
+        const headers = toHeaders(options.headers);
+        if (ttTag !== undefined) headers.set('X-TokenTrimmer-Tag', ttTag);
+        if (ttCostLimit !== undefined) {
+          if (!Number.isFinite(ttCostLimit) || ttCostLimit <= 0) {
+            throw new Error(
+              `ttCostLimit must be a positive finite number; got ${String(ttCostLimit)}`,
+            );
+          }
+          headers.set('X-TokenTrimmer-Cost-Limit-Usd', String(ttCostLimit));
         }
-        headers.set('X-TokenTrimmer-Cache', ttCache);
-      }
-      const callOpts: RequestOptions = { ...options, headers };
+        if (ttCache !== undefined) {
+          if (!VALID_CACHE_OVERRIDES.has(ttCache)) {
+            throw new Error(
+              `ttCache must be one of ${[...VALID_CACHE_OVERRIDES].join(', ')}; got ${String(ttCache)}`,
+            );
+          }
+          headers.set('X-TokenTrimmer-Cache', ttCache);
+        }
+        const callOpts: RequestOptions = { ...options, headers };
 
-      // Streaming: strip the terminal `tokentrimmer.usage` frame so chunk
-      // iteration stays clean, and surface its cost on the returned stream's
-      // `.tt` once drained.
-      if (params.stream === true) {
-        const stream = await originalCreate(params as ChatCompletionCreateParamsStreaming, callOpts);
-        return new TokenTrimmerStream(stream);
+        // Use the installed OpenAI APIPromise's transformation seam rather
+        // than async/await (which erases helpers) or an eager .then (which
+        // consumes asResponse's body). Parsing and augmentation happen once,
+        // only when awaited/withResponse'd; the raw response remains untouched.
+        return originalCreate(params, callOpts)._thenUnwrap((data, { response }) => {
+          if (params.stream === true) {
+            return new TokenTrimmerStream(data as Stream<ChatCompletionChunk>);
+          }
+          const withMeta = data as ChatCompletionWithMeta;
+          withMeta.tt = parseMeta(response.headers);
+          return withMeta;
+        });
+      } catch (error) {
+        // Preserve the previous asynchronous validation-failure contract,
+        // including when consumed through either inherited response helper.
+        return new APIPromise(this, Promise.reject(error));
       }
-
-      const { data, response } = await originalCreate(
-        params as ChatCompletionCreateParamsNonStreaming,
-        callOpts,
-      ).withResponse();
-      const withMeta = data as ChatCompletionWithMeta;
-      withMeta.tt = parseMeta(response.headers);
-      return withMeta;
     };
 
     // The OpenAI SDK's `create` is a heavily-overloaded method; replacing it

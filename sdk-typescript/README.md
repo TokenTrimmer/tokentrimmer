@@ -129,6 +129,34 @@ Because `TokenTrimmer` subclasses `openai.OpenAI`, sharing a single copy is requ
 for correct subclassing and TypeScript types. The package is developed and tested
 against the `^6` line; `^5` is not supported.
 
+### Response helpers and output limits
+
+`chat.completions.create()` returns an OpenAI `APIPromise`, not a native Promise:
+
+```ts
+const pending = client.chat.completions.create({
+  model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'Hello' }],
+  max_completion_tokens: 256,
+});
+const { data, response, request_id } = await pending.withResponse();
+console.log(data.tt.costUsd, response.status, request_id);
+```
+
+`.asResponse()` returns the **unconsumed raw response** without parsing JSON or
+stripping streaming usage frames. As with OpenAI, choose raw-body consumption or
+parsed data; consuming the raw body first prevents subsequently parsing it.
+`.withResponse()` also works for streams; its `data.tt` remains `null` until the
+terminal usage frame is consumed. Early cancellation does not invent a final cost.
+Request `signal` and the stream's `controller.abort()` remain supported.
+
+No output cap is added by default. Prefer a per-request limit appropriate to the
+model/operation. `defaultMaxTokens: 1024` is an optional **positive integer**
+constructor setting for applications that deliberately want a common
+`max_tokens` fallback. Explicit `max_tokens`, `max_completion_tokens`, and `null`
+are preserved; reasoning models that require `max_completion_tokens` should use
+that field explicitly rather than the common fallback. This is a token limit,
+not a guaranteed invoice ceiling.
+
 ### Streaming
 
 Streaming works as usual; per-request cost is on the stream's `.tt` once it's drained (the Gateway's terminal usage frame is stripped, so chunk iteration is clean):

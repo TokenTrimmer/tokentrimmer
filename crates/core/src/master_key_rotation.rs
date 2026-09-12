@@ -1,8 +1,10 @@
 //! Shared database boot/readiness fence for `TT_MASTER_KEY` rotation.
 //!
-//! The hosted rotator writes only domain-separated key fingerprints to
+//! A reviewed coordinator must write only domain-separated key fingerprints to
 //! `public.master_key_rotation`. The gateway never performs a rotation; it
-//! consumes that journal so an interrupted pass or stale root cannot serve.
+//! consumes the journal so an interrupted pass or stale root fails boot/readiness.
+//! This consumer does not establish that an all-family rotator exists or stop
+//! already-running writers. The Cloud consumer shares the fingerprint vector.
 
 use anyhow::{bail, Context};
 use sha2::{Digest, Sha256};

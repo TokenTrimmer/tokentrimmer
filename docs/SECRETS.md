@@ -61,7 +61,16 @@ The public crate exposes two useful re-encryption primitives:
 
 - **`tt_auth::postgres::PostgresProviderCredentialStore::reencrypt_all(&new_master_key)`**
   (crates/auth/src/postgres.rs) — re-seals every `provider_credentials` row in a
-  single all-or-nothing transaction; returns the row count.
+  single all-or-nothing transaction; returns the row count. The additional
+  **`reencrypt_all_batched(&new_master_key, batch_size)`** in
+  `crates/auth/src/postgres/rotation.rs` limits each committed page to 1–1000
+  rows, authenticates old/new mixtures and returns `CredentialRotationStats`
+  (`scanned`, `reencrypted`, `already_current`, `batches`). Re-run from the
+  beginning with the same roots after interruption; already-current blobs and
+  timestamps are not rewritten. A bad row rolls back its page, not prior pages.
+  Row locks plus ciphertext CAS preserve concurrent updates, but an old-root
+  writer can still write old-root ciphertext after commit: stop all writers
+  and readers before maintenance. This is **not** versioned runtime overlap.
 - **`tt_telemetry::body_capture::postgres::PostgresBodyCaptureWriter::reencrypt_all(&new_master_key)`**
   (crates/telemetry/src/body_capture.rs, behind the `postgres` feature) — re-seals
   every `request_body_captures` row in keyset-paginated batches, each committed

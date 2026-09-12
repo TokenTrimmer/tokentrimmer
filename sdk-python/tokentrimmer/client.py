@@ -255,6 +255,12 @@ class TokenTrimmer(OpenAI):
         default), no cap is injected — the request goes to the Gateway exactly
         as the caller wrote it.
         """
+        if default_max_tokens is not None and (
+            isinstance(default_max_tokens, bool)
+            or not isinstance(default_max_tokens, int)
+            or default_max_tokens <= 0
+        ):
+            raise ValueError("default_max_tokens must be a positive integer")
         # API-key precedence: explicit `api_key` arg > TOKENTRIMMER_API_KEY env >
         # the base OpenAI SDK's own OPENAI_API_KEY fallback (which kicks in when
         # we pass api_key=None). We only consult TOKENTRIMMER_API_KEY when the
@@ -294,6 +300,12 @@ class TokenTrimmer(OpenAI):
         # Capture with_raw_response.create BEFORE patching completions.create,
         # so it references the original underlying method and does not recurse.
         raw_response_create = completions.with_raw_response.create
+        # This is also a cached resource whose constructor captures `create`.
+        # Materialize it before patching; otherwise its lazy first access wraps
+        # our eager parsed-result path and its context manager receives a
+        # ChatCompletion instead of an APIResponse (headers/close then fail).
+        # Both native raw helpers intentionally retain the OpenAI-only surface.
+        _ = completions.with_streaming_response
 
         def create(*args: Any, **kwargs: Any) -> Any:
             # Explicit opt-in cap: only inject when the caller configured

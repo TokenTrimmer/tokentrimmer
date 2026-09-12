@@ -1,9 +1,13 @@
 # Releasing `tokentrimmer` to PyPI
 
-The Python SDK is published to PyPI as [`tokentrimmer`](https://pypi.org/project/tokentrimmer/)
-by the [`release-pypi.yml`](../.github/workflows/release-pypi.yml) workflow,
+The release workflow is configured to publish the Python SDK to PyPI as
+[`tokentrimmer`](https://pypi.org/project/tokentrimmer/) via the [`release-pypi.yml`](../.github/workflows/release-pypi.yml) workflow,
 which triggers on a `py-v*` tag and authenticates via **PyPI Trusted Publishing
 (OIDC)** — there is **no API token to store**.
+
+A read-only registry check on 2026-09-12 returned HTTP 404 for this package.
+Clean-installed local wheels are verified; registry publication and provenance
+are still pending. A 404 does not establish ownership or reserve the name.
 
 ## One-time setup (USER-GATED — do this once before the first release)
 
@@ -57,7 +61,14 @@ publishes to PyPI via `pypa/gh-action-pypi-publish` (OIDC).
 ```bash
 python -m build --outdir dist sdk-python   # builds sdist + wheel
 python -m twine check dist/*               # validates metadata + README rendering
+uv run --no-project python sdk-python/scripts/verify-installed.py
 ```
+
+The installed check builds a wheel and tests isolated environments with OpenAI
+1.70.0, latest supported 1.x and latest supported 2.x. It uses in-process HTTP
+fixtures for metadata, output limits, native raw helpers and stream closure;
+`python -I` prevents accidentally testing source instead of the installed wheel.
+This is not PyPI publication/provenance or hosted endpoint acceptance.
 
 > Do **not** run `twine upload` locally — publishing is the workflow's job via
 > Trusted Publishing, and a manual upload would not have provenance.

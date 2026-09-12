@@ -25,6 +25,8 @@ jobs:
         run: uv run --project sdk-python --locked python -m py_compile examples/python/*.py
       - name: Test
         run: uv run --directory sdk-python --locked python -m pytest tests/ -q
+      - name: Test clean-installed wheel (OpenAI floor and supported major lines)
+        run: uv run --no-project python sdk-python/scripts/verify-installed.py
 
   typescript:
     runs-on: ubuntu-latest
@@ -41,6 +43,8 @@ jobs:
         run: cd sdk-typescript && npm run typecheck
       - name: Test
         run: cd sdk-typescript && npx vitest run
+      - name: Test clean-installed tarball and declarations (OpenAI floor and latest 6.x)
+        run: cd sdk-typescript && npm run test:installed
       - name: Typecheck examples
         run: cd examples/typescript && ../../sdk-typescript/node_modules/.bin/tsc -p tsconfig.json
 

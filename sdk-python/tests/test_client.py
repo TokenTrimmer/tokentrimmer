@@ -192,6 +192,33 @@ def test_explicit_max_completion_tokens_wins_over_default():
     assert body["max_completion_tokens"] == 256
 
 
+@pytest.mark.parametrize("value", [True, False, 0, -1, 0.5, float("inf"), float("nan"), "32"])
+def test_invalid_default_output_cap_refused(value):
+    with pytest.raises(ValueError, match="default_max_tokens"):
+        TokenTrimmer(api_key="tt_test", default_max_tokens=value)
+
+
+@respx.mock
+def test_explicit_null_output_cap_is_not_replaced():
+    route = _completion_route()
+    with TokenTrimmer(api_key="tt_test", base_url=GATEWAY, default_max_tokens=32) as client:
+        client.chat.completions.create(model="m", messages=[], max_tokens=None)
+    assert json.loads(route.calls.last.request.content)["max_tokens"] is None
+
+
+@respx.mock
+def test_native_streaming_response_helper_remains_lazy_and_closable():
+    route = _completion_route()
+    with _client() as client:
+        context = client.chat.completions.with_streaming_response.create(model="m", messages=[])
+        assert not route.called
+        with context as response:
+            assert response.headers["x-tokentrimmer-trace-id"] == "trace-1"
+            assert response.parse().id == "chatcmpl-1"
+        assert response.is_closed
+    assert route.call_count == 1
+
+
 @respx.mock
 def test_tt_tag_cost_limit_and_cache_lift_to_headers():
     route = _completion_route()
