@@ -121,6 +121,23 @@ bounded responder copy; use stable reason codes and the actual request result
 for machine decisions. The batch removes cross-process drift, but composite
 stores and runtime configuration are still not one transaction.
 
+## Output limits and raw response helpers
+
+No output cap is added by default. Prefer an explicit, model-appropriate
+`max_tokens` or `max_completion_tokens` on each call. The optional positive-integer
+constructor setting `default_max_tokens=1024` fills `max_tokens` only when no
+limit argument is supplied; explicit values and `None` are preserved. Models
+requiring `max_completion_tokens` should supply it explicitly. A token limit is
+not a guaranteed invoice ceiling.
+
+The native OpenAI `chat.completions.with_raw_response.create(...)` and
+`chat.completions.with_streaming_response.create(...)` interfaces remain available
+for headers and raw body inspection. These are **OpenAI-only** interfaces: they
+bypass the `tt_*` convenience arguments, default-cap injection, `.tt` augmentation
+and usage-frame filtering. Use ordinary `chat.completions.create(...)` for those
+extensions; use native `extra_headers` and explicit limits on the raw interfaces.
+The streaming-response context manager is lazy and closes the response on exit.
+
 ## Streaming
 
 Streaming works as usual; per-request cost is on the stream's `.tt` once it's drained (the Gateway's terminal usage frame is stripped, so chunk iteration is clean):

@@ -48,7 +48,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:installed": "node scripts/verify-installed.mjs"
   },
   "peerDependencies": {
     "openai": "^6.45.0",

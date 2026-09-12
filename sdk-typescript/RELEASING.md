@@ -1,11 +1,15 @@
 # Releasing `@tokentrimmer/client` to npm
 
-The TypeScript SDK is published to npm as
-[`@tokentrimmer/client`](https://www.npmjs.com/package/@tokentrimmer/client) by
+The release workflow is configured to publish the TypeScript SDK to npm as
+[`@tokentrimmer/client`](https://www.npmjs.com/package/@tokentrimmer/client) via
 the [`release-npm.yml`](../.github/workflows/release-npm.yml) workflow, which
 triggers on a `ts-v*` tag. It publishes with **npm provenance** (`--provenance`,
 OIDC-attested) and **public access** (`--access public`, required because the
 package is scoped under `@tokentrimmer`).
+
+A read-only registry check on 2026-09-12 returned HTTP 404 for this package.
+Clean-installed local tarballs are verified; registry publication and provenance
+are still pending. A 404 does not establish ownership or reserve the name.
 
 npm registry auth still uses an **`NPM_TOKEN` secret** (npm's own OIDC trusted
 publishing is newer/less universally available; a token is the safe path today).
@@ -56,9 +60,16 @@ tarball to the GitHub Release, then `npm publish --provenance --access public`.
 cd sdk-typescript
 npm install
 npm run build
+npm run test:installed # packs, clean-installs and tests OpenAI 6.45.0 + latest 6.x
 npm pack --dry-run    # shows the exact tarball contents (dist/, README, LICENSE)
 npm pack             # produces the installable tarball (e.g. tokentrimmer-client-0.1.0.tgz)
 ```
+
+The installed check also compiles consumer TypeScript against the packed
+`.d.ts` files. It tests response helpers, metadata, explicit/omitted limits,
+request abort and stream cancellation without provider traffic; dependency
+installation uses npm but publication never runs. This does not establish
+registry availability, release provenance, or hosted endpoint acceptance.
 
 > Do **not** run `npm publish` locally — publishing (with provenance) is the
 > workflow's job. The `.tgz` produced by `npm pack` can be shared or installed
