@@ -75,7 +75,7 @@ class ApiMeteredEvidenceInvoiceReconciled:
 ApiMeteredEvidence = Union[ApiMeteredEvidenceBilled, ApiMeteredEvidenceEstimated, ApiMeteredEvidenceInvoiceReconciled]
 
 
-Capability = Literal["text", "vision", "audio", "tools", "json_mode", "streaming", "reasoning", "prompt_caching"]
+Capability = Union[Literal["strict_json_schema"], Literal["text", "vision", "audio", "tools", "json_mode", "streaming", "reasoning", "prompt_caching"]]
 
 
 ExpectedAgentCostBasis = Literal["api_metered", "subscription", "self_hosted"]
@@ -161,6 +161,7 @@ class ModelPricing:
     input_per_million: float
     output_per_million: float
     prompt_cache_min_tokens: Optional[int]
+    verified_at: Optional[str] = None
 
 
 @dataclass(frozen=True)

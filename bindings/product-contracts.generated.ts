@@ -71,7 +71,7 @@ export type BudgetPolicy = {
   on_exceed?: OnExceed;
 };
 
-export type Capability = "text" | "vision" | "audio" | "tools" | "json_mode" | "streaming" | "reasoning" | "prompt_caching";
+export type Capability = "text" | "vision" | "audio" | "tools" | "json_mode" | "streaming" | "reasoning" | "prompt_caching" | "strict_json_schema";
 
 export type CapabilityReason = {
   code: string;
@@ -142,6 +142,7 @@ export type ModelPricing = {
   input_per_million: number;
   output_per_million: number;
   prompt_cache_min_tokens: number | null;
+  verified_at?: string | null;
 };
 
 export type ModelSelection = {
@@ -331,6 +332,7 @@ export type RouteConditions = {
   prompt_contains_any_of?: Array<string>;
   tag_equals?: string | null;
   upstream_latency_ms_p95_gt?: number | null;
+  workload?: string | null;
 };
 
 export type RoutePanel = {

@@ -122,6 +122,11 @@
     "Aggregates": {
       "description": "Point-estimate aggregates the replay produces.",
       "properties": {
+        "batch_opportunity_usd": {
+          "description": "Total HYPOTHETICAL USD savings if every Batch-eligible request were migrated to the async Batch API. SEPARATE from `projected_savings_usd` (which contains only what the synchronous gateway actually realizes). A batch-eligibility route cannot increase this headline (C03).",
+          "format": "double",
+          "type": "number"
+        },
         "cache_hit_rate_projected": {
           "description": "Fraction of requests projected to be cache hits, 0–1.",
           "format": "double",
@@ -165,7 +170,7 @@
           "type": "number"
         },
         "projected_savings_usd": {
-          "description": "`max(0, baseline - projected)` — never negative.",
+          "description": "`max(0, baseline - projected)` — never negative. Contains ONLY synchronous-gateway-realized savings — the hypothetical Batch API opportunity is tracked separately in `batch_opportunity_usd` (C03).",
           "format": "double",
           "type": "number"
         },
@@ -199,6 +204,7 @@
         }
       },
       "required": [
+        "batch_opportunity_usd",
         "cache_hit_rate_projected",
         "p50_latency_ms_projected",
         "p95_latency_ms_projected",
@@ -489,6 +495,14 @@
         },
         "batch_output_per_million": {
           "description": "USD per 1M batch (async Batch API) output tokens. See [`Self::batch_input_per_million`].",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cache_write_per_million": {
+          "description": "USD per 1M prompt-cache **write** tokens (e.g. Anthropic's cache-creation input, typically ~1.25× the base input rate). `None` = no separate cache-write tier; the replay then charges cache-write tokens at the standard `input_per_million` rate. Mirrors `tt_shared::pricing::ModelPricing::cache_write_per_million`. Skipped from JSON when `None` so existing snapshots stay byte-identical.",
           "format": "double",
           "type": [
             "number",
@@ -975,10 +989,28 @@
             "null"
           ]
         },
+        "cache_creation_input_tokens": {
+          "description": "Tokens written to the provider's prompt cache during this request (Anthropic `cache_creation_input_tokens`). `None` on legacy/adapter rows; when present, these tokens bill at the [`ModelPricing::cache_write_per_million`](crate::types::ModelPricing) rate rather than the standard input rate. NEW in C02 — serde `default` keeps existing snapshots deserializable.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "cache_layer": {
           "description": "`\"l1\"` | `\"l2\"` | `None`. Constrained to the same set as the DB CHECK.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "cache_read_input_tokens": {
+          "description": "Tokens read from the provider's prompt cache (Anthropic `cache_read_input_tokens`). When present, this supersedes `cached_tokens` for cache-read pricing (which cannot distinguish reads from the collapsed legacy `cached_tokens` count).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
             "null"
           ]
         },

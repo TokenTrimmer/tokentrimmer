@@ -24,6 +24,7 @@ export type AgenticBudget = {
 };
 
 export type Aggregates = {
+  batch_opportunity_usd: number;
   cache_hit_rate_projected: number;
   l2_per_class?: Array<PerClassL2Metrics>;
   l2_poisoning_candidates?: number;
@@ -80,6 +81,7 @@ export type L2TaskClass = "chat_completions";
 export type ModelPricing = {
   batch_input_per_million?: number | null;
   batch_output_per_million?: number | null;
+  cache_write_per_million?: number | null;
   cached_input_per_million?: number | null;
   flex_input_per_million?: number | null;
   flex_output_per_million?: number | null;
@@ -160,7 +162,9 @@ export type QualityResult = {
 export type RequestLog = {
   baseline_cost_usd: number;
   body?: string | null;
+  cache_creation_input_tokens?: number | null;
   cache_layer?: string | null;
+  cache_read_input_tokens?: number | null;
   cached: boolean;
   cached_tokens: number;
   cost_usd: number;
