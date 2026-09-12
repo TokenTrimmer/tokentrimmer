@@ -3,16 +3,16 @@
 //!
 //! # Why this exists
 //!
-//! The public gateway has **no p95 latency data at routing-decision time**:
-//! `request_logs` (the only persisted latency record) is cloud-only and written
-//! fire-and-forget *after* the response, so it cannot inform a route picked
-//! *before* dispatch. A latency-aware condition backed by nothing would either
-//! always match or never match — a no-op masquerading as a feature.
+//! Routing uses a live in-process observation window rather than querying a
+//! persisted request-log aggregate for each decision. A missing signal must be
+//! unknown, not an invented zero or a measurement from another operation.
 //!
 //! [`LatencyTracker`] makes the signal real and local: the gateway records every
-//! upstream `upstream_latency_ms` it already measures into a bounded, in-process
-//! rolling window keyed by `(provider, model)`, and the routing engine queries
-//! that window's live p95 when evaluating the condition.
+//! observed dispatch duration into an in-process window keyed by provider,
+//! model and operation. Routing consults the incoming request's operation.
+//! Streaming establishment is stream-handle readiness, not first output token.
+//! Gateway wiring currently records successful direct dispatch groups including
+//! retries/backoff, not every attempt, timeout or failover. This is not an SLO.
 //!
 //! # Semantics (cold-start safe)
 //!
@@ -20,7 +20,8 @@
 //!   [`WINDOW_CAPACITY`] samples per `(provider, model)` are retained, so the
 //!   p95 reflects *current* upstream behavior, not all-time history. It is
 //!   per-instance: a multi-replica gateway maintains one window per replica
-//!   (acceptable — each replica routes on what it has itself observed).
+//!   (each replica routes on what it has itself observed). This bounds each
+//!   window, not the total keyspace; expired keys are not reclaimed here.
 //! - [`LatencyTracker::p95`] returns `None` until at least [`MIN_SAMPLES`]
 //!   observations exist for that key. A condition consulting it therefore treats
 //!   **insufficient data as "do not match"** (cold start → the slow-primary
@@ -35,10 +36,9 @@ use std::time::{Duration, Instant};
 /// and keeps the p95 responsive to recent behavior rather than all-time history.
 pub const WINDOW_CAPACITY: usize = 256;
 
-/// Minimum samples before [`LatencyTracker::p95`] returns a value. Below this,
-/// the percentile is statistically meaningless, so the tracker reports `None`
-/// and latency conditions stay FALSE (cold start). 20 keeps a fresh key from
-/// firing on one or two slow outliers.
+/// Policy minimum before [`LatencyTracker::p95`] returns a value. Below this,
+/// the tracker reports None and conditions stay false. This floor is not a
+/// calibrated confidence bound or a guarantee against noisy tail estimates.
 pub const MIN_SAMPLES: usize = 20;
 
 /// Maximum age of a latency sample before it is excluded from the p95.
@@ -49,6 +49,23 @@ pub const MAX_SAMPLE_AGE: Duration = Duration::from_secs(300);
 /// Number of shards. Sharding the keyspace across independent locks keeps the
 /// hot record path from contending on a single global lock under load.
 const SHARD_COUNT: usize = 16;
+
+/// One consistent, instance-local view of the retained/fresh window. Ages are
+/// relative to a monotonic clock and cover fresh samples only. This does not
+/// manufacture first-token, failure/timeout-rate or fleet-wide evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatencyEvidence {
+    pub scope: &'static str,
+    pub operation: LatencyOperation,
+    pub window_seconds: u64,
+    pub capacity: usize,
+    pub minimum_samples: usize,
+    pub retained_samples: usize,
+    pub sample_count: usize,
+    pub newest_sample_age_ms: Option<u64>,
+    pub oldest_sample_age_ms: Option<u64>,
+    pub p95_ms: Option<u32>,
+}
 
 /// One observed latency sample with its capture time.
 #[derive(Debug, Clone, Copy)]
@@ -78,44 +95,52 @@ impl Window {
         }
     }
 
-    /// p95 of the current **fresh** (under [`MAX_SAMPLE_AGE`]) samples,
-    /// or `None` when fewer than [`MIN_SAMPLES`] fresh observations exist.
-    /// Uses the nearest-rank method on a sorted copy.
-    fn p95(&self) -> Option<u32> {
-        let now = Instant::now();
-        let fresh: Vec<u32> = self
-            .samples
-            .iter()
-            .filter(|s| now.duration_since(s.at) < MAX_SAMPLE_AGE)
-            .map(|s| s.ms)
-            .collect();
-        let n = fresh.len();
-        if n < MIN_SAMPLES {
-            return None;
+    fn evidence_at(&self, operation: LatencyOperation, now: Instant) -> LatencyEvidence {
+        let mut fresh = Vec::with_capacity(self.samples.len());
+        let mut newest: Option<u64> = None;
+        let mut oldest: Option<u64> = None;
+        for sample in &self.samples {
+            let Some(age) = now.checked_duration_since(sample.at) else {
+                continue;
+            };
+            if age >= MAX_SAMPLE_AGE {
+                continue;
+            }
+            let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
+            newest = Some(newest.map_or(age_ms, |value| value.min(age_ms)));
+            oldest = Some(oldest.map_or(age_ms, |value| value.max(age_ms)));
+            fresh.push(sample.ms);
         }
-        let mut sorted = fresh;
-        sorted.sort_unstable();
-        let rank = ((0.95_f64 * n as f64).ceil() as usize).clamp(1, n);
-        Some(sorted[rank - 1])
-    }
-
-    /// Count of *fresh* samples (mainly for tests/telemetry).
-    fn fresh_count(&self) -> usize {
-        let now = Instant::now();
-        self.samples
-            .iter()
-            .filter(|s| now.duration_since(s.at) < MAX_SAMPLE_AGE)
-            .count()
+        let n = fresh.len();
+        let p95_ms = if n < MIN_SAMPLES {
+            None
+        } else {
+            fresh.sort_unstable();
+            let rank = ((0.95_f64 * n as f64).ceil() as usize).clamp(1, n);
+            Some(fresh[rank - 1])
+        };
+        LatencyEvidence {
+            scope: "instance",
+            operation,
+            window_seconds: MAX_SAMPLE_AGE.as_secs(),
+            capacity: WINDOW_CAPACITY,
+            minimum_samples: MIN_SAMPLES,
+            retained_samples: self.samples.len(),
+            sample_count: n,
+            newest_sample_age_ms: newest,
+            oldest_sample_age_ms: oldest,
+            p95_ms,
+        }
     }
 }
 
 /// Type of upstream operation being measured. Prevents mixing fundamentally
-/// different latency signals (time-to-first-byte vs full completion) into one
+/// different signals (stream-handle readiness vs buffered completion) into one
 /// distribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LatencyOperation {
-    /// Time to establish a streaming response (first chunk / stream ready).
-    /// Measures connection + upstream queue, not generation time.
+    /// Time until the provider returns a stream handle, including configured
+    /// retries/backoff. This is not TCP connect time or first output token.
     StreamEstablishment,
     /// Time to receive a full buffered (non-streaming) completion. Includes
     /// generation time; NOT comparable with [`StreamEstablishment`].
@@ -123,6 +148,23 @@ pub enum LatencyOperation {
 }
 
 impl LatencyOperation {
+    /// Match the operation recorded by dispatch, without borrowing another
+    /// population when the matching one is cold or unavailable.
+    pub const fn for_streaming(stream: bool) -> Self {
+        if stream {
+            Self::StreamEstablishment
+        } else {
+            Self::BufferedCompletion
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamEstablishment => "stream_establishment",
+            Self::BufferedCompletion => "buffered_completion",
+        }
+    }
+
     fn key_fragment(self) -> &'static str {
         match self {
             Self::StreamEstablishment => "stream",
@@ -201,31 +243,37 @@ impl LatencyTracker {
     /// aged out) or the lock is poisoned. Callers MUST treat `None` as
     /// "insufficient data → condition does not match".
     pub fn p95(&self, provider: &str, model: &str, operation: LatencyOperation) -> Option<u32> {
-        let shard = self.shard_for(provider, model);
-        let map = shard.read().ok()?;
-        map.get(&(
-            provider.to_string(),
-            model.to_string(),
-            operation.key_fragment().to_string(),
-        ))
-        .and_then(Window::p95)
+        self.evidence(provider, model, operation)
+            .and_then(|e| e.p95_ms)
     }
 
-    /// Current fresh sample count for `(provider, model, operation)` (mainly for tests/telemetry).
+    /// One snapshot for p95, sample count and age. A missing key is a known
+    /// empty window; a poisoned lock is unavailable (None), not healthy zero.
+    pub fn evidence(
+        &self,
+        provider: &str,
+        model: &str,
+        operation: LatencyOperation,
+    ) -> Option<LatencyEvidence> {
+        let map = self.shard_for(provider, model).read().ok()?;
+        let now = Instant::now(); // after acquiring the lock, not before a wait
+        let empty = Window::default();
+        Some(
+            map.get(&(
+                provider.to_string(),
+                model.to_string(),
+                operation.key_fragment().to_string(),
+            ))
+            .unwrap_or(&empty)
+            .evidence_at(operation, now),
+        )
+    }
+
+    /// Legacy count helper; unavailable locks still map to zero for API
+    /// compatibility. Use evidence() to distinguish unavailable from empty.
     pub fn sample_count(&self, provider: &str, model: &str, operation: LatencyOperation) -> usize {
-        let shard = self.shard_for(provider, model);
-        shard
-            .read()
-            .ok()
-            .and_then(|map| {
-                map.get(&(
-                    provider.to_string(),
-                    model.to_string(),
-                    operation.key_fragment().to_string(),
-                ))
-                .map(Window::fresh_count)
-            })
-            .unwrap_or(0)
+        self.evidence(provider, model, operation)
+            .map_or(0, |e| e.sample_count)
     }
 }
 
@@ -233,6 +281,93 @@ impl LatencyTracker {
 mod tests {
     use super::*;
     const OP: LatencyOperation = LatencyOperation::StreamEstablishment;
+
+    #[test]
+    fn evidence_uses_one_clock_and_excludes_expired_boundary_and_future_samples() {
+        let now = Instant::now();
+        let mut window = Window::default();
+        for i in 1..=20 {
+            window.push(i, now - Duration::from_secs(u64::from(i)));
+        }
+        window.push(9999, now - MAX_SAMPLE_AGE);
+        window.push(9999, now + Duration::from_secs(1));
+        let evidence = window.evidence_at(OP, now);
+        assert_eq!(evidence.scope, "instance");
+        assert_eq!(evidence.operation, OP);
+        assert_eq!(evidence.window_seconds, 300);
+        assert_eq!(evidence.capacity, WINDOW_CAPACITY);
+        assert_eq!(evidence.minimum_samples, MIN_SAMPLES);
+        assert_eq!(evidence.retained_samples, 22);
+        assert_eq!(evidence.sample_count, 20);
+        assert_eq!(evidence.newest_sample_age_ms, Some(1000));
+        assert_eq!(evidence.oldest_sample_age_ms, Some(20_000));
+        assert_eq!(evidence.p95_ms, Some(19));
+        let expired = window.evidence_at(OP, now + MAX_SAMPLE_AGE + Duration::from_secs(1));
+        assert_eq!(expired.retained_samples, 22);
+        assert_eq!(expired.sample_count, 0);
+        assert_eq!(expired.p95_ms, None);
+        assert_eq!(expired.newest_sample_age_ms, None);
+        assert_eq!(expired.oldest_sample_age_ms, None);
+    }
+
+    #[test]
+    fn evidence_exposes_cold_scope_without_borrowing_another_operation_or_tracker() {
+        let tracker = LatencyTracker::new();
+        let operation = LatencyOperation::for_streaming(false);
+        assert_eq!(operation, LatencyOperation::BufferedCompletion);
+        assert_eq!(operation.as_str(), "buffered_completion");
+        assert_eq!(LatencyOperation::for_streaming(true), OP);
+        let cold = tracker.evidence("p", "m", operation).unwrap();
+        assert_eq!(cold.scope, "instance");
+        assert_eq!(cold.sample_count, 0);
+        assert_eq!(cold.retained_samples, 0);
+        assert_eq!(cold.newest_sample_age_ms, None);
+        tracker.record("p", "m", operation, 42);
+        assert_eq!(
+            tracker.evidence("p", "m", operation).unwrap().sample_count,
+            1
+        );
+        assert_eq!(tracker.evidence("p", "m", OP).unwrap().sample_count, 0);
+        assert_eq!(
+            LatencyTracker::new()
+                .evidence("p", "m", operation)
+                .unwrap()
+                .sample_count,
+            0
+        );
+    }
+
+    #[test]
+    fn evidence_reports_nearest_rank_and_retained_capacity() {
+        let now = Instant::now();
+        let mut window = Window::default();
+        for ms in 1..=100 {
+            window.push(ms, now);
+        }
+        assert_eq!(window.evidence_at(OP, now).p95_ms, Some(95));
+        for _ in 0..WINDOW_CAPACITY {
+            window.push(10, now);
+        }
+        let evidence = window.evidence_at(OP, now);
+        assert_eq!(evidence.retained_samples, WINDOW_CAPACITY);
+        assert_eq!(evidence.sample_count, WINDOW_CAPACITY);
+        assert_eq!(evidence.p95_ms, Some(10));
+    }
+
+    #[test]
+    fn poisoned_evidence_is_unavailable_not_a_healthy_empty_snapshot() {
+        let tracker = std::sync::Arc::new(LatencyTracker::new());
+        let other = tracker.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = other.shard_for("p", "m").write().unwrap();
+            panic!("fixture poison");
+        })
+        .join()
+        .is_err());
+        assert!(tracker.evidence("p", "m", OP).is_none());
+        assert_eq!(tracker.p95("p", "m", OP), None);
+        tracker.record("p", "m", OP, 10); // no panic on poisoned telemetry
+    }
 
     #[test]
     fn p95_is_none_below_min_samples() {
@@ -332,7 +467,8 @@ mod tests {
     #[test]
     fn p95_reflects_tail_latency() {
         let t = LatencyTracker::new();
-        // 95 samples at 100ms, 5 at 5000ms → p95 sits in the slow tail.
+        // Nearest-rank p95 is the 95th sample: exactly five slow outliers
+        // among 100 samples remain above that rank, not in the reported p95.
         for _ in 0..95 {
             t.record("p", "m", OP, 100);
         }
@@ -340,7 +476,7 @@ mod tests {
             t.record("p", "m", OP, 5000);
         }
         let p95 = t.p95("p", "m", OP).expect("enough samples");
-        assert!((100..=5000).contains(&p95));
+        assert_eq!(p95, 100);
     }
 
     #[test]
