@@ -56,3 +56,4 @@ read individual archives directly.
 - 2026-09-09T23:30:59Z · task=`september-review-audit-runtime` · branch=`main` · diff=" 6 files changed, 323 insertions(+), 267 deletions(-)" → [archive](sessions/2026-09-09T23-30-59Z-september-review-audit-runtime.md)
 - 2026-09-12T12:45:31Z · task=`s02-s09-capability-latency` · branch=`fix/review-sdk-rotation` · diff=" 12 files changed, 201 insertions(+), 139 deletions(-)" → [archive](sessions/2026-09-12T12-45-31Z-s02-s09-capability-latency.md)
 - 2026-09-12T13:19:06Z · task=`review-2026-09-05-batch32` · branch=`fix/review-sdk-rotation` · diff=" 15 files changed, 224 insertions(+), 153 deletions(-)" → [archive](sessions/2026-09-12T13-19-06Z-review-2026-09-05-batch32.md)
+- 2026-09-12T13:51:20Z · task=`review-2026-09-05-batch33` · branch=`docs/review-integration-handoff` · diff="none" → [archive](sessions/2026-09-12T13-51-20Z-review-2026-09-05-batch33.md)
