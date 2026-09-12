@@ -109,8 +109,9 @@ fn chained_max_attempts_from_lookup(get: impl Fn(&str) -> Option<String>) -> u32
 ///
 /// When `Some`, each candidate whose [`tt_shared::ModelInfo`] is known in the
 /// registry is checked before dispatch: if the candidate does not satisfy
-/// `required` or its `max_input_tokens < estimated_tokens`, the candidate is
-/// skipped with a `route_skipped_capability` tracing event.  `None` disables
+/// `required` (including the explicit output cap) or its
+/// `max_input_tokens < estimated_tokens`, the candidate is skipped with a
+/// `route_skipped_capability` tracing event.  `None` disables
 /// the guard (plain failover, prior behavior).
 #[derive(Clone, Copy)]
 pub struct CapCheck<'a> {

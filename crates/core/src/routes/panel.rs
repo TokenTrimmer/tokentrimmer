@@ -1621,8 +1621,8 @@ fn panel_admission_estimate(
 /// registry current at dispatch — a proof minted under one catalog cannot fan
 /// out after that catalog loses a member or its capabilities.
 ///
-/// Only the capability LIST is certified here (not the local-tokenizer
-/// input-window comparison): the local input-token estimate can differ from
+/// The capability list and explicit caller output cap are checked here (not
+/// the local-tokenizer input-window comparison): input estimates can differ from
 /// provider tokenization, matching the request-preflight model-support
 /// evidence, so context-window enforcement remains a dispatch-time provider
 /// concern.
@@ -1641,9 +1641,8 @@ fn validate_panel_catalog_admission(
                 .ok_or_else(|| ApiError::ModelNotFound {
                     model: member.model.clone(),
                 })?;
-        // estimated_tokens = 0 skips the local-tokenizer window check; we only
-        // fail on capabilities we positively know are missing from the catalog
-        // row (see doc comment above).
+        // Zero skips only input estimation. Explicit output caps still have
+        // to fit this member's known catalog limit.
         let missing = required.skip_reasons(info, 0);
         if !missing.is_empty() {
             return Err(ApiError::PanelModelCapabilityUnavailable {
@@ -3447,7 +3446,20 @@ mod tests {
         let ctx = direct_engine_admission_context();
         let creds: HashMap<String, ProviderCredentials> = HashMap::new();
 
-        let expensive = direct_engine_admission_request(1_000_000);
+        // An impossible output cap must fail capability admission before
+        // money admission. Keep the budget regression independently valid.
+        let oversized = direct_engine_admission_request(1_000_000);
+        assert!(matches!(
+            run_panel(&state, &ctx, &oversized, &creds, &cfg, &admission, Duration::from_secs(1)).await,
+            Err(ApiError::PanelModelCapabilityUnavailable { reasons, .. })
+                if reasons.contains(&"output_limit_too_large")
+        ));
+        let catalog_limit = state
+            .registry
+            .model_info("gpt-4o")
+            .unwrap()
+            .max_output_tokens;
+        let expensive = direct_engine_admission_request(u32::try_from(catalog_limit).unwrap());
         assert!(matches!(
             run_panel(
                 &state,

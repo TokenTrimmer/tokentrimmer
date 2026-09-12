@@ -654,6 +654,16 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Interactive` | Declares a human is waiting on this request (send `1` or `true`). Hard-clears the advisory batch-eligibility route action (`then.batch`) — the gateway never marks interactive traffic batch-eligible (`batch_ineligible:interactive` warning). Parsing fails interactive-safe: **any** non-empty value other than an explicit `0`/`false` opt-out is treated as interactive, so an unrecognized spelling (`yes`, `on`, …) can never be silently batch-marked. Set automatically by `tt chat` and the `/tools` loop. | Honored | `1` |
 | `traceparent` | Standard [W3C TraceContext](https://www.w3.org/TR/trace-context/) header. When present and valid, the gateway **continues your trace**: its request span becomes a child of your inbound span (same `trace_id`), so gateway cost/latency appears on your existing distributed trace. An accompanying `tracestate` is preserved. Absent/malformed → a fresh root trace. | Honored | `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01` |
 
+When route/failover capability guards apply, an explicit `max_completion_tokens`
+(or `max_tokens` when the former is absent) must fit the candidate's known catalog
+`max_output_tokens`. `output_limit_too_large` suppresses an ordinary route rewrite
+while retaining its privacy effects on the caller model; an explicitly forced
+incompatible route returns 400 before provider I/O. Buffered and stream-establishment
+fallbacks skip incompatible candidates rather than silently shrinking the caller's
+limit. The guard does not invent a limit when omitted, and unknown model metadata
+remains permissive. This is not blanket validation of direct caller-model requests,
+combined context capacity, credentials, actual output length or final invoice cost.
+
 ### 6.2 Response headers
 
 | Header | Present | Example |
