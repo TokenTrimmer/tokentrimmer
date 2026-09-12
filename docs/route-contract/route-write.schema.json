@@ -311,6 +311,13 @@
             "integer",
             "null"
           ]
+        },
+        "workload": {
+          "description": "Match only when the request's TRUSTED workload name equals this (R07). The workload rides the RESERVED metadata namespace from [`tt_shared::reserved_metadata`]: it is set only by the authenticated workload-policy surface (a keyed request header validated against the org's registered workload policies) — never by the free-form `X-TokenTrimmer-Tag`, and never influenced by prompt text. A caller cannot self-select into a workload route by editing a prompt or tag.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"

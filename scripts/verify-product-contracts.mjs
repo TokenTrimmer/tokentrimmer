@@ -53,7 +53,10 @@ assert('content_compress' in route.$defs.RouteAction.properties, 'live route act
 const routePreviewFamily = families.get('route_preview_coverage');
 const routePreview = load(routePreviewFamily.compatibility_corpus);
 assert(routePreview.corpus.id === routePreviewFamily.id, 'route-preview corpus id drift');
-assert(routePreview.corpus.version === 2, 'route-preview corpus version drift');
+assert(
+  routePreviewFamily.versions.includes(routePreview.corpus.version),
+  'route-preview corpus version drift',
+);
 assert(routePreview.route_contract.id === families.get('route').id, 'route-preview route id drift');
 assert(routePreview.route_contract.version === 1, 'route-preview route version drift');
 const previewFields = routePreview.conditions.map((condition) => condition.field);

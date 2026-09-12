@@ -12,7 +12,7 @@
       "write": "POST /v1/routes"
     },
     {
-      "compatibility_corpus": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json",
+      "compatibility_corpus": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v3.corpus.json",
       "family": "route_preview_coverage",
       "id": "tokentrimmer.route-preview-coverage-corpus",
       "route_contract_id": "tokentrimmer.route.v1",
@@ -20,7 +20,8 @@
         1
       ],
       "versions": [
-        2
+        2,
+        3
       ]
     },
     {
@@ -86,7 +87,7 @@
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "ebf50bcdab2233b85cca08f78e91ea8ac2fdcc5593cf42931bbb0ba2d9012332"
+      "sha256": "f93932de416904664e92e47ad6adad636121dfeaab889878ef97e3984ddf10cd"
     },
     {
       "path": "docs/agent-contract/agent-cost-evidence.schema.json",
@@ -98,19 +99,19 @@
     },
     {
       "path": "docs/capability-contract/request-preflight-batch-response.schema.json",
-      "sha256": "c016ba003e66ca2ec53f886187ed22ef9090ff7badbdeb7fecb3d23c595fd5e6"
+      "sha256": "1f5482aab521fb8fd0214326917c9270ac38c55d8fb368b8145cd10570d8bfe7"
     },
     {
       "path": "docs/capability-contract/request-preflight-response.schema.json",
-      "sha256": "4f6c85c8c998b6aeb3ba15fb6a16ebeb17816de6be3f943d19ca73904bab9cc6"
+      "sha256": "be312503a85013dab3a1dbfce38edde693c52e84cd220db2ef574866cd31a6e4"
     },
     {
       "path": "docs/model-contract/models-response.schema.json",
-      "sha256": "481e75eac2764c78fbcc67dd60cdcfd48f67496bbf76001c21e78b039013ebb3"
+      "sha256": "cca24e739da28f957133ef060c635bd64e3dc0b3dc1fe90f899148b49f39111a"
     },
     {
       "path": "docs/route-contract/route-write.schema.json",
-      "sha256": "d5bc7e9b324de50af0f0ef9d4e7a97e15aeb39495e757882b9ad23d4cc57833f"
+      "sha256": "c455d2f8c19ef52750922542c12e6c82cb42628377a0ab2cbd5e9ab765b42de5"
     },
     {
       "path": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json",
@@ -130,11 +131,11 @@
     },
     {
       "path": "sdk-python/tokentrimmer/product_contracts_generated.py",
-      "sha256": "6f684a113218249f8ab61f45b1ab14130a0e4c00bae77677e2c639470b0477f5"
+      "sha256": "b29e66b9e34979d0fc79bfe63d40a58313514d947a003d7ef66a5f29b9067505"
     },
     {
       "path": "sdk-typescript/src/product-contracts.generated.ts",
-      "sha256": "ebf50bcdab2233b85cca08f78e91ea8ac2fdcc5593cf42931bbb0ba2d9012332"
+      "sha256": "f93932de416904664e92e47ad6adad636121dfeaab889878ef97e3984ddf10cd"
     }
   ],
   "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, model-catalog response type, gateway capability response type, request-preflight response types, and multi-basis agent cost evidence type",

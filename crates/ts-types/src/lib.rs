@@ -32,6 +32,8 @@ const SDK_PRODUCT_PY_PATH: &str = "sdk-python/tokentrimmer/product_contracts_gen
 const PRODUCT_MANIFEST_PATH: &str = "docs/contracts/product-contracts.manifest.json";
 const ROUTE_PREVIEW_V2_PATH: &str =
     "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json";
+const ROUTE_PREVIEW_V3_PATH: &str =
+    "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v3.corpus.json";
 const FIXED_KEY_BYTES: [u8; 32] = [7; 32];
 const FIXED_KEY_HEX: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
 
@@ -351,6 +353,8 @@ fn deterministic_bundle() -> Result<SavingsBundle> {
         cached: false,
         cache_layer: None,
         matched_route_id: None,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
         latency_ms: 100,
         upstream_latency_ms: Some(80),
         status: 200,
@@ -399,6 +403,7 @@ fn deterministic_bundle() -> Result<SavingsBundle> {
             input_per_million: 0.25,
             output_per_million: 1.25,
             cached_input_per_million: Some(0.025),
+            cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: None,
@@ -603,10 +608,10 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
             {
                 "family": "route_preview_coverage",
                 "id": "tokentrimmer.route-preview-coverage-corpus",
-                "versions": [2],
+                "versions": [2, 3],
                 "route_contract_id": tt_routing::ROUTE_SCHEMA_ID,
                 "route_contract_versions": [tt_routing::ROUTE_SCHEMA_VERSION],
-                "compatibility_corpus": ROUTE_PREVIEW_V2_PATH
+                "compatibility_corpus": ROUTE_PREVIEW_V3_PATH
             },
             {
                 "family": "workflow_definition",
