@@ -1,7 +1,7 @@
 //! Capability and context-window guard for the routing / failover path.
 //!
 //! [`RequiredCapabilities`] is derived from a [`ChatCompletionRequest`] and
-//! checked against a candidate model's [`ModelInfo`] before a route rewrite or
+//! checked against a candidate model's [`ModelInfo`](crate::ModelInfo) before a route rewrite or
 //! failover dispatch is committed.  The check is intentionally permissive:
 //!
 //! - When `ModelInfo` is **unknown** for a candidate (not in the registry
@@ -13,202 +13,18 @@
 //!
 //! # Token counting
 //!
-//! [`estimate_input_tokens`] concatenates all message text and delegates to
-//! [`tt_tokenize::estimate_tokens`], keyed on `provider_id` so tiktoken is
-//! used for OpenAI/Anthropic and the char/4 heuristic is used elsewhere.
-//! Image/audio bytes are not measured — the guard is a best-effort floor, not
-//! an exact window-packing count.
+//! [`message_text_for_estimation`] extracts text for the caller's provider-aware
+//! tokenizer. Image/audio bytes are not measured — the input guard is a
+//! best-effort floor, not an exact window-packing count. Explicit output caps
+//! are checked separately against the known model's declared output limit.
 
 use crate::{
     messages::{ContentPart, Message, MessageContent},
-    pricing::{Capability, ModelInfo},
     ChatCompletionRequest,
 };
 
-/// The set of capabilities a [`ChatCompletionRequest`] requires.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RequiredCapabilities {
-    /// At least one message contains an image_url content part.
-    pub vision: bool,
-    /// At least one message contains an input_audio content part.
-    pub audio: bool,
-    /// The request has non-empty `tools`, or any assistant message contains
-    /// `tool_calls`.
-    pub tools: bool,
-    /// `response_format.type` is `"json_object"` or `"json_schema"`.
-    pub json_mode: bool,
-    /// `response_format.type` is `"json_schema"` AND the envelope carries
-    /// `strict: true` (S02). A strict structured-output request must not be
-    /// rewritten to a model that only promises the loose `json_object` shape:
-    /// the dispatch-time downgrade warning fires AFTER the rewrite committed,
-    /// which is exactly the silently-changed-output-contract failure the
-    /// review named. Suppressed at selection instead; unknown models stay
-    /// permissive per the module's unknown-metadata policy (the downgrade
-    /// warning remains the backstop there).
-    pub strict_json_schema: bool,
-    /// `stream` is true; models explicitly lacking Streaming cannot serve.
-    pub streaming: bool,
-}
-
-impl RequiredCapabilities {
-    /// Derive the required capabilities from a chat completion request.
-    pub fn from_request(req: &ChatCompletionRequest) -> Self {
-        let mut caps = Self::default();
-
-        // tools / function-calling
-        if !req.tools.is_empty() {
-            caps.tools = true;
-        }
-
-        // response_format → json mode
-        if let Some(rf) = &req.response_format {
-            if rf.r#type == "json_object" || rf.r#type == "json_schema" {
-                caps.json_mode = true;
-            }
-            // S02: a STRICT structured-output request (json_schema envelope
-            // with strict: true) additionally requires the strict capability
-            // so selection cannot rewrite it onto a json_object-only model.
-            if rf.r#type == "json_schema" && schema_envelope_is_strict(&rf.json_schema) {
-                caps.strict_json_schema = true;
-            }
-        }
-
-        // streaming
-        if req.stream {
-            caps.streaming = true;
-        }
-
-        // scan messages for vision/audio content and tool_calls
-        for msg in &req.messages {
-            match msg {
-                Message::User { content, .. } | Message::System { content } => {
-                    if let MessageContent::Parts(parts) = content {
-                        for part in parts {
-                            match part {
-                                ContentPart::ImageUrl { .. } => {
-                                    caps.vision = true;
-                                }
-                                ContentPart::InputAudio { .. } => {
-                                    caps.audio = true;
-                                }
-                                // A Document part does NOT require Vision: the
-                                // Document Lane's target is a TEXT model (the
-                                // pre-routing seam distills it to text). Leaving
-                                // `vision` unset is what lets a document route
-                                // downgrade to a non-Vision model.
-                                ContentPart::Document { .. } | ContentPart::Text { .. } => {}
-                            }
-                        }
-                    }
-                }
-                Message::Assistant { tool_calls, .. } => {
-                    if !tool_calls.is_empty() {
-                        caps.tools = true;
-                    }
-                }
-                Message::Tool { .. } => {
-                    // A Tool message in context means the conversation already
-                    // used tool-calling; the next turn may need it too.
-                    caps.tools = true;
-                }
-            }
-        }
-
-        caps
-    }
-
-    /// Returns `true` when all required capabilities are listed in
-    /// `info.capabilities` **and** `max_input_tokens >= estimated_tokens`.
-    ///
-    /// Pass `estimated_tokens = 0` to skip the context-window check.
-    #[must_use]
-    pub fn satisfied_by(&self, info: &ModelInfo, estimated_tokens: u64) -> bool {
-        if self.vision && !info.capabilities.contains(&Capability::Vision) {
-            return false;
-        }
-        if self.audio && !info.capabilities.contains(&Capability::Audio) {
-            return false;
-        }
-        if self.tools && !info.capabilities.contains(&Capability::Tools) {
-            return false;
-        }
-        if self.json_mode && !info.capabilities.contains(&Capability::JsonMode) {
-            return false;
-        }
-        if self.strict_json_schema && !info.capabilities.contains(&Capability::StrictJsonSchema) {
-            return false;
-        }
-        if self.streaming && !info.capabilities.contains(&Capability::Streaming) {
-            return false;
-        }
-        if estimated_tokens > 0 && info.max_input_tokens < estimated_tokens {
-            return false;
-        }
-        true
-    }
-
-    /// S02 evidence policy for the guard: what was checked against positive
-    /// catalog knowledge vs. what was assumed. Unknown models are PERMISSIVE
-    /// (dispatch may still work; the dispatch-time downgrade warnings remain
-    /// the backstop), and token/media counts are ESTIMATES — this enum lets
-    /// callers label route decisions with that uncertainty instead of
-    /// presenting an approximate guard as an exact one.
-    #[must_use]
-    pub fn evidence_policy(info_known: bool) -> &'static str {
-        if info_known {
-            "catalog_verified"
-        } else {
-            "unknown_model_permissive"
-        }
-    }
-
-    /// Human-readable list of the reasons a candidate was skipped, for use in
-    /// the `route_skipped_capability` tracing event.
-    pub fn skip_reasons(&self, info: &ModelInfo, estimated_tokens: u64) -> Vec<&'static str> {
-        let mut reasons = Vec::new();
-        if self.vision && !info.capabilities.contains(&Capability::Vision) {
-            reasons.push("vision_not_supported");
-        }
-        if self.audio && !info.capabilities.contains(&Capability::Audio) {
-            reasons.push("audio_not_supported");
-        }
-        if self.tools && !info.capabilities.contains(&Capability::Tools) {
-            reasons.push("tools_not_supported");
-        }
-        if self.json_mode && !info.capabilities.contains(&Capability::JsonMode) {
-            reasons.push("json_mode_not_supported");
-        }
-        if self.strict_json_schema && !info.capabilities.contains(&Capability::StrictJsonSchema) {
-            reasons.push("strict_json_schema_not_supported");
-        }
-        if self.streaming && !info.capabilities.contains(&Capability::Streaming) {
-            reasons.push("streaming_not_supported");
-        }
-        if estimated_tokens > 0 && info.max_input_tokens < estimated_tokens {
-            reasons.push("context_window_too_small");
-        }
-        reasons
-    }
-}
-
-/// True when the OpenAI `response_format.json_schema` envelope carries
-/// `strict: true`. Mirrors `unwrap_schema_envelope` in the core shaping
-/// module (`{"name", "strict", "schema"}` envelope, accepting a bare
-/// schema as non-strict) without a cross-crate dependency — keep the two in
-/// sync. A bare schema without the envelope is deliberately NOT strict: the
-/// absence of the flag is not evidence of a grammar-locked output contract.
-fn schema_envelope_is_strict(raw: &Option<serde_json::Value>) -> bool {
-    raw.as_ref()
-        .and_then(|v| v.as_object())
-        .and_then(|obj| obj.get("schema").filter(|s| s.is_object()))
-        .is_some_and(|_| {
-            raw.as_ref()
-                .and_then(|v| v.as_object())
-                .and_then(|obj| obj.get("strict"))
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false)
-        })
-}
+mod requirements;
+pub use requirements::RequiredCapabilities;
 
 /// Concatenate all message text parts from a request for token estimation.
 ///
