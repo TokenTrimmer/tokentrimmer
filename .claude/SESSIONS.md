@@ -59,3 +59,4 @@ read individual archives directly.
 - 2026-09-12T13:51:20Z · task=`review-2026-09-05-batch33` · branch=`docs/review-integration-handoff` · diff="none" → [archive](sessions/2026-09-12T13-51-20Z-review-2026-09-05-batch33.md)
 - 2026-09-12T15:56:10Z · task=`review-2026-09-05-batch34-integrated` · branch=`fix/routing-output-capability` · diff=" 5 files changed, 39 insertions(+), 199 deletions(-)" → [archive](sessions/2026-09-12T15-56-10Z-review-2026-09-05-batch34-integrated.md)
 - 2026-09-12T17:06:28Z · task=`review-2026-09-05-batch36` · branch=`fix/routing-output-capability` · diff=" 7 files changed, 53 insertions(+), 208 deletions(-)" → [archive](sessions/2026-09-12T17-06-28Z-review-2026-09-05-batch36.md)
+- 2026-09-12T17:49:00Z · task=`review-2026-09-05-batch37` · branch=`fix/audit-readiness-lock-permission` · diff=" 3 files changed, 121 insertions(+), 2 deletions(-)" → [archive](sessions/2026-09-12T17-49-00Z-review-2026-09-05-batch37.md)

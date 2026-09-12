@@ -293,3 +293,116 @@ async fn concurrent_writers_keep_one_gap_free_chain() {
     other_pool.close().await;
     f.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires disposable TEST_DATABASE_URL; isolated UUID schema"]
+async fn readiness_requires_actual_row_lock_permission_and_accepts_column_level_update() {
+    let f = Fixture::new().await;
+    let org = Uuid::new_v4();
+    sqlx::query("INSERT INTO business_state VALUES ($1, 1)")
+        .bind(org)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.writer()
+        .write(org, Actor::System, "seed".into(), serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let role = format!("audit_append_{}", Uuid::new_v4().simple());
+    f.admin
+        .execute(format!("CREATE ROLE {role} NOLOGIN").as_str())
+        .await
+        .unwrap();
+    f.admin
+        .execute(format!("GRANT USAGE ON SCHEMA {} TO {role}", f.schema).as_str())
+        .await
+        .unwrap();
+    f.pool
+        .execute(format!("GRANT SELECT, INSERT ON audit_entries TO {role}").as_str())
+        .await
+        .unwrap();
+    let limited_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(f.options.clone().options([("role", role.clone())]))
+        .await
+        .unwrap();
+    let limited = PostgresAuditWriter::new(
+        limited_pool.clone(),
+        ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+    );
+    let acl: (bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege(current_user, 'audit_entries', 'INSERT'),
+                has_any_column_privilege(current_user, 'audit_entries', 'UPDATE')",
+    )
+    .fetch_one(&limited_pool)
+    .await
+    .unwrap();
+    assert_eq!(acl, (true, false));
+    assert!(
+        limited
+            .write(org, Actor::System, "refused".into(), serde_json::json!({}))
+            .await
+            .is_err(),
+        "the real writer must fail without its row-lock privilege"
+    );
+    assert!(
+        limited.storage_readiness().await.is_err(),
+        "readiness must not accept SELECT+INSERT when the actual FOR UPDATE cannot run"
+    );
+    assert_eq!(f.writer().list(org).await.unwrap().len(), 1);
+
+    // PostgreSQL row locks require UPDATE on at least one column, not the
+    // entire table. This fixture is not a recommended production ACL grant.
+    f.pool
+        .execute(format!("GRANT UPDATE (id) ON audit_entries TO {role}").as_str())
+        .await
+        .unwrap();
+    let broad_update: bool =
+        sqlx::query_scalar("SELECT has_table_privilege(current_user, 'audit_entries', 'UPDATE')")
+            .fetch_one(&limited_pool)
+            .await
+            .unwrap();
+    assert!(
+        !broad_update,
+        "do not require or silently grant table-wide UPDATE"
+    );
+    assert!(matches!(
+        limited.storage_readiness().await.unwrap(),
+        AuditStorageReadiness::Postgres { .. }
+    ));
+    assert_eq!(
+        f.writer().list(org).await.unwrap().len(),
+        1,
+        "readiness writes no evidence rows"
+    );
+    limited
+        .write(org, Actor::System, "allowed".into(), serde_json::json!({}))
+        .await
+        .unwrap();
+    let entries = limited.list(org).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    verify_chain(&entries, &limited.verifying_key()).unwrap();
+
+    // The eligibility check is live, not cached after a successful append.
+    f.pool
+        .execute(format!("REVOKE UPDATE (id) ON audit_entries FROM {role}").as_str())
+        .await
+        .unwrap();
+    assert!(limited.storage_readiness().await.is_err());
+    assert_eq!(f.writer().list(org).await.unwrap().len(), 2);
+    limited_pool.close().await;
+    f.pool
+        .execute(format!("REVOKE ALL ON audit_entries FROM {role}").as_str())
+        .await
+        .unwrap();
+    f.admin
+        .execute(format!("REVOKE USAGE ON SCHEMA {} FROM {role}", f.schema).as_str())
+        .await
+        .unwrap();
+    f.admin
+        .execute(format!("DROP ROLE {role}").as_str())
+        .await
+        .unwrap();
+    f.cleanup().await;
+}
