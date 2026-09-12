@@ -70,7 +70,12 @@ impl AuditWriter for PostgresAuditWriter {
     async fn storage_readiness(&self) -> Result<AuditStorageReadiness, AuditError> {
         // Exercise this writer's actual pool and column contract, without
         // creating synthetic tenants or polluting an immutable audit chain.
-        sqlx::query("SELECT id, org_id, ts, actor, event, payload, prev_hash, hash, signature, seq FROM audit_entries LIMIT 0")
+        // The real append uses FOR UPDATE on the chain tail. LIMIT 0 checks
+        // that locking privilege without locking any rows or writing data.
+        // PostgreSQL accepts a column-level UPDATE grant for row locking; a
+        // table-wide has_table_privilege(..., 'UPDATE') check would reject that
+        // valid narrower role and encourage unnecessarily broad grants.
+        sqlx::query("SELECT id, org_id, ts, actor, event, payload, prev_hash, hash, signature, seq FROM audit_entries LIMIT 0 FOR UPDATE")
             .execute(&self.pool).await.map_err(|e| AuditError::Storage(e.to_string()))?;
         let writable: bool = sqlx::query_scalar(
             "SELECT NOT pg_is_in_recovery() \
@@ -83,7 +88,7 @@ impl AuditWriter for PostgresAuditWriter {
         if !writable {
             return Err(AuditError::Storage("audit storage is not writable".into()));
         }
-        // This proves connectivity, readable columns and write eligibility,
+        // This proves connectivity, readable columns, row-lock and INSERT eligibility,
         // not every FK/trigger or future write. Actual append errors still
         // must fail their owning transaction/action.
         Ok(AuditStorageReadiness::Postgres {
