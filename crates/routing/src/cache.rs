@@ -357,6 +357,52 @@ mod tests {
         assert_eq!(e.routes()[0].name, "b");
     }
 
+    /// R03: two replicas share one backing store. The writer invalidates only
+    /// ITS cache; the peer's invalidation message is lost. The peer must still
+    /// converge within the TTL — the documented objective — rather than serving
+    /// the stale definition indefinitely or mislabelling it as current.
+    #[tokio::test]
+    async fn lost_invalidation_converges_within_ttl_across_replicas() {
+        let backing = Arc::new(InMemoryRoutingStore::new());
+        let org = Uuid::now_v7();
+        backing.set_routes(org, vec![route("a", "m1")]);
+
+        // Two independent cache instances = two replicas over one store.
+        // A generous TTL keeps the "before TTL" assertion robust on a slow CI
+        // runner while still proving convergence shortly after expiry.
+        let ttl = Duration::from_millis(500);
+        let writer = CachingRoutingStore::with_ttl(backing.clone() as Arc<dyn RoutingStore>, ttl);
+        let peer = CachingRoutingStore::with_ttl(backing.clone() as Arc<dyn RoutingStore>, ttl);
+
+        // Both warm on the original definition.
+        assert_eq!(writer.engine_for(org).await.unwrap().routes()[0].name, "a");
+        assert_eq!(peer.engine_for(org).await.unwrap().routes()[0].name, "a");
+
+        // A write lands in the shared store. The writer invalidates its own
+        // cache; we intentionally do NOT call peer.invalidate (lost message).
+        backing.set_routes(org, vec![route("b", "m2")]);
+        writer.invalidate(org).await;
+        assert_eq!(
+            writer.engine_for(org).await.unwrap().routes()[0].name,
+            "b",
+            "the writing replica must converge immediately"
+        );
+        // The peer still serves the stale-but-not-yet-expired snapshot.
+        assert_eq!(
+            peer.engine_for(org).await.unwrap().routes()[0].name,
+            "a",
+            "before TTL, a lost-invalidation peer may serve its last fresh snapshot"
+        );
+
+        // Once the TTL elapses the peer converges without any invalidation.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            peer.engine_for(org).await.unwrap().routes()[0].name,
+            "b",
+            "a lost invalidation must converge within the TTL objective"
+        );
+    }
+
     #[tokio::test]
     async fn empty_org_caches_too() {
         let backing = Arc::new(InMemoryRoutingStore::new());
