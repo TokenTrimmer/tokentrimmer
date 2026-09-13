@@ -68,6 +68,12 @@ activation: `schema_version`, `name`, `priority`, `enabled`, `conditions`,
 field/code issue pairs. Messages are deliberately omitted because explanatory
 copy is not the portable compatibility surface.
 
+The workload cases preserve the trusted workload condition and its canonical
+hash through both wire projections, and reject non-string condition values.
+These are parser/identity checks, not workload registration, model eligibility,
+activation, runtime governance or deployment evidence. Hosted write admission
+must enforce its policy constraints separately.
+
 Dashboard proxy validation is deliberately not a semantic corpus consumer: it
 must preserve nested route JSON and tt-api's field-addressed 422 response
 rather than growing a third hand-maintained canonicalizer.
