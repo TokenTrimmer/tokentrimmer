@@ -64,3 +64,4 @@ read individual archives directly.
 - 2026-09-13T19:11:02Z · task=`review-2026-09-05-batches54-59-verified` · branch=`fix/r03-lost-invalidation-convergence` · diff="none" → [archive](sessions/2026-09-13T19-11-02Z-review-2026-09-05-batches54-59-verified.md)
 - 2026-09-13T19:12:54Z · task=`review-2026-09-05-batches54-60-verified` · branch=`fix/r03-lost-invalidation-convergence` · diff="none" → [archive](sessions/2026-09-13T19-12-54Z-review-2026-09-05-batches54-60-verified.md)
 - 2026-09-13T19:24:53Z · task=`review-2026-09-05-batches54-60-verified` · branch=`main` · diff="none" → [archive](sessions/2026-09-13T19-24-53Z-review-2026-09-05-batches54-60-verified.md)
+- 2026-09-13T20:05:39Z · task=`review-2026-09-05-batches54-60-integrated` · branch=`main` · diff="none" → [archive](sessions/2026-09-13T20-05-39Z-review-2026-09-05-batches54-60-integrated.md)
