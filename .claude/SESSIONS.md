@@ -67,3 +67,4 @@ read individual archives directly.
 - 2026-09-13T20:05:39Z · task=`review-2026-09-05-batches54-60-integrated` · branch=`main` · diff="none" → [archive](sessions/2026-09-13T20-05-39Z-review-2026-09-05-batches54-60-integrated.md)
 - 2026-09-13T21:20:50Z · task=`review-2026-09-05-batch61-pdf-download` · branch=`main` · diff="none" → [archive](sessions/2026-09-13T21-20-50Z-review-2026-09-05-batch61-pdf-download.md)
 - 2026-09-13T22:09:00Z · task=`review-2026-09-05-verified-state` · branch=`main` · diff="none" → [archive](sessions/2026-09-13T22-09-00Z-review-2026-09-05-verified-state.md)
+- 2026-09-13T22:12:28Z · task=`review-2026-09-05-batch62-durable-report-notice` · branch=`main` · diff="none" → [archive](sessions/2026-09-13T22-12-28Z-review-2026-09-05-batch62-durable-report-notice.md)
