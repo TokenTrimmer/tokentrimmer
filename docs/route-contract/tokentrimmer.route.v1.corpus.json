@@ -67,6 +67,85 @@
       }
     },
     {
+      "id": "workload_condition_is_preserved_in_both_projections_and_hash",
+      "gateway": {
+        "name": "workload-bound",
+        "enabled": false,
+        "when": { "workload": "support-summary" },
+        "then": { "target_model": "gpt-4o-mini" }
+      },
+      "control_plane": {
+        "name": "workload-bound",
+        "priority": 100,
+        "enabled": false,
+        "conditions": { "workload": "support-summary" },
+        "target": { "target_model": "gpt-4o-mini" }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "accepted",
+          "canonical": {
+            "schema_version": 1,
+            "name": "workload-bound",
+            "priority": 100,
+            "enabled": false,
+            "conditions": {
+              "model_in": [],
+              "input_tokens_lt": null,
+              "input_tokens_gt": null,
+              "tag_equals": null,
+              "workload": "support-summary"
+            },
+            "target": { "target_model": "gpt-4o-mini" },
+            "canonical_hash": "sha256:a74ea54b7f8eca8510c065da82dd2a16179b1dc151b8c8c046c4bb3c0607bfd3"
+          }
+        },
+        "control_plane": {
+          "outcome": "accepted",
+          "canonical": {
+            "schema_version": 1,
+            "name": "workload-bound",
+            "priority": 100,
+            "enabled": false,
+            "conditions": {
+              "model_in": [],
+              "input_tokens_lt": null,
+              "input_tokens_gt": null,
+              "tag_equals": null,
+              "workload": "support-summary"
+            },
+            "target": { "target_model": "gpt-4o-mini" },
+            "canonical_hash": "sha256:a74ea54b7f8eca8510c065da82dd2a16179b1dc151b8c8c046c4bb3c0607bfd3"
+          }
+        }
+      }
+    },
+    {
+      "id": "workload_condition_rejects_non_string_values",
+      "gateway": {
+        "name": "workload-invalid-type",
+        "when": { "workload": 42 },
+        "then": { "target_model": "gpt-4o-mini" }
+      },
+      "control_plane": {
+        "name": "workload-invalid-type",
+        "priority": 100,
+        "enabled": false,
+        "conditions": { "workload": 42 },
+        "target": { "target_model": "gpt-4o-mini" }
+      },
+      "expected": {
+        "gateway": {
+          "outcome": "rejected",
+          "issues": [{ "field": "when.workload", "code": "invalid_field" }]
+        },
+        "control_plane": {
+          "outcome": "rejected",
+          "issues": [{ "field": "conditions.workload", "code": "invalid_field" }]
+        }
+      }
+    },
+    {
       "id": "accepted_dense_rewrite_covers_all_condition_and_direct_action_fields",
       "gateway": {
         "schema_version": 1,
