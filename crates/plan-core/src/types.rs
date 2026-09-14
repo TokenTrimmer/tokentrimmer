@@ -229,6 +229,14 @@ pub struct RouteConditions {
     /// Match only if `req.tag == Some(this)`.
     #[serde(default)]
     pub tag_equals: Option<String>,
+    /// Mirror of `tt_routing::RouteConditions::workload` (R07 workload
+    /// policies). Gateway-owned and derived from a verified workload identity,
+    /// never prompt/tag self-selection. Carried for lossless wire round-trip;
+    /// not projectable in replay (a historical `RequestLog` has no workload
+    /// identity), so the canonical matcher fails this condition closed and Plan
+    /// cannot over-project savings on a workload route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
     /// Mirror of `tt_routing::RouteConditions::has_images`. Not evaluable in
     /// replay (RequestLog records no modality), so the canonical matcher fails
     /// the condition closed against the historical feature snapshot.
@@ -1263,6 +1271,7 @@ mod tests {
             input_tokens_lt: Some(1000),
             input_tokens_gt: Some(10),
             tag_equals: Some("batch".to_string()),
+            workload: Some("support_summary".to_string()),
             has_images: Some(true),
             has_audio: Some(false),
             has_documents: Some(true),
@@ -1282,6 +1291,7 @@ mod tests {
         assert_eq!(plan_conditions.input_tokens_lt, Some(1000));
         assert_eq!(plan_conditions.input_tokens_gt, Some(10));
         assert_eq!(plan_conditions.tag_equals, Some("batch".to_string()));
+        assert_eq!(plan_conditions.workload.as_deref(), Some("support_summary"));
         assert_eq!(plan_conditions.has_images, Some(true));
         assert_eq!(plan_conditions.has_audio, Some(false));
         assert_eq!(plan_conditions.has_documents, Some(true));

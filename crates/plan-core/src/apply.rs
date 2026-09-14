@@ -287,6 +287,7 @@ mod tests {
                 input_tokens_lt: Some(2_000),
                 input_tokens_gt: None,
                 tag_equals: None,
+                workload: None,
                 has_images: None,
                 has_audio: None,
                 has_documents: None,
