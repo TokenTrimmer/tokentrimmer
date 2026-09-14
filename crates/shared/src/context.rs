@@ -49,7 +49,9 @@ impl CallerTier {
     }
 }
 
-const MICRO_USD_PER_USD: f64 = 1_000_000.0;
+/// C05/D4: the single sanctioned f64→micros conversion is `MoneyMicros`;
+/// this module no longer owns its own copy of the scale or the rounding rules.
+use crate::money::MoneyMicros;
 
 /// Why a run-scoped provider reservation settled at its final amount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -304,14 +306,15 @@ impl std::fmt::Debug for RunBudgetState {
     }
 }
 
+/// The run-budget ceiling rounds toward zero (a cap must not over-permit);
+/// the settled/estimated figure rounds away from zero (a charge must not
+/// under-report). Both delegate to the one biased `MoneyMicros` entry points.
 fn usd_to_micros_floor(value: f64) -> Option<u64> {
-    let scaled = value * MICRO_USD_PER_USD;
-    (value.is_finite() && value >= 0.0 && scaled <= u64::MAX as f64).then(|| scaled.floor() as u64)
+    MoneyMicros::from_usd_floor(value).map(MoneyMicros::as_micros)
 }
 
 fn usd_to_micros_ceil(value: f64) -> Option<u64> {
-    let scaled = value * MICRO_USD_PER_USD;
-    (value.is_finite() && value >= 0.0 && scaled <= u64::MAX as f64).then(|| scaled.ceil() as u64)
+    MoneyMicros::from_usd_ceil(value).map(MoneyMicros::as_micros)
 }
 /// Request-scoped privacy constraints applied to every primary, retry,
 /// fallback, shadow, judge, and other provider dispatch sharing this state.
