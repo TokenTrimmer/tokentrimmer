@@ -71,3 +71,4 @@ read individual archives directly.
 - 2026-09-13T22:37:18Z · task=`review-2026-09-05-batch62-plus-governance` · branch=`main` · diff="none" → [archive](sessions/2026-09-13T22-37-18Z-review-2026-09-05-batch62-plus-governance.md)
 - 2026-09-14T01:12:12Z · task=`review-2026-09-05-batch62-followup` · branch=`main` · diff="none" → [archive](sessions/2026-09-14T01-12-12Z-review-2026-09-05-batch62-followup.md)
 - 2026-09-14T02:52:06Z · task=`review-test-compile-repairs-pin-advance` · branch=`main` · diff="none" → [archive](sessions/2026-09-14T02-52-06Z-review-test-compile-repairs-pin-advance.md)
+- 2026-09-14T13:54:18Z · task=`review-remaining-governance-triage` · branch=`main` · diff="none" → [archive](sessions/2026-09-14T13-54-18Z-review-remaining-governance-triage.md)
