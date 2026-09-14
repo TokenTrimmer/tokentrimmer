@@ -15,6 +15,7 @@ pub mod gateway_capabilities;
 pub mod messages;
 pub mod model_aliases;
 pub mod model_catalog;
+pub mod money;
 pub mod pricing;
 pub mod provider;
 pub mod providers;
