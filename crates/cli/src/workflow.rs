@@ -368,6 +368,8 @@ mod tests {
             projected_cost_usd: 0.0,
             per_node: vec![],
             warnings: vec![],
+            task_levers: Default::default(),
+            task_lever_notes: vec![],
         };
         let baseline_path = dir.path().join("baseline.json");
         std::fs::write(
