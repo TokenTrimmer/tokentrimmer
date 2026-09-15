@@ -634,7 +634,7 @@ async fn postgres_reservations_serialize_instances_and_survive_restart() {
         .unwrap();
     let (late_status, late_basis, late_settled): (String, Option<String>, Option<f64>) =
         sqlx::query_as(
-            "SELECT status, settlement_basis, settled_usd \
+            "SELECT status, settlement_basis, settled_usd::float8 \
              FROM gateway_budget_reservations WHERE id = $1",
         )
         .bind(stale_reservation.id)

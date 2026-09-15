@@ -252,7 +252,7 @@ impl PostgresBudgetReservationStore {
         month_start: NaiveDate,
     ) -> Result<f64, BudgetReservationError> {
         let (baseline, reserved, settled): (f64, f64, f64) = sqlx::query_as(
-            "SELECT baseline_spend_usd, reserved_usd, settled_spend_usd \
+            "SELECT baseline_spend_usd::float8, reserved_usd::float8, settled_spend_usd::float8 \
              FROM gateway_budget_scope_months \
              WHERE scope_kind = $1 AND scope_id = $2 AND month_start = $3 \
              FOR UPDATE",
@@ -362,7 +362,7 @@ impl PostgresBudgetReservationStore {
         }
 
         let stale: Vec<(Uuid, Uuid, Uuid, f64, bool, bool)> = sqlx::query_as(
-            "SELECT id, org_id, api_key_id, estimated_usd, reserves_org, reserves_api_key \
+            "SELECT id, org_id, api_key_id, estimated_usd::float8, reserves_org, reserves_api_key \
              FROM gateway_budget_reservations \
              WHERE month_start = $3 AND status = 'active' AND lease_expires_at <= $4 \
                AND (NOT reserves_org OR $5) \
@@ -611,8 +611,8 @@ impl BudgetReservationStore for PostgresBudgetReservationStore {
 
         let mut tx = self.pool.begin().await?;
         let initial: Option<ReservationRow> = sqlx::query_as(
-            "SELECT org_id, api_key_id, month_start, estimated_usd, \
-                    reserves_org, reserves_api_key, status, settled_usd \
+            "SELECT org_id, api_key_id, month_start, estimated_usd::float8, \
+                    reserves_org, reserves_api_key, status, settled_usd::float8 \
              FROM gateway_budget_reservations WHERE id = $1",
         )
         .bind(reservation.id)
@@ -645,8 +645,8 @@ impl BudgetReservationStore for PostgresBudgetReservationStore {
             status,
             prior_settled,
         ): ReservationRow = sqlx::query_as(
-            "SELECT org_id, api_key_id, month_start, estimated_usd, \
-                    reserves_org, reserves_api_key, status, settled_usd \
+            "SELECT org_id, api_key_id, month_start, estimated_usd::float8, \
+                    reserves_org, reserves_api_key, status, settled_usd::float8 \
              FROM gateway_budget_reservations WHERE id = $1 FOR UPDATE",
         )
         .bind(reservation.id)

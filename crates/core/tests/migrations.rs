@@ -1204,3 +1204,37 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         .await
         .expect("cleanup");
 }
+
+/// C05/D2: the durable monthly-reservation money columns must be NUMERIC(12,6)
+/// (the money-contract floor), never DOUBLE PRECISION. This is the DDL rule the
+/// migration policy adds; it prevents an accidental reintroduction on a future
+/// table rebuild.
+#[test]
+#[ignore = "requires a disposable TEST_DATABASE_URL; serial runner"]
+fn budget_reservation_money_columns_are_numeric_at_the_six_decimal_floor() {
+    let url = std::env::var("TEST_DATABASE_URL").expect("disposable TEST_DATABASE_URL");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        tt_core::migrate_only(&url).await.expect("migrations apply");
+        let pool = tt_core::connect(&url, 2).await.expect("connect");
+        let misconfigured: Vec<(String, String)> = sqlx::query_as(
+            "SELECT table_name, column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name IN ('gateway_budget_scope_months', \
+                                  'gateway_budget_reservations', \
+                                  'gateway_budget_adjustments') \
+               AND column_name IN ('baseline_spend_usd', 'reserved_usd', \
+                                   'settled_spend_usd', 'estimated_usd', \
+                                   'settled_usd', 'delta_usd') \
+               AND NOT (data_type = 'numeric' AND numeric_precision = 12 AND numeric_scale = 6) \
+             ORDER BY table_name, column_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("inspect money columns");
+        assert!(
+            misconfigured.is_empty(),
+            "these money columns are not NUMERIC(12,6): {misconfigured:?}"
+        );
+    });
+}
