@@ -82,3 +82,4 @@ read individual archives directly.
 - 2026-09-15T00:33:57Z · task=`feature-slices-r02-r03-r05-r07-c05` · branch=`main` · diff="none" → [archive](sessions/2026-09-15T00-33-57Z-feature-slices-r02-r03-r05-r07-c05.md)
 - 2026-09-15T00:55:51Z · task=`c05-d2-numeric-money-migration` · branch=`main` · diff="none" → [archive](sessions/2026-09-15T00-55-51Z-c05-d2-numeric-money-migration.md)
 - 2026-09-15T01:27:07Z · task=`c05-d4-signed-money` · branch=`main` · diff="none" → [archive](sessions/2026-09-15T01-27-07Z-c05-d4-signed-money.md)
+- 2026-09-15T01:31:38Z · task=`c05-d4-complete` · branch=`main` · diff="none" → [archive](sessions/2026-09-15T01-31-38Z-c05-d4-complete.md)
