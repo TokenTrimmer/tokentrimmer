@@ -146,6 +146,94 @@ impl std::iter::Sum for MoneyMicros {
     }
 }
 
+/// A **signed** monetary amount in micro-USD, for a value that may be negative:
+/// a request-delta refund/regression, or a signed adjustment. Distinct from
+/// [`MoneyMicros`] (non-negative) so the type itself documents whether a
+/// negative value is legal.
+///
+/// The biased constructors mirror [`MoneyMicros`]:
+/// * [`SignedMoneyMicros::from_usd_round`] — round to nearest, the receipt
+///   idiom `(usd * 1e6).round()`, for a signed estimate where the direction is
+///   not safety-significant.
+/// * [`SignedMoneyMicros::from_usd_floor`] / [`from_usd_ceil`] — the biased
+///   directions, for a bound.
+///
+/// Non-finite and out-of-range inputs are rejected (`None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SignedMoneyMicros(i64);
+
+impl SignedMoneyMicros {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn from_micros(micros: i64) -> Self {
+        Self(micros)
+    }
+
+    #[must_use]
+    pub const fn as_micros(self) -> i64 {
+        self.0
+    }
+
+    /// Round to nearest (the established receipt idiom). Rejects non-finite and
+    /// out-of-range inputs; negative values ARE allowed here by design.
+    #[must_use]
+    pub fn from_usd_round(value: f64) -> Option<Self> {
+        Self::scale(value, f64::round)
+    }
+
+    /// Round toward zero. Negative values allowed.
+    #[must_use]
+    pub fn from_usd_floor(value: f64) -> Option<Self> {
+        Self::scale(value, f64::floor)
+    }
+
+    /// Round away from zero. Negative values allowed.
+    #[must_use]
+    pub fn from_usd_ceil(value: f64) -> Option<Self> {
+        Self::scale(value, f64::ceil)
+    }
+
+    fn scale(value: f64, round: fn(f64) -> f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        let scaled = value * MICRO_USD_PER_USD;
+        if scaled < i64::MIN as f64 || scaled >= -(i64::MIN as f64) {
+            return None;
+        }
+        Some(Self(round(scaled) as i64))
+    }
+
+    #[must_use]
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
+
+    #[must_use]
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
+        self.0.checked_sub(other.0).map(Self)
+    }
+
+    /// The non-negative magnitude as [`MoneyMicros`], rejecting a negative
+    /// value (`None`) — the explicit conversion for "saved = max(signed, 0)".
+    #[must_use]
+    pub fn positive_magnitude(self) -> Option<MoneyMicros> {
+        u64::try_from(self.0).ok().map(MoneyMicros::from_micros)
+    }
+
+    #[must_use]
+    pub fn as_usd_f64(self) -> f64 {
+        self.0 as f64 / MICRO_USD_PER_USD
+    }
+}
+
+impl fmt::Display for SignedMoneyMicros {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.6}", self.as_usd_f64())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +263,49 @@ mod tests {
         assert_eq!(MoneyMicros::from_usd_floor(0.0), Some(MoneyMicros::ZERO));
         assert_eq!(MoneyMicros::from_usd_ceil(0.0), Some(MoneyMicros::ZERO));
         assert_eq!(MoneyMicros::ZERO.as_micros(), 0);
+    }
+
+    #[test]
+    fn signed_type_allows_negatives_and_rejects_non_finite() {
+        assert_eq!(
+            SignedMoneyMicros::from_usd_round(-0.25)
+                .unwrap()
+                .as_micros(),
+            -250_000
+        );
+        assert_eq!(
+            SignedMoneyMicros::from_usd_round(0.123_456_5)
+                .unwrap()
+                .as_micros(),
+            123_457
+        );
+        assert_eq!(SignedMoneyMicros::from_usd_round(f64::NAN), None);
+        assert_eq!(SignedMoneyMicros::from_usd_round(f64::INFINITY), None);
+        // Biased directions differ on a half, matching MoneyMicros.
+        assert_eq!(
+            SignedMoneyMicros::from_usd_floor(-1.5).unwrap().as_micros(),
+            -1_500_000
+        );
+        assert_eq!(
+            SignedMoneyMicros::from_usd_ceil(-1.5).unwrap().as_micros(),
+            -1_500_000
+        );
+        // positive_magnitude is the explicit "saved = max(signed, 0)" step.
+        assert_eq!(
+            SignedMoneyMicros::from_micros(500)
+                .positive_magnitude()
+                .unwrap()
+                .as_micros(),
+            500
+        );
+        assert_eq!(
+            SignedMoneyMicros::from_micros(-500).positive_magnitude(),
+            None
+        );
+        assert_eq!(
+            SignedMoneyMicros::from_micros(-250_000).to_string(),
+            "-0.250000"
+        );
     }
 
     #[test]
