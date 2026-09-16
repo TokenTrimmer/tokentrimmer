@@ -52,7 +52,7 @@
     "test:installed": "node scripts/verify-installed.mjs"
   },
   "peerDependencies": {
-    "openai": "^6.45.0",
+    "openai": "^7.15.0",
     "ai": ">=3.0.0",
     "@opentelemetry/api": ">=1.0.0 <2.0.0",
     "unpdf": "^1.0.0"
@@ -75,7 +75,7 @@
     "@opentelemetry/api": "^1.9.0",
     "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "4.1.10",
-    "openai": "^6.45.0",
+    "openai": "^7.15.0",
     "typescript": "^7.0.2",
     "unpdf": "^1.8.0",
     "vitest": "4.1.10"
