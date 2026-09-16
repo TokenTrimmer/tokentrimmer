@@ -87,7 +87,7 @@ impl Provider for BatchRecordingProvider {
             .map(|id| ModelInfo {
                 id: id.into(),
                 provider: "batchrec".into(),
-                capabilities: vec![Capability::Text],
+                capabilities: vec![Capability::Text, Capability::Streaming],
                 max_input_tokens: 8192,
                 max_output_tokens: 8192,
             })
