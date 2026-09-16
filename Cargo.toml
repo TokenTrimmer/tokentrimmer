@@ -109,7 +109,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 opentelemetry-http = "0.32"
 
 # Crypto + auth
-argon2 = "0.5"
+argon2 = "0.6"
 chacha20poly1305 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
