@@ -33,7 +33,7 @@ classifiers = [
 # full suite passes against 1.109.1 and 2.41.1 (2026-06). Do NOT raise the
 # ceiling past <3.0.0 without re-verifying those internals against 3.x.
 dependencies = [
-    "openai>=1.70.0,<3.0.0",
+    "openai>=1.70.0,<4.0.0",
     "httpx>=0.27.0",
 ]
 
