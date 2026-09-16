@@ -78,7 +78,7 @@
     "openai": "^6.45.0",
     "typescript": "^7.0.2",
     "unpdf": "^1.8.0",
-    "vitest": "4.1.10"
+    "vitest": "5.0.0"
   },
   "engines": {
     "node": ">=18"
