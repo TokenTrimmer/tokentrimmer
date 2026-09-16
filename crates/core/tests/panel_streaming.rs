@@ -302,7 +302,7 @@ impl Provider for MockStreamingArbiter {
         vec![ModelInfo {
             id: self.model.into(),
             provider: self.id.into(),
-            capabilities: vec![Capability::Streaming],
+            capabilities: vec![Capability::Text, Capability::Streaming],
             max_input_tokens: 4096,
             max_output_tokens: 4096,
         }]
@@ -1143,7 +1143,10 @@ impl Provider for MemberMock {
         vec![ModelInfo {
             id: self.model.into(),
             provider: self.id.into(),
-            capabilities: vec![Capability::Text],
+            // A streaming panel fans its member legs and arbiter through the
+            // streaming dispatch, so the members must declare Streaming too
+            // (the S02 capability guard is fail-closed).
+            capabilities: vec![Capability::Text, Capability::Streaming],
             max_input_tokens: 8192,
             max_output_tokens: 8192,
         }]
@@ -1239,7 +1242,10 @@ impl Provider for JudgeMock {
         vec![ModelInfo {
             id: self.model.into(),
             provider: self.id.into(),
-            capabilities: vec![Capability::Text],
+            // A streaming panel fans its member legs and arbiter through the
+            // streaming dispatch, so the members must declare Streaming too
+            // (the S02 capability guard is fail-closed).
+            capabilities: vec![Capability::Text, Capability::Streaming],
             max_input_tokens: 8192,
             max_output_tokens: 8192,
         }]
@@ -1327,7 +1333,7 @@ impl Provider for StreamingArbiterMock {
         vec![ModelInfo {
             id: self.model.into(),
             provider: self.id.into(),
-            capabilities: vec![Capability::Streaming],
+            capabilities: vec![Capability::Text, Capability::Streaming],
             max_input_tokens: 8192,
             max_output_tokens: 8192,
         }]

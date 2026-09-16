@@ -75,8 +75,17 @@ impl Provider for FsRecordingProvider {
             provider: "fsrec".into(),
             // JsonMode: the test requests carry response_format, and the
             // routing capability guard requires the TARGET model to support
-            // it (else the route is skipped wholesale).
-            capabilities: vec![Capability::Text, Capability::JsonMode],
+            // it (else the route is skipped wholesale). StrictJsonSchema is
+            // also declared so the strict-schema case exercises the
+            // format-switch planner's own skip rather than being suppressed
+            // earlier by the capability guard. Streaming is declared because
+            // one case dispatches a streaming request.
+            capabilities: vec![
+                Capability::Text,
+                Capability::JsonMode,
+                Capability::StrictJsonSchema,
+                Capability::Streaming,
+            ],
             max_input_tokens: 8192,
             max_output_tokens: 8192,
         }]
