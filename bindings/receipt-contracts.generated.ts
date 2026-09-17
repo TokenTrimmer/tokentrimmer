@@ -232,6 +232,7 @@ export type RouteConditions = {
   prompt_contains_any_of?: Array<string>;
   tag_equals?: string | null;
   upstream_latency_ms_p95_gt?: number | null;
+  workload?: string | null;
 };
 
 export type RoutePanel = {
