@@ -227,7 +227,7 @@ impl RequestPass for CacheClassifierPass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+
     use tt_shared::messages::{Message, MessageContent};
     use tt_shared::pricing::ModelPricing;
 

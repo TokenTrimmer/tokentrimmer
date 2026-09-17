@@ -2547,7 +2547,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
-        use futures::stream::{BoxStream, StreamExt};
+        use futures::stream::BoxStream;
         use serde_json::json;
         use tt_auth::{
             keys::{issue, Environment},
@@ -2561,9 +2561,9 @@ mod tests {
         };
         use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
 
-        let state = crate::AppState::new(crate::ProviderRegistry::new());
+        let _state = crate::AppState::new(crate::ProviderRegistry::new());
         let keys = Arc::new(InMemoryKeyStore::new());
-        let key = issue(
+        let _key = issue(
             keys.as_ref(),
             &InMemoryAuditWriter::new(),
             Uuid::now_v7(),

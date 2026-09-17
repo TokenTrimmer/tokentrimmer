@@ -478,7 +478,7 @@ impl CacheBustEstimate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+
     use tt_shared::messages::MessageContent;
 
     fn sys(text: &str) -> Message {

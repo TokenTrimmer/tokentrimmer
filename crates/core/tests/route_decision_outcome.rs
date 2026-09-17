@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
-use futures::stream::{BoxStream, StreamExt};
+use futures::stream::BoxStream;
 use serde_json::json;
 use tower::util::ServiceExt;
 
@@ -28,7 +28,7 @@ use tt_shared::{
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
 use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
-use tt_telemetry::request_logs::{InMemoryRequestLogWriter, RequestLogRow, RequestLogWriter};
+use tt_telemetry::request_logs::{InMemoryRequestLogWriter, RequestLogRow};
 use uuid::Uuid;
 
 /// Static mock serving two models; records every dispatch.

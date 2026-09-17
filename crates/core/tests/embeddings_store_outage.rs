@@ -4,7 +4,7 @@
 //! embeddings entry point specifically — including batch inputs.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -100,32 +100,6 @@ impl Provider for RecordingEmbedder {
                 cache_read_input_tokens: None,
             },
         })
-    }
-}
-
-/// L1 read counter — proves the outage refusal happens before any cache
-/// lookup when a privacy policy might mandate it.
-#[derive(Default)]
-struct CountingL1 {
-    inner: tt_cache::memory::InMemoryL1Cache,
-    reads: AtomicUsize,
-}
-#[async_trait]
-impl tt_cache::L1Cache for CountingL1 {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, tt_cache::CacheError> {
-        if !key.starts_with("revoked:key:") {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.get(key).await
-    }
-    async fn set(&self, key: &str, value: &[u8], ttl: u64) -> Result<(), tt_cache::CacheError> {
-        self.inner.set(key, value, ttl).await
-    }
-    async fn delete(&self, key: &str) -> Result<(), tt_cache::CacheError> {
-        self.inner.delete(key).await
-    }
-    async fn purge_org(&self, org: Uuid) -> Result<tt_cache::L1PurgeResult, tt_cache::CacheError> {
-        self.inner.purge_org(org).await
     }
 }
 

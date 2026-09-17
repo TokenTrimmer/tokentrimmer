@@ -326,7 +326,7 @@ mod tests {
     use super::*;
     use crate::passes::split::SplitRequest;
     use crate::passes::PassPipeline;
-    use chrono::Utc;
+
     use tt_shared::messages::{ContentPart, ToolCall, ToolCallFunction};
     use tt_shared::pricing::ModelPricing;
     use tt_shared::ChatCompletionRequest;

@@ -197,7 +197,7 @@ mod nopricing {
 
 mod cachereporting {
     use async_trait::async_trait;
-    use chrono::Utc;
+
     use futures::stream::BoxStream;
     use tt_shared::messages::{Choice, Message, MessageContent};
     use tt_shared::pricing::Capability;
@@ -288,7 +288,7 @@ mod cachereporting {
 
 mod streamnousage {
     use async_trait::async_trait;
-    use chrono::Utc;
+
     use futures::stream::{BoxStream, StreamExt};
     use tt_shared::messages::{ChunkChoice, ChunkDelta};
     use tt_shared::pricing::Capability;
@@ -596,7 +596,7 @@ async fn served_counter_recorded_for_embeddings_dispatch() {
 #[tokio::test]
 async fn served_counter_increments_per_agent_run_turn() {
     use async_trait::async_trait;
-    use chrono::Utc;
+
     use futures::stream::BoxStream;
     use std::sync::{
         atomic::{AtomicU32, Ordering},
