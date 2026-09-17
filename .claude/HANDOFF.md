@@ -1,20 +1,25 @@
 # Active session handoff
 
-_Written at 2026-09-15T02:33:32Z by session `20260915-77258` on branch `main` (@ 152db40)._
+_Written at 2026-09-17 by session on branch `main` (public @ 0b403443, cloud @ d478a43a)._
 
-## Status: Two honesty/observability fixes: the /data retention schedule now discloses the decision-trace ledger (90d) and opt-in body capture (1-30d) with a source contract pinning schedule to code (Cloud #654); the retention sweep log now emits the trace/activation/funnel deletion counts it was hiding (Cloud #655). Verified on a FRESH disposable DB: tt-api lib 1,232/0, retention 9/0, route_decision_trace 4/0, dashboard 3,262/89. No deployment or launch approval.
+## Status: Governance refresh batches 64–68 — the 156-command cloud sweep went from **130 pass / 26 fail** to **153 pass / 3 fail**. Public PR #453 (merged `0b403443`) repaired a real `main` test failure class: the S02 `Streaming` capability guard began suppressing `stream:true` routes on mocks that did not declare `Capability::Streaming`, turning five `tt-core` binaries red. Cloud PRs #663–#667 advanced the engine pin to `0b403443`, re-minted every pin-coupled record, migrated the R07 workload-policy form back to shared controls, and fixed a real Firefox-only WCAG-AA color-contrast violation in the workflow canvas. No deployment or launch approval.
 
-Active task: `honesty-and-observability-fixes`
+Active task: `governance-refresh-batches-64-68`
 
 ## What happened this session
 
-- Diff: (no git changes)
-- Files touched:
-
+- Public #453 `0b403443`: `test: declare Streaming capability on streaming dispatch mocks` — 5 red `tt-core` binaries fixed; `cargo test -p tt-core --tests` green across 99 binaries.
+- Cloud #663 (batch 64): governance evidence refresh + R07 `WorkloadPoliciesController` shared-control migration (zero native controls again).
+- Cloud #664 (batch 65): advanced the public pin `fb60e78 → 0b403443`; re-minted definition/fusion/route-preview-replay/route-transformation/gateway-cache-purge/reconciliation evidence.
+- Cloud #665 (batch 66): stood up a live local stack (disposable PostgreSQL 18 + pgvector, production dashboard build, loopback fixtures, all three engines) and re-ran chat-drawer 3/3, interaction-safety 9/9, workflow-graph 3/3, target-size 3/3, route-activation-health 3/3 + 2/2 DB. **Found + fixed a real Firefox-only WCAG-AA color-contrast defect** (`--tt-text-faint` 2.54:1 → `--tt-text-muted`).
+- Cloud #666 (batch 67): completed the fresh performance run batch 54 required (`--project=perf` 7/7); observed values + source hashes re-minted.
+- Cloud #667 (batch 68): recorded the visual-baseline assessment — 9/10 extended chromium baselines differ from the reviewed 2026-08-03 shots due to legitimate product changes; a deliberate reviewed `--update-snapshots` pass is required (not blind-refreshed).
 
 ## Next session should
 
-Continue the dependency-ordered source queue and C05 D1. Keep root totals at 3 local complete / 42 partial / 11 external / 3 open.
+1. Do a deliberate, reviewed visual-baseline re-shoot for `accessibility-mobile-state` + `accessibility-nonchromium-visual-performance` (9 PNG diffs already characterised in `cloud/docs/reviews/2026-09-13-open-items.md`).
+2. Re-run the whole-release `supply-chain` record at the current revision (full workspace).
+3. Continue the dependency-ordered source queue and C05 D1. Keep root totals at 3 local complete / 42 partial / 11 external / 3 open.
 
 ## Recent audit trail
 
