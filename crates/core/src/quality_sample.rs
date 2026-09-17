@@ -1733,7 +1733,6 @@ pub fn spawn_quality_judge(job: QualityJudgeJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     fn pricing(input: f64, output: f64) -> ModelPricing {
         ModelPricing {

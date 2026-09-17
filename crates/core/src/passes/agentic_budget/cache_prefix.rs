@@ -139,7 +139,7 @@ pub fn annotate_cache_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+
     use tt_shared::messages::{Message, MessageContent};
     use tt_shared::pricing::ModelPricing;
     use tt_shared::ChatCompletionRequest;

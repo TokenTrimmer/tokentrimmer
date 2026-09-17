@@ -15,7 +15,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use futures::stream::{BoxStream, StreamExt};
+use futures::stream::BoxStream;
 use serde_json::json;
 use tower::ServiceExt;
 use tt_auth::{
