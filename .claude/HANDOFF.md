@@ -1,25 +1,29 @@
 # Active session handoff
 
-_Written at 2026-09-17 by session on branch `main` (public @ 0b403443, cloud @ d478a43a)._
+_Written at 2026-09-17 by session on branch `main` (public @ f2b56703, cloud @ 152665c9)._
 
-## Status: Governance refresh batches 64–68 — the 156-command cloud sweep went from **130 pass / 26 fail** to **153 pass / 3 fail**. Public PR #453 (merged `0b403443`) repaired a real `main` test failure class: the S02 `Streaming` capability guard began suppressing `stream:true` routes on mocks that did not declare `Capability::Streaming`, turning five `tt-core` binaries red. Cloud PRs #663–#667 advanced the engine pin to `0b403443`, re-minted every pin-coupled record, migrated the R07 workload-policy form back to shared controls, and fixed a real Firefox-only WCAG-AA color-contrast violation in the workflow canvas. No deployment or launch approval.
+## Status: Governance backlog closed — the 156-command cloud sweep went from **130 pass / 26 fail** to **156 pass / 0 fail**. Along the way the work found and fixed **four real CI/product defects**. Thirteen PRs merged (public #453/#465/#466/#467, cloud #663–#671). No deployment or launch approval.
 
-Active task: `governance-refresh-batches-64-68`
+Active task: `governance-backlog-closed`
 
-## What happened this session
+## The four real defects fixed
 
-- Public #453 `0b403443`: `test: declare Streaming capability on streaming dispatch mocks` — 5 red `tt-core` binaries fixed; `cargo test -p tt-core --tests` green across 99 binaries.
-- Cloud #663 (batch 64): governance evidence refresh + R07 `WorkloadPoliciesController` shared-control migration (zero native controls again).
-- Cloud #664 (batch 65): advanced the public pin `fb60e78 → 0b403443`; re-minted definition/fusion/route-preview-replay/route-transformation/gateway-cache-purge/reconciliation evidence.
-- Cloud #665 (batch 66): stood up a live local stack (disposable PostgreSQL 18 + pgvector, production dashboard build, loopback fixtures, all three engines) and re-ran chat-drawer 3/3, interaction-safety 9/9, workflow-graph 3/3, target-size 3/3, route-activation-health 3/3 + 2/2 DB. **Found + fixed a real Firefox-only WCAG-AA color-contrast defect** (`--tt-text-faint` 2.54:1 → `--tt-text-muted`).
-- Cloud #666 (batch 67): completed the fresh performance run batch 54 required (`--project=perf` 7/7); observed values + source hashes re-minted.
-- Cloud #667 (batch 68): recorded the visual-baseline assessment — 9/10 extended chromium baselines differ from the reviewed 2026-08-03 shots due to legitimate product changes; a deliberate reviewed `--update-snapshots` pass is required (not blind-refreshed).
+1. **S02 streaming-capability fixtures** (public #453, `0b403443`) — the `Streaming` capability guard began suppressing `stream:true` routes on mocks that did not declare it, turning 5 `tt-core` binaries red. Stale fixtures updated; `cargo test -p tt-core --tests` green across 99 binaries.
+2. **R07 native-control regression** (cloud #663) — `WorkloadPoliciesController` reintroduced 8 native form tags; migrated back to shared `Label`/`Input`.
+3. **Firefox-only WCAG-AA contrast** (cloud #665, `006a1b09`) — the workflow canvas `NodeCard` "no config" text used `--tt-text-faint` at **2.54:1**; fixed to `--tt-text-muted` (4.83:1), verified 3/3 engines.
+4. **Two public CI blockers** — `cargo clippy --workspace --all-targets -- -D warnings` failed on `main` (public #466, `df713c0c`: 57 redundant `chrono::Utc` imports, 2 unused `StreamExt`, one dead struct, two shadowed test bindings), and `tt-ts-types` contract drift (public #467, `f2b56703`: generated receipt contracts predated the R07 `workload` field).
+
+## How the sweep was closed
+
+- Cloud #664/#669–#671 advanced the engine pin `fb60e78 → 0b403443 → df713c0c → f2b56703` and re-minted every pin-coupled record (definitions, fusion, route-preview-replay, route-transformation, gateway-cache-purge, reconciliation, target-size).
+- Cloud #665/#666/#668 stood up a live local acceptance stack (disposable PostgreSQL 18 + pgvector, production dashboard build, loopback fixture gateways, Chromium/Firefox/WebKit) and re-ran the browser families for real: chat-drawer 3/3, interaction-safety 9/9, workflow-graph 3/3, target-size 3/3, route-activation-health 3/3 + 2/2 DB, performance 7/7. All 23 reviewed visual baselines were deliberately re-shot.
+- Cloud #671 re-minted the whole-release supply-chain record from a fully re-run workspace validation.
+
+No hash was blindly replaced: every recomputed digest was paired with a re-verification of the substantive claim, and browser/performance evidence came from actual re-runs.
 
 ## Next session should
 
-1. Do a deliberate, reviewed visual-baseline re-shoot for `accessibility-mobile-state` + `accessibility-nonchromium-visual-performance` (9 PNG diffs already characterised in `cloud/docs/reviews/2026-09-13-open-items.md`).
-2. Re-run the whole-release `supply-chain` record at the current revision (full workspace).
-3. Continue the dependency-ordered source queue and C05 D1. Keep root totals at 3 local complete / 42 partial / 11 external / 3 open.
+Continue the dependency-ordered source queue and **C05 D1** (per-request money computation in integer micro-USD). Keep root totals at 3 local complete / 42 partial / 11 external / 3 open. Note `cloud/crates/api/tests/audit_boot.rs` can spuriously time out on this machine while the child process resolves the deliberately-invalid DB hostname (the binary itself rejects in ~10 ms with a resolvable host) — the ledger documents this `syspolicyd`/load class at batch 38.
 
 ## Recent audit trail
 
