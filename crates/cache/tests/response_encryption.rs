@@ -41,6 +41,32 @@ fn configured_child(name: &str) -> bool {
 fn strict_from_env() -> ResponseCodec {
     ResponseCodec::from_env().unwrap().unwrap()
 }
+
+/// Whether `url` names an explicit loopback host. These fixtures must never be
+/// pointed at a shared or remote database, but the accepted spelling varies:
+/// `127.0.0.1`, `[::1]` and `localhost` are all loopback, and Postgres URLs
+/// appear as both `postgres://` and `postgresql://` (the CI service uses
+/// `postgres://postgres:postgres@localhost:5432/postgres`). The scheme is only
+/// sanity-checked; the security property being asserted is the HOST.
+fn is_loopback_url(url: &str, expected_scheme: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.starts_with(expected_scheme) {
+        return false;
+    }
+    // Strip any userinfo (`user:pass@`) before the host.
+    let host_port = rest.rsplit('@').next().unwrap_or(rest);
+    // Strip any path/query/fragment and the port.
+    let authority = host_port.split(['/', '?', '#']).next().unwrap_or(host_port);
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or(bracketed)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
 fn entry(org: Uuid) -> CacheEntry {
     let mut vector = vec![0.0; 1536];
     vector[0] = 1.0;
@@ -373,8 +399,8 @@ fn redis_enforces_hosted_policy_and_stores_only_ciphertext_after_refill() {
         use tt_cache::redis_impl::RedisL1Cache;
         let url = std::env::var("TEST_REDIS_URL").expect("disposable TEST_REDIS_URL");
         assert!(
-            url.starts_with("redis://127.0.0.1:"),
-            "fixture requires explicit loopback Redis"
+            is_loopback_url(&url, "redis"),
+            "fixture requires explicit loopback Redis, got {url}"
         );
         let ns = format!("tt:review46:{}", Uuid::new_v4());
         let org = Uuid::new_v4();
@@ -433,8 +459,8 @@ fn postgres_enforces_policy_and_rejects_malformed_or_rebound_envelopes() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let url = std::env::var("TEST_DATABASE_URL").expect("disposable TEST_DATABASE_URL");
         assert!(
-            url.starts_with("postgresql://127.0.0.1:"),
-            "fixture requires explicit loopback Postgres"
+            is_loopback_url(&url, "postgres"),
+            "fixture requires explicit loopback Postgres, got {url}"
         );
         let pool = sqlx::PgPool::connect(&url).await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
@@ -513,4 +539,33 @@ fn postgres_enforces_policy_and_rejects_malformed_or_rebound_envelopes() {
         strict.evict(id).await.unwrap();
         pool.close().await;
     });
+}
+
+#[test]
+fn loopback_url_guard_accepts_every_loopback_spelling_and_rejects_remotes() {
+    // The CI service URL (scheme `postgres`, host `localhost`).
+    assert!(is_loopback_url(
+        "postgres://postgres:postgres@localhost:5432/postgres",
+        "postgres"
+    ));
+    assert!(is_loopback_url(
+        "postgresql://postgres:postgres@127.0.0.1:5432/postgres",
+        "postgres"
+    ));
+    assert!(is_loopback_url("redis://127.0.0.1:6379", "redis"));
+    assert!(is_loopback_url("redis://localhost:6379", "redis"));
+    assert!(is_loopback_url("redis://[::1]:6379", "redis"));
+
+    // A remote or shared database must be rejected.
+    assert!(!is_loopback_url(
+        "postgres://user:pw@db.example.com:5432/prod",
+        "postgres"
+    ));
+    assert!(!is_loopback_url(
+        "postgres://user:pw@10.0.0.5:5432/prod",
+        "postgres"
+    ));
+    // Wrong scheme is rejected too.
+    assert!(!is_loopback_url("mysql://localhost:3306/db", "postgres"));
+    assert!(!is_loopback_url("not-a-url", "redis"));
 }
