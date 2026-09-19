@@ -122,7 +122,16 @@ zeroize = "1.8"
 # feature on tt-core + tt-ml-scoring; OFF by default so the public/Fly builds stay
 # ML-dep-free. `load-dynamic` + `coreml` so the gateway boots even if the .onnx/lib
 # is absent, and CoreML (the macOS Metal-backed EP) is available on the M4 Max.
-ort = { version = "2.0.0-rc.12", default-features = true, features = ["coreml", "tls-rustls"] }
+#
+# `default-features = false` is load-bearing: ort's defaults include
+# `download-binaries`, which static-links an ONNX Runtime and makes `cargo test
+# --workspace` fail to link on Linux (`undefined reference to OrtGetApiBase`)
+# once ort-sys >= rc.13 changed its Linux binary layout. `load-dynamic` sets
+# `ort-sys/disable-linking`, so the dependency is resolved at runtime (via
+# ORT_DYLIB_PATH) and the workspace build stays link-time-free on every OS. The
+# `ndarray`/`std`/`tracing` features keep the tensor-array API this crate uses;
+# `copy-dylibs` stages the dylibs next to the binary when present.
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "copy-dylibs", "coreml", "ndarray", "std", "tracing"] }
 ndarray = "0.17"
 rand_core = { version = "0.6", features = ["getrandom"] }
 

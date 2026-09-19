@@ -62,6 +62,17 @@ ignore = [
     # path. Owner: Document Lane. Blocker: lopdf must migrate off ttf-parser.
     # Re-check 2026-09-15.
     "RUSTSEC-2026-0192", # ttf-parser unmaintained (not vuln); blocker: lopdf transitive (doc-sidecar); re-check 2026-09-15
+    # --- paste unmaintained --------------------------------------------------
+    # `paste` (proc-macro token pasting) — unmaintained but NOT vulnerable
+    # (RUSTSEC-2024-0436). Reached only through the doc-sidecar's image
+    # stack: doc-sidecar -> image -> ravif -> rav1e -> paste.
+    # `cargo tree -i paste` is empty by default because rav1e is pulled by a
+    # non-default feature path, but `cargo deny` evaluates `--all-features`, so
+    # the advisory is real for that graph. The sidecar is an out-of-process
+    # operational binary, not on the gateway hot path. Owner:
+    # Document Lane/Security. Blocker: rav1e must migrate off paste (rav1e has
+    # no maintained release without it). Re-check 2026-12-15.
+    "RUSTSEC-2024-0436", # paste unmaintained (not vuln); doc-sidecar -> image -> ravif -> rav1e; re-check 2026-12-15
 ]
 
 [sources]
