@@ -1,0 +1,31 @@
+# zizmor configuration (workflow-security job's third analyzer).
+#
+# Audit suppressions recorded here are explicit, reasoned departures from the
+# audit's default posture. Each entry carries its rationale below.
+
+rules:
+  # The gate-failure-alert listener exists because silent red gates caused the
+  # 2026-08-16..30 two-week regression. It is scoped to the CI acceptance
+  # workflow on the default branch, every workflow_run context reaches the
+  # script through `env:` indirection (never `${{ }}` inside `run:`), and the
+  # ephemeral github.token carries only issues:write. The `workflow_run`
+  # trigger is the only mechanism GitHub offers for reacting to a completed
+  # run, so the dangerous-triggers finding is accepted and contained.
+  dangerous-triggers:
+    ignore:
+      - .github/workflows/gate-failure-alert.yml
+      - gate-failure-alert.yml
+
+  # `uses: ./.github/workflows/deploy.yml` is the form GitHub documents for a
+  # reusable workflow in the same repository, and the form the pinned
+  # actionlint (1.7.12) requires. zizmor >=1.30 additionally suggests the newer
+  # `$/...` spelling, but actionlint rejects that, so the two analyzers
+  # disagree; keep the actionlint-valid form and suppress this advisory-only
+  # (`help` severity) finding. Suppressed by rule only, so any other
+  # self-repository misuse still surfaces.
+  self-repository:
+    ignore:
+      - ci.yml
+      - cost-gate-self.yml
+      - .github/workflows/ci.yml
+      - .github/workflows/cost-gate-self.yml
