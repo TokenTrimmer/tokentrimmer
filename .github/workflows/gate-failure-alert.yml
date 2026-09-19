@@ -12,6 +12,17 @@ name: gate-failure-alert
 # ephemeral `github.token` (no repository secrets) and no third-party actions —
 # the repository workflow-security policy applies (see
 # .github/scripts/workflow-security-policy.mjs).
+#
+# zizmor posture:
+# - All workflow_run context reaches the script via `env:` (environment
+#   indirection), never via `${{ }}` interpolation inside `run:` —
+#   template-injection surfaces cannot execute.
+# - The `workflow_run` trigger itself is zizmor-flagged as a dangerous
+#   trigger by default; this listener is deliberately scoped to the CI
+#   acceptance workflow on the default branch and only mints issues with
+#   issues:write. The suppression in .github/zizmor.yml is an audited,
+#   documented decision: the alert exists because silent red gates caused a
+#   two-week regression.
 
 on:
   workflow_run:
@@ -34,18 +45,32 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       # `github.token` (the workflow-scoped ephemeral token) — deliberately not
       # `secrets.GITHUB_TOKEN`, same effective identity, no secret reference.
+      #
+      # These workflow_run values are attacker-influenced (a fork PR can set
+      # the branch name, and the repository owner controls URL/run identity), so
+      # they are passed as ENVIRONMENT VARIABLES rather than interpolated into
+      # the `run` script. `${{ }}` expansion inside `run:` is a command-injection
+      # sink (zizmor template-injection); `env:` indirection keeps the values
+      # data, never shell code.
+      WF_REPO: ${{ github.repository }}
+      WF_RUN_ID: ${{ github.event.workflow_run.id }}
+      WF_RUN_URL: ${{ github.event.workflow_run.html_url }}
+      WF_RUN_EVENT: ${{ github.event.workflow_run.event }}
+      WF_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      WF_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      WF_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - name: Open or resolve the gate-failure tracking issue
         run: |
           set -euo pipefail
 
-          repo="${{ github.repository }}"
-          run_id="${{ github.event.workflow_run.id }}"
-          run_url="${{ github.event.workflow_run.html_url }}"
-          run_event="${{ github.event.workflow_run.event }}"
-          run_branch="${{ github.event.workflow_run.head_branch }}"
-          conclusion="${{ github.event.workflow_run.conclusion }}"
-          head_sha="${{ github.event.workflow_run.head_sha }}"
+          repo="${WF_REPO}"
+          run_id="${WF_RUN_ID}"
+          run_url="${WF_RUN_URL}"
+          run_event="${WF_RUN_EVENT}"
+          run_branch="${WF_RUN_BRANCH}"
+          conclusion="${WF_CONCLUSION}"
+          head_sha="${WF_HEAD_SHA}"
 
           # Only track default-branch acceptance runs (the scheduled backstop
           # and dispatched audits). Failure runs from a scratch --ref dispatch

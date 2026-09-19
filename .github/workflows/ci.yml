@@ -67,7 +67,7 @@ jobs:
       - name: Validate GitHub Actions syntax
         run: actionlint -color -shellcheck= -pyflakes= .github/workflows/*.yml
       - name: Analyze GitHub Actions security posture
-        run: zizmor .github/workflows
+        run: zizmor --config .github/zizmor.yml .github/workflows
 
   deploy-trigger-policy:
     name: deploy trigger policy

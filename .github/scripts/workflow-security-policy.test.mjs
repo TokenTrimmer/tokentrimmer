@@ -176,7 +176,7 @@ jobs:
 test("the blocking CI gate runs both analyzers and gates deployments", () => {
   const ci = readFileSync(".github/workflows/ci.yml", "utf8");
   assert.match(ci, /workflow-security:[\s\S]*?actionlint -color -shellcheck= -pyflakes=/);
-  assert.match(ci, /workflow-security:[\s\S]*?zizmor \.github\/workflows/);
+  assert.match(ci, /workflow-security:[\s\S]*?zizmor(?: --config \.github\/zizmor\.yml)? \.github\/workflows/);
   assert.match(ci, /authorize-deploy:[\s\S]*?needs:[\s\S]*?- workflow-security/);
 });
 
