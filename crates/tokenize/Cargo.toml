@@ -12,7 +12,7 @@ tiktoken-rs.workspace = true
 
 [dev-dependencies]
 # Header-only decode of the inline image bytes in the dimension-parser tests.
-base64 = "0.22"
+base64 = "0.23"
 
 [lints]
 workspace = true
