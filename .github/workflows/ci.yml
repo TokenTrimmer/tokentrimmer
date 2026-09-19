@@ -177,16 +177,23 @@ jobs:
       # Postgres key store: issue -> validate -> revoke -> cross-org isolation.
       # PostgresKeyStore is gated behind tt-auth's `postgres` feature, which the
       # default workspace build does not enable — so scope + feature it here.
+      #
+      # Serial execution: these tests share ONE disposable database, and some
+      # own a full-table contract (`reencrypt_all` rotates every row and asserts
+      # an exact count) or run `CREATE TABLE IF NOT EXISTS` for a fixture. Run in
+      # parallel, two tests can race the catalog (duplicate-key on
+      # `pg_type_typname_nsp_index`) or each other's rows. The cloud DB job
+      # already serializes for the same reason.
       - name: tt-auth Postgres key store (ignored)
-        run: cargo test -p tt-auth --features postgres -- --include-ignored
+        run: cargo test -p tt-auth --features postgres -- --include-ignored --test-threads=1
       # Body-capture master-key re-encryption (TT_MASTER_KEY rotation): re-keys
       # request_body_captures. Gated behind tt-telemetry's `postgres` feature,
-      # like tt-auth above; creates + clears its own table.
+      # like tt-auth above; creates + clears its own table (serial, as above).
       - name: tt-telemetry body-capture reencrypt (ignored)
-        run: cargo test -p tt-telemetry --features postgres -- --include-ignored
+        run: cargo test -p tt-telemetry --features postgres -- --include-ignored --test-threads=1
       # L2 pgvector cache: round-trip + org-A-insert / org-B-miss isolation.
       - name: tt-cache L2 + L1 (ignored)
-        run: cargo test -p tt-cache -- --include-ignored
+        run: cargo test -p tt-cache -- --include-ignored --test-threads=1
       # BYO credential-store wiring (creates its own provider_credentials table).
       - name: tt-cli BYO credential wiring (ignored)
         run: cargo test -p tt-cli -- --include-ignored byo_only
